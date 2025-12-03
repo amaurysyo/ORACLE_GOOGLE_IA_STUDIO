@@ -1,0 +1,67 @@
+{
+  "title": "Or\u00e1culo \u2014 Ingesta WS/DB (m\u00ednimo)",
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "WS Latency p99 (ms)",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(ws_latency_ms_bucket[1m])) by (le))"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "WS Lag por stream (ms)",
+      "targets": [
+        {
+          "expr": "ws_lag_ms"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "DB Insert p99 (ms)",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(db_insert_ms_bucket[1m])) by (le))"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Backlog de batch (por cola)",
+      "targets": [
+        {
+          "expr": "batch_queue_backlog"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      }
+    }
+  ]
+}

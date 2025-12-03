@@ -1,0 +1,101 @@
+# config/config.yaml  # why: esquema alineado al doc; variables se expanden desde .env
+app:
+  symbol: BTCUSDT
+  network_timeout_ms: 1500
+  storage:
+    dsn: ${PG_DSN}
+    batch_max_rows: 100
+    flush_ms: 200
+heartbeat:
+  deribit: { trade: 20, book: 5, ticker: 15, mark: 15 }
+  futures:
+    trade: 40
+    depth: 15
+    mark: 30
+    forceOrder: 90
+  spot:
+    trade: 30
+    depth: 5
+    
+binance:
+  symbol: BTCUSDT
+  futures_depth_levels: 20
+  futures_depth_ms: 100
+  futures_ws_enabled: true
+  spot_ws_enabled: true
+  use_agg_trade: false
+      
+rest_pollers:
+  open_interest_ms: 1000        # 1s OK para /fapi/v1/openInterest (peso=1)
+  top_traders_ms: 15000         # 15s recomendado (period≥5m)
+  top_traders_period: "5m"      # válido: 5m,15m,30m,1h,...
+  user_agent: "Oraculo/1.0 (+https://example.local)"
+  # límites opcionales (token-bucket)
+  limits:
+    open_interest_rps: 1.0       # máx 1 req/seg
+    top_traders_rps: 0.2         # máx 1 req/5s
+    
+  
+streams_spot:
+  enabled: true
+  symbol: BTCUSDT
+  use_agg_trade: false   # true => aggTrade, false => trade
+  depth_levels: 20
+  depth_interval_ms: 100
+  
+
+streams:
+  venue: FUTURES 
+  depth_levels: 20
+  depth_interval_ms: 100
+  mark_price: 1s
+  use_snapshots: true
+  deribit:
+    enabled: true
+    ws_url: "wss://www.deribit.com/ws/api/v2"    
+    refresh_interval_s: 600   # 10 min
+    interval_trades: "100ms"   # "raw" o "100ms"
+    interval_ticker: "100ms"
+    interval_book: "100ms"
+    index_name_mark: "btc_usd"
+    hb_timeout_s: 30
+    use_trades_by_instrument: true          # <--- GRANULARIDAD ACTIVADA
+    auth:
+      client_id: "KQpLTge6"
+      client_secret: "LJ3OPUM90drnGff3wj_CrSydG5ZpFitTjyL5SuwkVyI"
+    filters:
+      expiries_front: 3        # n expiraciones más cercanas
+      strikes_around_atm: 5    # ±n strikes alrededor del ATM
+      depth_levels: 10
+      
+
+routing:
+  telegram:
+    bot_events:
+      token: "${TELEGRAM_BOT_EVENTS_TOKEN}"
+      chat_id: "${TELEGRAM_CHAT_EVENTS}"
+    bot_rules:
+      token: "${TELEGRAM_BOT_RULES_TOKEN}"
+      chat_id: "${TELEGRAM_CHAT_RULES}"
+    bot_errors:
+      token: "${TELEGRAM_BOT_ERRORS_TOKEN}"
+      chat_id: "${TELEGRAM_CHAT_ERRORS}"
+
+observability:
+  prometheus_exporter: true
+  logging:
+    json: true
+    level: INFO
+    rotation: "100 MB" #"00:00"
+    retention: "7 days"
+  pulse:
+    enabled: false
+
+failure_policies:
+  retries:  {max: 5, base_ms: 150, jitter: true, cap_ms: 10000}
+  timeouts: {ws_read_ms: 1200, db_write_ms: 200, http_ms: 1500}
+  
+hot_reload:
+  enabled: true
+  watch: ["config/config.yaml", ".env"]
+  debounce_ms: 300

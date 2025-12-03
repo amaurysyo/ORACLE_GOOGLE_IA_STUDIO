@@ -1,0 +1,121 @@
+detectors:
+  slicing_aggr:
+    gap_ms: 80
+    k_min: 5
+    qty_min: 1
+    require_equal: true     # true=iceberg ; false=hitting
+    equal_tol_pct: 0
+    equal_tol_abs: 0
+
+  slicing_hit:
+    gap_ms: 80
+    k_min: 1
+    qty_min: 150.0          # hitting (no igualdad)
+    # require_equal forzado a false en código
+
+  slicing_pass:
+    gap_ms: 120
+    k_min: 6
+    qty_min: 5.0
+    require_equal: true
+    equal_tol_pct: 0
+    equal_tol_abs: 0
+
+  absorption:
+    dur_s: 10.0
+    vol_btc: 450.0
+    max_price_drift_ticks: 2
+    tick_size: 0.1          # <- usado para convertir drift a ticks con ancla best
+
+  break_wall:
+    n_min: 3
+    dep_pct: 0.40
+    basis_vel_abs_bps_s: 1.5
+    require_depletion: true
+    top_levels_gate: 20         # niveles top para gating
+    tick_size: 0.1              # Binance BTCUSDT
+    forbid_refill_under_pct: 0.6
+    refill_window_s: 3.0
+    refill_min_pct: 0.60        # si recupera <60% en 3s => no_refill (ok ruptura)
+
+  dominance:
+    enabled: true
+    dom_pct: 0.80
+    max_spread_usd: 2.0
+    levels: 1000             # puedes subir a 5000 si tu book/REST lo soporta
+    hold_ms: 1000
+    retrigger_s: 30
+
+  # --- R11–R12 Spoofing (bid/ask). Usa stream de depth y trades para ratio ejecución/cancelación
+  spoofing:
+    enabled: true
+    top_levels_gate: 30        # el muro debe aparecer en los primeros N niveles
+    wall_size_btc: 80.0        # tamaño mínimo del muro
+    distance_ticks: 10         # distancia máxima al best para calificar como “muro”
+    appear_within_ms: 400      # muro aparece “de golpe”
+    hold_min_ms: 500           # debe sostenerse un mínimo tiempo
+    cancel_within_ms: 1200     # retirada rápida sospechosa
+    min_exec_ratio: 0.05       # % ejecutado mínimo para NO ser spoof (si es menor => sospecha)
+    max_cancel_ratio: 0.85     # % cancelado alto => sospecha
+    per_side:
+      bid:
+        wall_size_btc: 80.0
+      ask:
+        wall_size_btc: 80.0
+
+  # --- R13–R14 Depletion masivo (pérdida abrupta de liquidez por lado)
+  depletion:
+    enabled: true
+    window_s: 2.0           # ventana de observación
+    n_levels: 50            # niveles a evaluar
+    pct_drop_bid: 0.35      # caída relativa en bid
+    pct_drop_ask: 0.35      # caída relativa en ask
+
+  # --- R15–R18 Basis thresholds (Mark/Index). Leídos por las reglas, no depth.
+  basis:
+    extreme_pos_bps: 50     # contango extremo -> R15
+    extreme_neg_bps: -50    # backwardation extremo -> R16
+    mr_cross_eps_bps: 3     # tolerancia para cruce por cero en mean reversion
+    mr_hold_ms: 1000        # evitar flicker (mantener cruce un mínimo)
+
+  # --- R19–R22 Opciones (Deribit). Umbrales de IV y Skew de OI
+  options:
+    iv_spike:
+      window_s: 60
+      up_pct: 15            # R19
+      down_pct: -15         # R20
+      surface: "ATM_30d"    # p. ej. IV de 30 días ATM
+    oi_skew:
+      min_calls: 100
+      min_puts: 100
+      bull_ratio: 1.5       # R21: calls/puts >= 1.5
+      bear_ratio: 1.5       # R22: puts/calls >= 1.5
+      
+  tape_pressure:
+    enabled: true
+    window_s: 5.0           # ventana para acumular flujo agresivo
+    min_trades: 10          # mínimo de trades en la ventana
+    min_qty_btc: 30.0       # volumen total mínimo en la ventana
+    ofi_up: 0.65            # (BUY_VOL - SELL_VOL) / (BUY_VOL + SELL_VOL) ≥ 0.65 -> R23
+    ofi_down: -0.65         # ... ≤ -0.65 -> R24
+    max_spread_usd: 2.0     # gating por spread
+    hold_ms: 500            # evitar flicker, mantener la condición
+    retrigger_s: 20         # cooldown para no spamear
+
+  spread_squeeze:
+    enabled: true
+    max_spread_usd: 0.5     # compresión del spread
+    levels: 50              # head del libro para medir profundidad
+    min_depth_bid_btc: 200.0
+    min_depth_ask_btc: 200.0
+    hold_ms: 1500           # mantener squeeze un tiempo
+    retrigger_s: 30
+    
+  metrics:
+    imbalance_buy: 0.65
+    imbalance_sell: -0.65
+    basis_vel_up: 2.5
+    basis_vel_dn: -2.5
+    basis_extreme_pos: 80.0
+    basis_extreme_neg: -80.0
+    spread_squeeze: 0.5

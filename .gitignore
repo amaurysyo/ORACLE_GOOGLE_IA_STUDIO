@@ -1,0 +1,22 @@
+# Logs
+*.log
+logs/
+ 
+# Archivos temporales
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+ 
+# Entornos virtuales
+venv/
+env/
+ 
+# Archivos de configuración con datos sensibles
+.env
+.env.bak
+config/secrets.py
+ 
+# Archivos grandes/datos
+*.zip
+*.csv

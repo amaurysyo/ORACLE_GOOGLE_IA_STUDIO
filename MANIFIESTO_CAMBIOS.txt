@@ -1,0 +1,13 @@
+# Manifiesto de cambios y decisiones (29/10/2025)
+
+## Cambios aplicados
+- Normalizado `instrument_id` en documentación y ejemplos a **EXCHANGE:MARKET:SYMBOL** (p.ej., `BINANCE:PERP:BTCUSDT`).
+- Mantenidos CAGGs `_1s_base` y añadidas **vistas alias** `oraculo.trades_*_1s` para compatibilidad.
+- Respetados tamaños de **chunk** exactamente como en los SQL existentes.
+- Añadido script de **migración** `SQL_003_MIGRATE_instrument_id.sql`.
+
+## Soluciones escogidas y por qué
+- **Formato `instrument_id`**: EXCHANGE primero → filtros por exchange/mercado más rápidos y legibles; evita ambigüedad en joins.
+- **CAGGs `_1s_base` + vistas**: el sufijo `_base` separa claramente capa de agregación/refresh; las vistas mantienen DX de consulta.
+- **Chunking**: mantener 1h/6h según SQL maximiza rendimiento (ingest y refresh) sin tocar políticas ya probadas.
+- **PERP ~ FUTURES**: se documenta PERP como subtipo de mercado dentro de FUTURES; no se cambian columnas existentes.
