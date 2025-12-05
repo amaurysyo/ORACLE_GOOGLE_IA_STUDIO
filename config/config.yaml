@@ -4,8 +4,8 @@ app:
   network_timeout_ms: 1500
   storage:
     dsn: ${PG_DSN}
-    batch_max_rows: 100
-    flush_ms: 200
+    batch_max_rows: 200
+    flush_ms: 100
 heartbeat:
   deribit: { trade: 20, book: 5, ticker: 15, mark: 15 }
   futures:
@@ -85,7 +85,7 @@ observability:
   prometheus_exporter: true
   logging:
     json: true
-    level: INFO
+    level: DEBUG
     rotation: "100 MB" #"00:00"
     retention: "7 days"
   pulse:

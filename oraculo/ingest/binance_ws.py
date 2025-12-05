@@ -11,12 +11,7 @@ from typing import Any, Optional
 import aiohttp
 from loguru import logger
 
-from ..obs.metrics import (
-    ws_msgs_total,
-    ws_resync_total,
-    ws_heartbeat_miss_total,
-    ws_last_msg_age_s,
-)
+from ..obs.metrics import ws_msgs_total, ws_resync_total, ws_heartbeat_miss_total, ws_last_msg_age_s
 from ..db import DB
 from .batch_writer import AsyncBatcher
 
@@ -76,16 +71,15 @@ class FuturesWSRunner:
         self._sid_depth: Optional[str] = None
         self._sid_mark: Optional[str] = None
         self._sid_liq: Optional[str] = None
-        # Último u aplicado de depth
         self._last_depth_u: int = 0
-        # Flag de si ya estamos alineados tras el último snapshot REST
-        self._depth_synced: bool = False
-        self._last_msg_ts: dict[str, float] = {
-            "trade": 0.0,
-            "depth": 0.0,
-            "mark": 0.0,
-            "forceOrder": 0.0,
-        }
+        self._last_msg_ts: dict[str, float] = {"trade": 0.0, "depth": 0.0, "mark": 0.0, "forceOrder": 0.0}
+
+        # --- NUEVO: control para evitar bucles de resync en depth ---
+        # si el gap en ids es enorme, asumimos "hemos estado ciegos" y
+        # rebasamos baseline sin seguir reintentando.
+        self._huge_gap_rebase: int = 500_000  # ids de update, ajustable
+        self._depth_gap_streak: int = 0       # nº de gaps seguidos manejados con resync
+        self._max_depth_gap_streak: int = 5   # a partir de aquí, dejamos de resync y rebasamos
 
     async def run(self) -> None:
         await self._create_streams()
@@ -98,20 +92,13 @@ class FuturesWSRunner:
                 if raw is None:
                     await asyncio.sleep(0.01)
                     continue
-
                 p = _normalize_payload(raw)
                 if not p or "e" not in p:
                     continue
-
                 et = p["e"]
                 ws_msgs_total.labels(et).inc()
-
                 now = asyncio.get_event_loop().time()
-                key = (
-                    "depth"
-                    if et == "depthUpdate"
-                    else ("mark" if et in ("markPriceUpdate", "24hrMiniTicker", "24hrTicker") else et)
-                )
+                key = "depth" if et == "depthUpdate" else ("mark" if et in ("markPriceUpdate", "24hrMiniTicker", "24hrTicker") else et)
                 if key in self._last_msg_ts:
                     self._last_msg_ts[key] = now
 
@@ -119,74 +106,73 @@ class FuturesWSRunner:
                     await self._handle_trade(p)
 
                 elif et == "depthUpdate":
-                    # --- LÓGICA NUEVA DE ALINEACIÓN + GAP DETECTION CORRECTA ---
-                    try:
-                        U = int(p.get("U") or 0)
-                        u = int(p.get("u") or 0)
-                        pu = int(p.get("pu") or 0)
-                    except Exception:
-                        # Si algo raro, mejor log y seguir con el siguiente mensaje
-                        logger.warning("[fut-depth] malformed depthUpdate payload: {}", p)
+                    pu = int(p.get("pu") or 0)
+
+                    # 1) Sin baseline aún: aceptar primer mensaje que entre
+                    if not self._last_depth_u:
+                        self._depth_gap_streak = 0
+                        await self._handle_depth(p)
                         continue
 
-                    last = self._last_depth_u
+                    # 2) Normal: en sync
+                    if pu == self._last_depth_u:
+                        self._depth_gap_streak = 0
+                        await self._handle_depth(p)
+                        continue
 
-                    if last:
-                        if not self._depth_synced:
-                            # FASE DE ALINEACIÓN TRAS SNAPSHOT REST
-                            # 1) Eventos antiguos (u < last) => se ignoran
-                            if u < last:
-                                logger.debug(
-                                    "[fut-depth] skip old depth event U={} u={} pu={} last={}",
-                                    U,
-                                    u,
-                                    pu,
-                                    last,
-                                )
-                                continue
+                    # 3) Caso pu < last_depth_u -> mensaje viejo / reordenado: lo ignoramos sin resync
+                    gap = pu - self._last_depth_u
+                    if gap < 0:
+                        logger.debug(
+                            "[fut-depth] stale/out-of-order depthUpdate pu=%s < last=%s -> skip",
+                            pu,
+                            self._last_depth_u,
+                        )
+                        continue
 
-                            # 2) Evento que cruza el snapshot: U <= last <= u
-                            if U <= last <= u:
-                                logger.info(
-                                    "[fut-depth] depth stream aligned: snapshot={} matched by U={} u={}",
-                                    last,
-                                    U,
-                                    u,
-                                )
-                                self._depth_synced = True
-                                # Deja pasar este evento a _handle_depth para aplicar el diff
-                            else:
-                                # Ni viejo ni cruza el snapshot, esperamos al siguiente
-                                logger.debug(
-                                    "[fut-depth] waiting align: snapshot={} vs U={} u={} pu={}",
-                                    last,
-                                    U,
-                                    u,
-                                    pu,
-                                )
-                                continue
-                        else:
-                            # FASE NORMAL: ya alineados, aquí sí exigimos continuidad por pu
-                            if pu != last:
-                                ws_resync_total.labels("futures", "depth").inc()
-                                logger.warning(
-                                    "[fut-depth] gap detected after sync: pu={} last={} U={} u={} -> resync",
-                                    pu,
-                                    last,
-                                    U,
-                                    u,
-                                )
-                                await self._resync_depth(session)
-                                # Después del resync, volvemos a fase de alineación
-                                continue
+                    # 4) Gap gigante: típico tras caída larga de red.
+                    # No tiene sentido intentar "coser" millones de updates perdidos:
+                    # rebasamos baseline y seguimos.
+                    if gap >= self._huge_gap_rebase:
+                        logger.warning(
+                            "[fut-depth] HUGE gap detected pu=%s last=%s (gap=%s) -> rebase baseline without resub",
+                            pu,
+                            self._last_depth_u,
+                            gap,
+                        )
+                        self._last_depth_u = pu
+                        self._depth_gap_streak = 0
+                        await self._handle_depth(p)
+                        continue
 
-                    # Si last == 0 (inicio) o estamos alineados (o nos acabamos de alinear),
-                    # aplicamos el diff normalmente.
-                    await self._handle_depth(p)
+                    # 5) Gap "normal" (relativamente pequeño): intentamos resync, pero
+                    # con límite de reintentos para no entrar en bucle infinito.
+                    self._depth_gap_streak += 1
+                    logger.warning(
+                        "[fut-depth] gap detected pu=%s last=%s (gap=%s) streak=%s -> resync",
+                        pu,
+                        self._last_depth_u,
+                        gap,
+                        self._depth_gap_streak,
+                    )
+
+                    if self._depth_gap_streak <= self._max_depth_gap_streak:
+                        ws_resync_total.labels("futures", "depth").inc()
+                        await self._resync_depth(session)
+                    else:
+                        logger.error(
+                            "[fut-depth] too many resync attempts (%s), "
+                            "disabling strict gap detect and rebasing on current pu",
+                            self._depth_gap_streak,
+                        )
+                        self._last_depth_u = pu
+                        self._depth_gap_streak = 0
+                        await self._handle_depth(p)
+
+                    continue
 
                 elif et in ("markPriceUpdate", "24hrMiniTicker", "24hrTicker"):
                     await self._handle_mark(p)
-
                 elif et == "forceOrder":
                     await self._handle_liq(p)
 
@@ -234,20 +220,26 @@ class FuturesWSRunner:
             logger.warning(f"[fut-ws] resub {stream} fallo {type(e).__name__}: {e!s}")
 
     async def _resync_depth(self, session: aiohttp.ClientSession) -> None:
-        # En un resync de depth siempre volvemos a estado "no alineado"
-        self._depth_synced = False
+        """
+        Resincronización "soft" del depth:
+        - Resetea la referencia de secuencia.
+        - Resuscribe el stream.
+        - Pide snapshot solo como comprobación/log, pero NO lo usa para _last_depth_u.
+        """
+        # resetear baseline; el primer depthUpdate posterior entra limpio
+        self._last_depth_u = 0
+        self._depth_gap_streak = 0
+
         await self._resub("depth")
+
         try:
-            async with session.get(
-                f"{FAPI_BASE}/fapi/v1/depth", params={"symbol": "BTCUSDT", "limit": 1000}
-            ) as r:
+            async with session.get(f"{FAPI_BASE}/fapi/v1/depth", params={"symbol": "BTCUSDT", "limit": 1000}) as r:
                 r.raise_for_status()
                 data = await r.json()
-                self._last_depth_u = int(data.get("lastUpdateId") or 0)
+                last_u = int(data.get("lastUpdateId") or 0)
                 logger.info(
-                    "[fut-depth] resynced snapshot lastUpdateId={} (depth_synced={})",
-                    self._last_depth_u,
-                    self._depth_synced,
+                    "[fut-depth] fetched snapshot lastUpdateId=%s (solo informativo, no usado para seq)",
+                    last_u,
                 )
         except Exception as e:
             logger.warning(f"[fut-depth] snapshot failed {type(e).__name__}: {e!s}")
@@ -294,22 +286,18 @@ class FuturesWSRunner:
         event_time = _ms_to_ts(p["E"])
         seq = int(p.get("u", 0))
         meta_common = json.dumps({"U": p.get("U"), "u": p.get("u"), "pu": p.get("pu")})
-
         for price_str, qty_str in p.get("b", []):
             price = float(price_str)
             qty = float(qty_str)
             action = "delete" if qty == 0.0 else "update"
             row = (BINANCE_FUT_INST, event_time, seq, "buy", action, price, qty, meta_common)
             self._batcher.add("bfut_depth", row)
-
         for price_str, qty_str in p.get("a", []):
             price = float(price_str)
             qty = float(qty_str)
             action = "delete" if qty == 0.0 else "update"
             row = (BINANCE_FUT_INST, event_time, seq, "sell", action, price, qty, meta_common)
             self._batcher.add("bfut_depth", row)
-
-        # Actualizamos el último u aplicado
         self._last_depth_u = seq
 
     async def _handle_mark(self, p: dict[str, Any]) -> None:
@@ -319,9 +307,7 @@ class FuturesWSRunner:
         fr = _to_float(p.get("r") or p.get("fundingRate"))
         nfund_ms = p.get("T") or p.get("nextFundingTime")
         next_funding = _ms_to_ts(nfund_ms) if isinstance(nfund_ms, int) else None
-        basis_bps = (
-            (mark - index) / index * 10000.0 if (mark is not None and index not in (None, 0.0)) else None
-        )
+        basis_bps = ((mark - index) / index * 10000.0) if (mark is not None and index not in (None, 0.0)) else None
         meta = json.dumps({})
         row = (BINANCE_FUT_INST, event_time, mark, index, fr, next_funding, basis_bps, meta)
         self._batcher.add("bfut_mark", row)
@@ -335,9 +321,7 @@ class FuturesWSRunner:
         qty = float(o.get("z") or o.get("q") or 0.0)
         quote = price * qty if (price and qty) else None
         external_id = f"{o.get('s','')}-{o.get('S','')}-{int(o.get('T',0))}-{o.get('p','')}-{o.get('z','')}"
-        meta = json.dumps(
-            {"status": o.get("X"), "type": o.get("o"), "tif": o.get("f"), "last_filled": o.get("l")}
-        )
+        meta = json.dumps({"status": o.get("X"), "type": o.get("o"), "tif": o.get("f"), "last_filled": o.get("l")})
         row = (BINANCE_FUT_INST, event_time, side, price, qty, quote, external_id, meta)
         self._batcher.add("bfut_liq", row)
 
