@@ -51,7 +51,6 @@ def _sev_norm(x: str) -> str:
 def _parse_deribit_option(instrument_id: str) -> tuple[Optional[str], Optional[str]]:
     """
     Extrae (underlying, tipo) de un instrument_id canónico de Deribit OPTIONS.
-
     Ejemplo esperado:
       DERIBIT:OPTIONS:BTC-28NOV25-50000-C -> ("BTC", "C")
     """
@@ -72,21 +71,41 @@ def _parse_deribit_option(instrument_id: str) -> tuple[Optional[str], Optional[s
 
 
 # ----------------- Auxiliares -----------------
+
 class DBTail:
-    def __init__(self, db: DB, table: str) -> None:
+    """
+    Clase para seguir la cola de una tabla (tailing) usando una columna cursor (ID o Tiempo).
+    Evita perder filas con el mismo timestamp usando IDs únicos cuando es posible.
+    """
+    def __init__(self, db: DB, table: str, id_col: str, default_val: Any) -> None:
         self.db = db
         self.table = table
-        self.last_ts: Optional[dt.datetime] = None
+        self.id_col = id_col
+        self.last_val: Any = default_val  # Valor del cursor (int o datetime)
 
-    async def fetch_new(self, limit: int = 2000) -> list[dict]:
+    async def init_live(self, instrument_id: str) -> None:
+        """Inicializa el cursor al valor MÁS ALTO actual para empezar en modo LIVE."""
+        sql = f"SELECT MAX({self.id_col}) FROM {self.table} WHERE instrument_id=$1"
+        val = await self.db.fetchval(sql, instrument_id)
+        if val is not None:
+            self.last_val = val
+            logger.info(f"[{self.table}] Tail initialized LIVE at {self.id_col}={self.last_val}")
+        else:
+            logger.info(f"[{self.table}] Table empty or no data for {instrument_id}, starting from default.")
+
+    async def fetch_new(self, instrument_id: str, limit: int = 2000) -> list[dict]:
+        """Recupera filas nuevas donde id_col > last_val."""
         sql = f"""SELECT * FROM {self.table}
-                  WHERE instrument_id=$1 AND event_time > $2
-                  ORDER BY event_time ASC
+                  WHERE instrument_id=$1 AND {self.id_col} > $2
+                  ORDER BY {self.id_col} ASC
                   LIMIT {limit}"""
-        ts = self.last_ts or dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
-        rows = await self.db.fetch(sql, BINANCE_FUT_INST, ts)
+        
+        rows = await self.db.fetch(sql, instrument_id, self.last_val)
+        
         if rows:
-            self.last_ts = rows[-1]["event_time"]
+            # Actualizamos el cursor al último procesado
+            self.last_val = rows[-1][self.id_col]
+            
         return [dict(r) for r in rows]
 
 
@@ -463,7 +482,6 @@ def _apply_rules_to_detectors(
     )
 
 
-
 # ----------------- Runner principal -----------------
 async def run_pipeline(
     db: DB,
@@ -542,25 +560,22 @@ async def run_pipeline(
     # Telemetría
     telemetry = Telemetry(db, BINANCE_FUT_INST, ctx.profile)
 
-    # DB tails
-    tail_trades = DBTail(db, "binance_futures.trades")
-    tail_depth = DBTail(db, "binance_futures.depth")
-    tail_mark = DBTail(db, "binance_futures.mark_funding")
+    # --- DB Tails configurados por ID ---
+    # Trades: Paginamos por 'trade_id_ext' para no perder ráfagas del mismo milisegundo
+    tail_trades = DBTail(db, "binance_futures.trades", id_col="trade_id_ext", default_val=0)
+    
+    # Depth: Paginamos por 'seq' (UpdateID)
+    tail_depth = DBTail(db, "binance_futures.depth", id_col="seq", default_val=0)
+    
+    # Mark: Seguimos usando 'event_time' (como no tiene ID secuencial claro y es baja frecuencia, es seguro)
+    tail_mark = DBTail(db, "binance_futures.mark_funding", id_col="event_time", default_val=dt.datetime.fromtimestamp(0, tz=dt.timezone.utc))
 
-    # LIVE mode
-    tail_trades.last_ts = await db.fetchval(
-        "SELECT COALESCE(MAX(event_time), now()) FROM binance_futures.trades WHERE instrument_id=$1",
-        BINANCE_FUT_INST,
-    )
-    tail_depth.last_ts = await db.fetchval(
-        "SELECT COALESCE(MAX(event_time), now()) FROM binance_futures.depth WHERE instrument_id=$1",
-        BINANCE_FUT_INST,
-    )
-    tail_mark.last_ts = await db.fetchval(
-        "SELECT COALESCE(MAX(event_time), now()) FROM binance_futures.mark_funding WHERE instrument_id=$1",
-        BINANCE_FUT_INST,
-    )
-    logger.info("DB tails initialized in LIVE mode (start at current MAX(event_time)).")
+    # Inicialización LIVE (Obtener MAX ID actual)
+    await tail_trades.init_live(BINANCE_FUT_INST)
+    await tail_depth.init_live(BINANCE_FUT_INST)
+    await tail_mark.init_live(BINANCE_FUT_INST)
+    
+    logger.info("DB tails initialized via ID (Robust High-Frequency Mode).")
 
     # Warmup OB snapshot
     try:
@@ -659,7 +674,8 @@ async def run_pipeline(
     # ------------------- bucle principal -------------------
     while True:
         # 1) depth -> book & métricas + slicing pasivo + spoofing
-        for r in await tail_depth.fetch_new(limit=5000):
+        # Paginación por ID (seq)
+        for r in await tail_depth.fetch_new(BINANCE_FUT_INST, limit=5000):
             ts = r["event_time"].timestamp()
             engine.on_depth(ts, r["side"], r["action"], float(r["price"]), float(r["qty"]))
 
@@ -694,7 +710,8 @@ async def run_pipeline(
                         await router.send("rules", text, alert_id=aid, ts_first=t0)
 
         # 2) mark funding -> basis
-        for r in await tail_mark.fetch_new(limit=1000):
+        # Paginación por Tiempo (legacy para mark)
+        for r in await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000):
             engine.on_mark(
                 r["event_time"].timestamp(),
                 float(r.get("mark_price") or 0) or None,
@@ -702,6 +719,7 @@ async def run_pipeline(
             )
 
         # 2b) Deribit opciones ticker -> IV spikes (R19/R20) + OI skew (R21/R22)
+        # Nota: Mantenemos el polling directo por tiempo aquí ya que es otra tabla/lógica
         rows_opt = await db.fetch(
             """
             SELECT instrument_id,
@@ -784,7 +802,8 @@ async def run_pipeline(
                             await router.send("rules", text, alert_id=aid, ts_first=t0)
 
         # 3) trades -> slicing (iceberg/hitting) + absorción + break_wall + tape_pressure + spoofing_exec
-        for r in await tail_trades.fetch_new(limit=5000):
+        # Paginación por ID (trade_id_ext)
+        for r in await tail_trades.fetch_new(BINANCE_FUT_INST, limit=5000):
             ts = r["event_time"].timestamp()
             side = r["side"]
             px = float(r["price"])
