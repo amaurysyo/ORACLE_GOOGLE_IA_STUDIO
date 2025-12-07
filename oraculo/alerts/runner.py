@@ -170,6 +170,10 @@ class Telemetry:
         disc_iv_missing: int = 0,
         disc_oi_missing: int = 0,
         disc_oi_low: int = 0,
+        disc_basis_vel_low: int = 0,
+        disc_dep_low: int = 0,
+        disc_refill_high: int = 0,
+        disc_top_levels_gate: int = 0,
     ) -> None:
         key = (self._bucket(ts), rule, side)
         d = self._agg.setdefault(
@@ -181,6 +185,10 @@ class Telemetry:
                 "disc_iv_missing": 0,
                 "disc_oi_missing": 0,
                 "disc_oi_low": 0,
+                "disc_basis_vel_low": 0,
+                "disc_dep_low": 0,
+                "disc_refill_high": 0,
+                "disc_top_levels_gate": 0,
             },
         )
         d["emitted"] += emitted
@@ -189,6 +197,10 @@ class Telemetry:
         d["disc_iv_missing"] += disc_iv_missing
         d["disc_oi_missing"] += disc_oi_missing
         d["disc_oi_low"] += disc_oi_low
+        d["disc_basis_vel_low"] += disc_basis_vel_low
+        d["disc_dep_low"] += disc_dep_low
+        d["disc_refill_high"] += disc_refill_high
+        d["disc_top_levels_gate"] += disc_top_levels_gate
 
     async def flush_if_needed(self) -> None:
         now = dt.datetime.now(dt.timezone.utc).timestamp()
@@ -211,6 +223,10 @@ class Telemetry:
                 int,
                 int,
                 int,
+                int,
+                int,
+                int,
+                int,
             ]
         ] = []
         for (ts_bucket, rule, side), c in list(self._agg.items()):
@@ -227,15 +243,21 @@ class Telemetry:
                     c["disc_iv_missing"],
                     c["disc_oi_missing"],
                     c["disc_oi_low"],
+                    c["disc_basis_vel_low"],
+                    c["disc_dep_low"],
+                    c["disc_refill_high"],
+                    c["disc_top_levels_gate"],
                 )
             )
         sql = """
             INSERT INTO oraculo.rule_telemetry(
               ts_bucket, instrument_id, profile, rule, side,
               emitted, disc_dom_spread, disc_metrics_none,
-              disc_iv_missing, disc_oi_missing, disc_oi_low
+              disc_iv_missing, disc_oi_missing, disc_oi_low,
+              disc_basis_vel_low, disc_dep_low, disc_refill_high,
+              disc_top_levels_gate
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
             ON CONFLICT (ts_bucket, instrument_id, profile, rule, side)
             DO UPDATE SET
               emitted = oraculo.rule_telemetry.emitted + EXCLUDED.emitted,
@@ -243,7 +265,11 @@ class Telemetry:
               disc_metrics_none = oraculo.rule_telemetry.disc_metrics_none + EXCLUDED.disc_metrics_none,
               disc_iv_missing = oraculo.rule_telemetry.disc_iv_missing + EXCLUDED.disc_iv_missing,
               disc_oi_missing = oraculo.rule_telemetry.disc_oi_missing + EXCLUDED.disc_oi_missing,
-              disc_oi_low = oraculo.rule_telemetry.disc_oi_low + EXCLUDED.disc_oi_low
+              disc_oi_low = oraculo.rule_telemetry.disc_oi_low + EXCLUDED.disc_oi_low,
+              disc_basis_vel_low = oraculo.rule_telemetry.disc_basis_vel_low + EXCLUDED.disc_basis_vel_low,
+              disc_dep_low = oraculo.rule_telemetry.disc_dep_low + EXCLUDED.disc_dep_low,
+              disc_refill_high = oraculo.rule_telemetry.disc_refill_high + EXCLUDED.disc_refill_high,
+              disc_top_levels_gate = oraculo.rule_telemetry.disc_top_levels_gate + EXCLUDED.disc_top_levels_gate
         """
         try:
             await self.db.execute_many(sql, rows)
@@ -852,7 +878,9 @@ async def run_pipeline(
                 # Telemetría de descarte por falta de métricas (basis_vel)
                 if getattr(snap, "basis_vel_bps_s", None) is None:
                     telemetry.bump(ts, "R1/R2", (ev1 or ev2).side, disc_metrics_none=1)
-                e2 = det_bw.on_slicing(ts, ev1 or ev2, snap.__dict__ if hasattr(snap, "__dict__") else dict())
+                e2, gating_reason = det_bw.on_slicing(
+                    ts, ev1 or ev2, snap.__dict__ if hasattr(snap, "__dict__") else dict()
+                )
                 if e2:
                     for rule in eval_rules(_evdict(e2), ctx):
                         alert_id, ts_first_dt = await upsert_rule(rule, e2.ts)
@@ -863,6 +891,18 @@ async def run_pipeline(
                                 f"k={e2.fields.get('k')}"
                             )
                             await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
+                elif gating_reason:
+                    reason_map = {
+                        "basis_vel_low": {"disc_basis_vel_low": 1},
+                        "dep_low": {"disc_dep_low": 1},
+                        "refill_high": {"disc_refill_high": 1},
+                        "top_levels_gate": {"disc_top_levels_gate": 1},
+                    }
+                    bump_kwargs = reason_map.get(gating_reason, {})
+                    if bump_kwargs:
+                        telemetry.bump(
+                            ts, "R1/R2", (ev1 or ev2).side, **bump_kwargs,
+                        )
 
             # tape pressure
             ev_tp = tape_det.on_trade(ts, side, px, qty)

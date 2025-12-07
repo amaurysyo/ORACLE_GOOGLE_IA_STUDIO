@@ -54,6 +54,8 @@ class Snapshot:
     spread_usd: Optional[float] = None
     basis_bps: Optional[float] = None
     basis_vel_bps_s: Optional[float] = None
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
     dom_bid: Optional[float] = None
     dom_ask: Optional[float] = None
     imbalance: Optional[float] = None
@@ -168,6 +170,8 @@ class MetricsEngine:
             spread_usd=spread,
             basis_bps=self._basis_bps,
             basis_vel_bps_s=self._basis_vel,
+            best_bid=bb,
+            best_ask=ba,
             dom_bid=dom_bid,
             dom_ask=dom_ask,
             imbalance=imb,
