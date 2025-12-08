@@ -74,6 +74,10 @@ class FuturesWSRunner:
         self._last_depth_u: int = 0
         self._last_msg_ts: dict[str, float] = {"trade": 0.0, "depth": 0.0, "mark": 0.0, "forceOrder": 0.0}
 
+        # Track simple OB state to derive insert/delete/update deltas (for detectors that
+        # differentiate entre adds y retiros).
+        self._depth_book: dict[str, dict[float, float]] = {"buy": {}, "sell": {}}
+
         # --- NUEVO: control para evitar bucles de resync en depth ---
         # si el gap en ids es enorme, asumimos "hemos estado ciegos" y
         # rebasamos baseline sin seguir reintentando.
@@ -289,16 +293,55 @@ class FuturesWSRunner:
         for price_str, qty_str in p.get("b", []):
             price = float(price_str)
             qty = float(qty_str)
-            action = "delete" if qty == 0.0 else "update"
-            row = (BINANCE_FUT_INST, event_time, seq, "buy", action, price, qty, meta_common)
-            self._batcher.add("bfut_depth", row)
+            action, eff_qty = self._normalize_depth_action("buy", price, qty)
+            if action:
+                row = (BINANCE_FUT_INST, event_time, seq, "buy", action, price, eff_qty, meta_common)
+                self._batcher.add("bfut_depth", row)
         for price_str, qty_str in p.get("a", []):
             price = float(price_str)
             qty = float(qty_str)
-            action = "delete" if qty == 0.0 else "update"
-            row = (BINANCE_FUT_INST, event_time, seq, "sell", action, price, qty, meta_common)
-            self._batcher.add("bfut_depth", row)
+            action, eff_qty = self._normalize_depth_action("sell", price, qty)
+            if action:
+                row = (BINANCE_FUT_INST, event_time, seq, "sell", action, price, eff_qty, meta_common)
+                self._batcher.add("bfut_depth", row)
         self._last_depth_u = seq
+
+    def _normalize_depth_action(self, side: str, price: float, new_qty: float) -> tuple[str | None, float]:
+        """
+        Binance depth update envía cantidades absolutas. Para los detectores necesitamos
+        diferenciar entre inserciones (qty aumenta) y retiros (qty disminuye).
+
+        Devuelve (action, qty_effective) donde:
+        - "insert": qty_effective es el aumento respecto al nivel previo (o total si no existía).
+        - "delete": qty_effective es la cantidad retirada (nivel a cero o reducción parcial).
+        - None: sin cambio real.
+        """
+        book = self._depth_book[side]
+        prev = book.get(price, 0.0)
+
+        if new_qty == prev:
+            return None, 0.0
+
+        if new_qty <= 0.0:
+            # nivel eliminado
+            if prev == 0.0:
+                return None, 0.0
+            book.pop(price, None)
+            return "delete", prev
+
+        if prev == 0.0:
+            # nuevo nivel
+            book[price] = new_qty
+            return "insert", new_qty
+
+        if new_qty > prev:
+            # aumento de cantidad existente
+            book[price] = new_qty
+            return "insert", new_qty - prev
+
+        # reducción parcial
+        book[price] = new_qty
+        return "delete", prev - new_qty
 
     async def _handle_mark(self, p: dict[str, Any]) -> None:
         event_time = _ms_to_ts(p.get("E") or p.get("eventTime", 0))

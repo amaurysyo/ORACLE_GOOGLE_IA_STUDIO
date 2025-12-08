@@ -68,6 +68,7 @@ class SpotWSRunner:
         self._sid_depth: Optional[str] = None
         self._last_msg_ts: dict[str, float] = {"trade": 0.0, "depth": 0.0}
         self._last_depth_u: int = 0
+        self._depth_book: dict[str, dict[float, float]] = {"buy": {}, "sell": {}}
 
     async def run(self) -> None:
         await self._create_streams()
@@ -259,16 +260,43 @@ class SpotWSRunner:
         for price_str, qty_str in p.get("b", []):
             price = float(price_str)
             qty = float(qty_str)
-            action = "delete" if qty == 0.0 else "update"
-            row = (BINANCE_SPOT_INST, event_time, seq, "buy", action, price, qty, meta_common)
-            self._batcher.add("bspot_depth", row)
+            action, eff_qty = self._normalize_depth_action("buy", price, qty)
+            if action:
+                row = (BINANCE_SPOT_INST, event_time, seq, "buy", action, price, eff_qty, meta_common)
+                self._batcher.add("bspot_depth", row)
         for price_str, qty_str in p.get("a", []):
             price = float(price_str)
             qty = float(qty_str)
-            action = "delete" if qty == 0.0 else "update"
-            row = (BINANCE_SPOT_INST, event_time, seq, "sell", action, price, qty, meta_common)
-            self._batcher.add("bspot_depth", row)
+            action, eff_qty = self._normalize_depth_action("sell", price, qty)
+            if action:
+                row = (BINANCE_SPOT_INST, event_time, seq, "sell", action, price, eff_qty, meta_common)
+                self._batcher.add("bspot_depth", row)
         self._last_depth_u = seq
+
+    def _normalize_depth_action(self, side: str, price: float, new_qty: float) -> tuple[str | None, float]:
+        """Deriva acción efectiva (insert/delete) a partir de qty absoluta de Binance."""
+        book = self._depth_book[side]
+        prev = book.get(price, 0.0)
+
+        if new_qty == prev:
+            return None, 0.0
+
+        if new_qty <= 0.0:
+            if prev == 0.0:
+                return None, 0.0
+            book.pop(price, None)
+            return "delete", prev
+
+        if prev == 0.0:
+            book[price] = new_qty
+            return "insert", new_qty
+
+        if new_qty > prev:
+            book[price] = new_qty
+            return "insert", new_qty - prev
+
+        book[price] = new_qty
+        return "delete", prev - new_qty
 
 
 async def run_binance_spot_ingest(

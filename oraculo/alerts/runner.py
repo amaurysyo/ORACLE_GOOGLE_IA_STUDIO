@@ -703,11 +703,15 @@ async def run_pipeline(
         # Paginación por ID (seq)
         for r in await tail_depth.fetch_new(BINANCE_FUT_INST, limit=5000):
             ts = r["event_time"].timestamp()
-            engine.on_depth(ts, r["side"], r["action"], float(r["price"]), float(r["qty"]))
+            qty_delta = float(r["qty"])
+            price = float(r["price"])
+            side = r["side"]
+
+            engine.on_depth(ts, side, r["action"], price, qty_delta)
 
             # slicing pasivo
-            if r["action"] == "insert" and float(r["qty"]) > 0:
-                evp = det_pass.on_depth(ts, r["side"], float(r["price"]), float(r["qty"]))
+            if r["action"] == "insert" and qty_delta > 0:
+                evp = det_pass.on_depth(ts, side, price, qty_delta)
                 if evp:
                     await insert_slice(evp)
                     for rule in eval_rules(_evdict(evp), ctx):
@@ -723,7 +727,11 @@ async def run_pipeline(
 
             # spoofing detector (necesita bests)
             bb, ba = engine.book.best()
-            ev_sp = det_spoof.on_depth(ts, r["side"], r["action"], float(r["price"]), float(r["qty"]), bb, ba)
+            book_qty = (
+                engine.book.bids.get(price) if side == "buy" else engine.book.asks.get(price)
+            )
+            spoof_qty = book_qty if book_qty is not None else qty_delta
+            ev_sp = det_spoof.on_depth(ts, side, r["action"], price, spoof_qty, bb, ba)
             if ev_sp:
                 for rule in eval_rules(_evdict(ev_sp), ctx):
                     aid, t0 = await upsert_rule(rule, ev_sp.ts)
