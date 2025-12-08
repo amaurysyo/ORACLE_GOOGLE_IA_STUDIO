@@ -587,8 +587,13 @@ async def run_pipeline(
     telemetry = Telemetry(db, BINANCE_FUT_INST, ctx.profile)
 
     # --- DB Tails configurados por ID ---
+    # Trades: Paginamos por 'trade_id_ext' para no perder ráfagas del mismo milisegundo
     tail_trades = DBTail(db, "binance_futures.trades", id_col="trade_id_ext", default_val=0)
+    
+    # Depth: Paginamos por 'seq' (UpdateID)
     tail_depth = DBTail(db, "binance_futures.depth", id_col="seq", default_val=0)
+    
+    # Mark: Seguimos usando 'event_time' (como no tiene ID secuencial claro y es baja frecuencia, es seguro)
     tail_mark = DBTail(db, "binance_futures.mark_funding", id_col="event_time", default_val=dt.datetime.fromtimestamp(0, tz=dt.timezone.utc))
 
     # Inicialización LIVE (Obtener MAX ID actual)
@@ -693,52 +698,32 @@ async def run_pipeline(
                     logger.error(f"[metrics] drop row {r}: {e2!s}")
 
     # ------------------- bucle principal -------------------
-    
-    # [FIX 1Hz] Variable de estado para controlar la frecuencia de métricas
-    last_metric_flush = 0.0
-    
     while True:
         # 1) depth -> book & métricas + slicing pasivo + spoofing
         # Paginación por ID (seq)
         for r in await tail_depth.fetch_new(BINANCE_FUT_INST, limit=5000):
             ts = r["event_time"].timestamp()
-            row_price = float(r["price"])
-            row_qty = float(r["qty"])
-            row_side = r["side"]
-            raw_action = r["action"]  # "update" | "delete"
+            engine.on_depth(ts, r["side"], r["action"], float(r["price"]), float(r["qty"]))
 
-            # --- CORRECCIÓN CRÍTICA: Derivar semántica correcta para Detectores ---
-            if row_side == "buy":
-                old_qty = engine.book.bids.get(row_price, 0.0)
-            else:
-                old_qty = engine.book.asks.get(row_price, 0.0)
-
-            is_new_level = (old_qty == 0.0 and row_qty > 0.0)
-            semantic_action = raw_action
-            if raw_action == "update" and is_new_level:
-                semantic_action = "insert"
-
-            engine.on_depth(ts, row_side, raw_action, row_price, row_qty)
-
-            # --- Lógica Slicing Pasivo (R7/R8) ---
-            delta_qty = row_qty - old_qty
-            if raw_action == "update" and delta_qty > 0:
-                evp = det_pass.on_depth(ts, row_side, row_price, delta_qty)
+            # slicing pasivo
+            if r["action"] == "insert" and float(r["qty"]) > 0:
+                evp = det_pass.on_depth(ts, r["side"], float(r["price"]), float(r["qty"]))
                 if evp:
                     await insert_slice(evp)
                     for rule in eval_rules(_evdict(evp), ctx):
                         alert_id, ts_first_dt = await upsert_rule(rule, evp.ts)
                         if alert_id is not None:
+                            # telemetría de emisión
                             telemetry.bump(evp.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                             text = (
                                 f"#{rule['rule']} {evp.side.upper()} slicing_pass @ {evp.price} | "
-                                f"added={evp.intensity:.2f} BTC"
+                                f"qty={evp.intensity:.2f} BTC"
                             )
                             await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
 
-            # --- Lógica Spoofing (R11/R12) ---
+            # spoofing detector (necesita bests)
             bb, ba = engine.book.best()
-            ev_sp = det_spoof.on_depth(ts, row_side, semantic_action, row_price, row_qty, bb, ba)
+            ev_sp = det_spoof.on_depth(ts, r["side"], r["action"], float(r["price"]), float(r["qty"]), bb, ba)
             if ev_sp:
                 for rule in eval_rules(_evdict(ev_sp), ctx):
                     aid, t0 = await upsert_rule(rule, ev_sp.ts)
@@ -751,6 +736,7 @@ async def run_pipeline(
                         await router.send("rules", text, alert_id=aid, ts_first=t0)
 
         # 2) mark funding -> basis
+        # Paginación por Tiempo (legacy para mark)
         for r in await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000):
             engine.on_mark(
                 r["event_time"].timestamp(),
@@ -759,6 +745,7 @@ async def run_pipeline(
             )
 
         # 2b) Deribit opciones ticker -> IV spikes (R19/R20) + OI skew (R21/R22)
+        # Nota: Mantenemos el polling directo por tiempo aquí ya que es otra tabla/lógica
         rows_opt = await db.fetch(
             """
             SELECT instrument_id,
@@ -804,6 +791,7 @@ async def run_pipeline(
 
                 underlying, opt_type = _parse_deribit_option(inst_id)
                 if underlying is None or opt_type is None:
+                    # Opcional: podrías añadir otro contador de parse-fail aquí
                     continue
 
                 prev = oi_last_by_instr.get(inst_id)
@@ -823,6 +811,7 @@ async def run_pipeline(
                 oi_c = oi_calls_by_und.get(underlying, 0.0)
                 oi_p = oi_puts_by_und.get(underlying, 0.0)
 
+                # Telemetría de descarte por OI insuficiente
                 total_oi = oi_c + oi_p
                 min_total_oi = float(getattr(oi_skew_det.cfg, "min_total_oi", 0.0) or 0.0)
                 if min_total_oi > 0.0 and total_oi < min_total_oi:
@@ -839,19 +828,24 @@ async def run_pipeline(
                             await router.send("rules", text, alert_id=aid, ts_first=t0)
 
         # 3) trades -> slicing (iceberg/hitting) + absorción + break_wall + tape_pressure + spoofing_exec
+        # Paginación por ID (trade_id_ext)
         for r in await tail_trades.fetch_new(BINANCE_FUT_INST, limit=5000):
             ts = r["event_time"].timestamp()
             side = r["side"]
             px = float(r["price"])
             qty = float(r["qty"])
 
+            # actualizar métricas por trade si tu engine lo usa
             engine.on_trade(ts, side, px, qty)
+
+            # spoofing: registrar ejecuciones cerca del muro
             det_spoof.on_trade(ts, side, px, qty)
 
+            # slicing iceberg/hitting
             ev1 = det_slice_eq.on_trade(ts, side, px, qty)
             ev2 = det_slice_hit.on_trade(ts, side, px, qty)
             for ev in filter(None, [ev1, ev2]):  # type: ignore
-                await insert_slice(ev)
+                await insert_slice(ev)  # persistir slice event
                 for rule in eval_rules(_evdict(ev), ctx):
                     alert_id, ts_first_dt = await upsert_rule(rule, ev.ts)
                     if alert_id is not None:
@@ -863,6 +857,7 @@ async def run_pipeline(
                         )
                         await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
 
+            # Absorción (usa bests actuales para validar drift)
             bb, ba = engine.book.best()
             det_abs.on_best(bb, ba)
             ev_abs = det_abs.on_trade(ts, side, px, qty)
@@ -877,6 +872,7 @@ async def run_pipeline(
                         )
                         await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
 
+            # BreakWall: gating por snapshot (depleción/refill/basis_vel)
             snap = engine.get_snapshot()
             if ev1 or ev2:
                 # Telemetría de descarte por falta de métricas (basis_vel)
@@ -908,6 +904,7 @@ async def run_pipeline(
                             ts, "R1/R2", (ev1 or ev2).side, **bump_kwargs,
                         )
 
+            # tape pressure
             ev_tp = tape_det.on_trade(ts, side, px, qty)
             if ev_tp:
                 for rule in eval_rules(_evdict(ev_tp), ctx):
@@ -920,10 +917,11 @@ async def run_pipeline(
                         )
                         await router.send("rules", text, alert_id=aid, ts_first=t0)
 
-        # 4) Triggers de snapshot
+        # 4) Triggers de snapshot: dominance, depletion, basis_extreme, basis_mean-revert
         snap = engine.get_snapshot()
         ts_now = dt.datetime.now(dt.timezone.utc).timestamp()
 
+        # Dominance (timer-based) con telemetría de descartes por spread
         if getattr(snap, "spread_usd", None) is None:
             telemetry.bump(ts_now, "R9/R10", "na", disc_metrics_none=1)
         elif float(snap.spread_usd or 0.0) > det_dom.cfg.max_spread_usd:
@@ -941,6 +939,7 @@ async def run_pipeline(
                         )
                         await router.send("rules", text, alert_id=aid, ts_first=t0)
 
+        # Depletion masivo (R13/R14)
         ev_dep_bid = dep_bid_det.on_snapshot(ts_now, snap.__dict__ if hasattr(snap, "__dict__") else dict())
         ev_dep_ask = dep_ask_det.on_snapshot(ts_now, snap.__dict__ if hasattr(snap, "__dict__") else dict())
         for evd in [ev_dep_bid, ev_dep_ask]:
@@ -952,6 +951,7 @@ async def run_pipeline(
                         text = f"#{rule['rule']} {evd.side.upper()} depletion {evd.intensity:.2f}"
                         await router.send("rules", text, alert_id=aid, ts_first=t0)
 
+        # Basis extremos (R15/R16) a través de MetricTrigger
         if getattr(snap, "basis_bps", None) is None:
             telemetry.bump(ts_now, "R15/R16", "na", disc_metrics_none=1)
         else:
@@ -966,6 +966,7 @@ async def run_pipeline(
                             text = f"#{rule['rule']} basis_bps={evb.intensity:.1f}"
                             await router.send("rules", text, alert_id=aid, ts_first=t0)
 
+        # Basis mean-revert (R17/R18)
         if getattr(snap, "basis_bps", None) is None or getattr(snap, "basis_vel_bps_s", None) is None:
             telemetry.bump(ts_now, "R17/R18", "na", disc_metrics_none=1)
         else:
@@ -981,12 +982,9 @@ async def run_pipeline(
                         )
                         await router.send("rules", text, alert_id=aid, ts_first=t0)
 
-        # 5) Flush de métricas y telemetría (1 Hz REAL)
+        # 5) Flush de métricas y telemetría (1 Hz)
         now_ts = dt.datetime.now(dt.timezone.utc).timestamp()
-        
-        # [CORRECCIÓN] Usar temporizador real, no comparación con ts_now
-        if (now_ts - last_metric_flush) >= 1.0:
-            last_metric_flush = now_ts
+        if (now_ts - ts_now) >= 0:  # ts_now es de este mismo tick
             now_dt = dt.datetime.fromtimestamp(now_ts, tz=dt.timezone.utc)
             snap = engine.get_snapshot()
             rows: List[Tuple[str, dt.datetime, int, str, float, Optional[str], str]] = []
@@ -1009,4 +1007,7 @@ async def run_pipeline(
             add("refill_bid_3s", getattr(snap, "refill_bid_3s", None))
             add("refill_ask_3s", getattr(snap, "refill_ask_3s", None))
 
-       
+            await insert_metrics(rows)
+            await telemetry.flush_if_needed()
+
+        await asyncio.sleep(0.05)  # 50ms cadence

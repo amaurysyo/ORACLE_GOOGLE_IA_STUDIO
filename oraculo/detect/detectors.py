@@ -273,9 +273,11 @@ class BreakWallDetector:
         self._k_buy = 0
         self._k_sell = 0
 
-    def on_slicing(self, ts: float, ev: Event, snapshot: Dict[str, Any]) -> Optional[Event]:
+    def on_slicing(
+        self, ts: float, ev: Event, snapshot: Dict[str, Any]
+    ) -> Tuple[Optional[Event], Optional[str]]:
         if ev.kind != "slicing_aggr":
-            return None
+            return None, None
         side = ev.side
         if side == "buy":
             self._k_buy += 1
@@ -286,11 +288,22 @@ class BreakWallDetector:
 
         k = self._k_buy if side == "buy" else self._k_sell
         if k < self.cfg.n_min:
-            return None
+            return None, None
 
-        bv = float(snapshot.get("basis_vel_bps_s", 0.0) or 0.0)
+        bv_raw = snapshot.get("basis_vel_bps_s")
+        if bv_raw is None:
+            return None, None
+
+        bv = float(bv_raw or 0.0)
         if abs(bv) < self.cfg.basis_vel_abs_bps_s:
-            return None
+            return None, "basis_vel_low"
+
+        if self.cfg.top_levels_gate and self.cfg.tick_size > 0:
+            ref_px = snapshot.get("best_ask") if side == "buy" else snapshot.get("best_bid")
+            if ref_px is not None:
+                ticks_diff = abs(ev.price - ref_px) / self.cfg.tick_size
+                if ticks_diff > float(self.cfg.top_levels_gate):
+                    return None, "top_levels_gate"
 
         dep_ok = True
         refill_ok = True
@@ -302,7 +315,11 @@ class BreakWallDetector:
                 dep_ok = float(snapshot.get("dep_bid", 0.0)) >= self.cfg.dep_pct
                 refill_ok = float(snapshot.get("refill_bid_3s", 0.0)) < self.cfg.forbid_refill_under_pct
         if not (dep_ok and refill_ok):
-            return None
+            if not dep_ok:
+                return None, "dep_low"
+            if not refill_ok:
+                return None, "refill_high"
+            return None, None
 
         return Event(
             "break_wall",
@@ -311,7 +328,7 @@ class BreakWallDetector:
             ev.price,
             ev.intensity,
             {"k": k, "basis_vel_bps_s": bv},
-        )
+        ), None
 
 # --------- Dominance ---------
 @dataclass
