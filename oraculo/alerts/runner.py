@@ -170,6 +170,10 @@ class Telemetry:
         disc_iv_missing: int = 0,
         disc_oi_missing: int = 0,
         disc_oi_low: int = 0,
+        disc_basis_vel_low: int = 0,
+        disc_dep_low: int = 0,
+        disc_refill_high: int = 0,
+        disc_top_levels_gate: int = 0,
     ) -> None:
         key = (self._bucket(ts), rule, side)
         d = self._agg.setdefault(
@@ -181,6 +185,10 @@ class Telemetry:
                 "disc_iv_missing": 0,
                 "disc_oi_missing": 0,
                 "disc_oi_low": 0,
+                "disc_basis_vel_low": 0,
+                "disc_dep_low": 0,
+                "disc_refill_high": 0,
+                "disc_top_levels_gate": 0,
             },
         )
         d["emitted"] += emitted
@@ -189,6 +197,10 @@ class Telemetry:
         d["disc_iv_missing"] += disc_iv_missing
         d["disc_oi_missing"] += disc_oi_missing
         d["disc_oi_low"] += disc_oi_low
+        d["disc_basis_vel_low"] += disc_basis_vel_low
+        d["disc_dep_low"] += disc_dep_low
+        d["disc_refill_high"] += disc_refill_high
+        d["disc_top_levels_gate"] += disc_top_levels_gate
 
     async def flush_if_needed(self) -> None:
         now = dt.datetime.now(dt.timezone.utc).timestamp()
@@ -211,6 +223,10 @@ class Telemetry:
                 int,
                 int,
                 int,
+                int,
+                int,
+                int,
+                int,
             ]
         ] = []
         for (ts_bucket, rule, side), c in list(self._agg.items()):
@@ -227,15 +243,21 @@ class Telemetry:
                     c["disc_iv_missing"],
                     c["disc_oi_missing"],
                     c["disc_oi_low"],
+                    c["disc_basis_vel_low"],
+                    c["disc_dep_low"],
+                    c["disc_refill_high"],
+                    c["disc_top_levels_gate"],
                 )
             )
         sql = """
             INSERT INTO oraculo.rule_telemetry(
               ts_bucket, instrument_id, profile, rule, side,
               emitted, disc_dom_spread, disc_metrics_none,
-              disc_iv_missing, disc_oi_missing, disc_oi_low
+              disc_iv_missing, disc_oi_missing, disc_oi_low,
+              disc_basis_vel_low, disc_dep_low, disc_refill_high,
+              disc_top_levels_gate
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
             ON CONFLICT (ts_bucket, instrument_id, profile, rule, side)
             DO UPDATE SET
               emitted = oraculo.rule_telemetry.emitted + EXCLUDED.emitted,
@@ -243,7 +265,11 @@ class Telemetry:
               disc_metrics_none = oraculo.rule_telemetry.disc_metrics_none + EXCLUDED.disc_metrics_none,
               disc_iv_missing = oraculo.rule_telemetry.disc_iv_missing + EXCLUDED.disc_iv_missing,
               disc_oi_missing = oraculo.rule_telemetry.disc_oi_missing + EXCLUDED.disc_oi_missing,
-              disc_oi_low = oraculo.rule_telemetry.disc_oi_low + EXCLUDED.disc_oi_low
+              disc_oi_low = oraculo.rule_telemetry.disc_oi_low + EXCLUDED.disc_oi_low,
+              disc_basis_vel_low = oraculo.rule_telemetry.disc_basis_vel_low + EXCLUDED.disc_basis_vel_low,
+              disc_dep_low = oraculo.rule_telemetry.disc_dep_low + EXCLUDED.disc_dep_low,
+              disc_refill_high = oraculo.rule_telemetry.disc_refill_high + EXCLUDED.disc_refill_high,
+              disc_top_levels_gate = oraculo.rule_telemetry.disc_top_levels_gate + EXCLUDED.disc_top_levels_gate
         """
         try:
             await self.db.execute_many(sql, rows)
@@ -561,13 +587,8 @@ async def run_pipeline(
     telemetry = Telemetry(db, BINANCE_FUT_INST, ctx.profile)
 
     # --- DB Tails configurados por ID ---
-    # Trades: Paginamos por 'trade_id_ext' para no perder ráfagas del mismo milisegundo
     tail_trades = DBTail(db, "binance_futures.trades", id_col="trade_id_ext", default_val=0)
-    
-    # Depth: Paginamos por 'seq' (UpdateID)
     tail_depth = DBTail(db, "binance_futures.depth", id_col="seq", default_val=0)
-    
-    # Mark: Seguimos usando 'event_time' (como no tiene ID secuencial claro y es baja frecuencia, es seguro)
     tail_mark = DBTail(db, "binance_futures.mark_funding", id_col="event_time", default_val=dt.datetime.fromtimestamp(0, tz=dt.timezone.utc))
 
     # Inicialización LIVE (Obtener MAX ID actual)
@@ -672,32 +693,52 @@ async def run_pipeline(
                     logger.error(f"[metrics] drop row {r}: {e2!s}")
 
     # ------------------- bucle principal -------------------
+    
+    # [FIX 1Hz] Variable de estado para controlar la frecuencia de métricas
+    last_metric_flush = 0.0
+    
     while True:
         # 1) depth -> book & métricas + slicing pasivo + spoofing
         # Paginación por ID (seq)
         for r in await tail_depth.fetch_new(BINANCE_FUT_INST, limit=5000):
             ts = r["event_time"].timestamp()
-            engine.on_depth(ts, r["side"], r["action"], float(r["price"]), float(r["qty"]))
+            row_price = float(r["price"])
+            row_qty = float(r["qty"])
+            row_side = r["side"]
+            raw_action = r["action"]  # "update" | "delete"
 
-            # slicing pasivo
-            if r["action"] == "insert" and float(r["qty"]) > 0:
-                evp = det_pass.on_depth(ts, r["side"], float(r["price"]), float(r["qty"]))
+            # --- CORRECCIÓN CRÍTICA: Derivar semántica correcta para Detectores ---
+            if row_side == "buy":
+                old_qty = engine.book.bids.get(row_price, 0.0)
+            else:
+                old_qty = engine.book.asks.get(row_price, 0.0)
+
+            is_new_level = (old_qty == 0.0 and row_qty > 0.0)
+            semantic_action = raw_action
+            if raw_action == "update" and is_new_level:
+                semantic_action = "insert"
+
+            engine.on_depth(ts, row_side, raw_action, row_price, row_qty)
+
+            # --- Lógica Slicing Pasivo (R7/R8) ---
+            delta_qty = row_qty - old_qty
+            if raw_action == "update" and delta_qty > 0:
+                evp = det_pass.on_depth(ts, row_side, row_price, delta_qty)
                 if evp:
                     await insert_slice(evp)
                     for rule in eval_rules(_evdict(evp), ctx):
                         alert_id, ts_first_dt = await upsert_rule(rule, evp.ts)
                         if alert_id is not None:
-                            # telemetría de emisión
                             telemetry.bump(evp.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                             text = (
                                 f"#{rule['rule']} {evp.side.upper()} slicing_pass @ {evp.price} | "
-                                f"qty={evp.intensity:.2f} BTC"
+                                f"added={evp.intensity:.2f} BTC"
                             )
                             await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
 
-            # spoofing detector (necesita bests)
+            # --- Lógica Spoofing (R11/R12) ---
             bb, ba = engine.book.best()
-            ev_sp = det_spoof.on_depth(ts, r["side"], r["action"], float(r["price"]), float(r["qty"]), bb, ba)
+            ev_sp = det_spoof.on_depth(ts, row_side, semantic_action, row_price, row_qty, bb, ba)
             if ev_sp:
                 for rule in eval_rules(_evdict(ev_sp), ctx):
                     aid, t0 = await upsert_rule(rule, ev_sp.ts)
@@ -710,7 +751,6 @@ async def run_pipeline(
                         await router.send("rules", text, alert_id=aid, ts_first=t0)
 
         # 2) mark funding -> basis
-        # Paginación por Tiempo (legacy para mark)
         for r in await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000):
             engine.on_mark(
                 r["event_time"].timestamp(),
@@ -719,7 +759,6 @@ async def run_pipeline(
             )
 
         # 2b) Deribit opciones ticker -> IV spikes (R19/R20) + OI skew (R21/R22)
-        # Nota: Mantenemos el polling directo por tiempo aquí ya que es otra tabla/lógica
         rows_opt = await db.fetch(
             """
             SELECT instrument_id,
@@ -765,7 +804,6 @@ async def run_pipeline(
 
                 underlying, opt_type = _parse_deribit_option(inst_id)
                 if underlying is None or opt_type is None:
-                    # Opcional: podrías añadir otro contador de parse-fail aquí
                     continue
 
                 prev = oi_last_by_instr.get(inst_id)
@@ -785,7 +823,6 @@ async def run_pipeline(
                 oi_c = oi_calls_by_und.get(underlying, 0.0)
                 oi_p = oi_puts_by_und.get(underlying, 0.0)
 
-                # Telemetría de descarte por OI insuficiente
                 total_oi = oi_c + oi_p
                 min_total_oi = float(getattr(oi_skew_det.cfg, "min_total_oi", 0.0) or 0.0)
                 if min_total_oi > 0.0 and total_oi < min_total_oi:
@@ -802,24 +839,19 @@ async def run_pipeline(
                             await router.send("rules", text, alert_id=aid, ts_first=t0)
 
         # 3) trades -> slicing (iceberg/hitting) + absorción + break_wall + tape_pressure + spoofing_exec
-        # Paginación por ID (trade_id_ext)
         for r in await tail_trades.fetch_new(BINANCE_FUT_INST, limit=5000):
             ts = r["event_time"].timestamp()
             side = r["side"]
             px = float(r["price"])
             qty = float(r["qty"])
 
-            # actualizar métricas por trade si tu engine lo usa
             engine.on_trade(ts, side, px, qty)
-
-            # spoofing: registrar ejecuciones cerca del muro
             det_spoof.on_trade(ts, side, px, qty)
 
-            # slicing iceberg/hitting
             ev1 = det_slice_eq.on_trade(ts, side, px, qty)
             ev2 = det_slice_hit.on_trade(ts, side, px, qty)
             for ev in filter(None, [ev1, ev2]):  # type: ignore
-                await insert_slice(ev)  # persistir slice event
+                await insert_slice(ev)
                 for rule in eval_rules(_evdict(ev), ctx):
                     alert_id, ts_first_dt = await upsert_rule(rule, ev.ts)
                     if alert_id is not None:
@@ -831,7 +863,6 @@ async def run_pipeline(
                         )
                         await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
 
-            # Absorción (usa bests actuales para validar drift)
             bb, ba = engine.book.best()
             det_abs.on_best(bb, ba)
             ev_abs = det_abs.on_trade(ts, side, px, qty)
@@ -846,13 +877,14 @@ async def run_pipeline(
                         )
                         await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
 
-            # BreakWall: gating por snapshot (depleción/refill/basis_vel)
             snap = engine.get_snapshot()
             if ev1 or ev2:
                 # Telemetría de descarte por falta de métricas (basis_vel)
                 if getattr(snap, "basis_vel_bps_s", None) is None:
                     telemetry.bump(ts, "R1/R2", (ev1 or ev2).side, disc_metrics_none=1)
-                e2 = det_bw.on_slicing(ts, ev1 or ev2, snap.__dict__ if hasattr(snap, "__dict__") else dict())
+                e2, gating_reason = det_bw.on_slicing(
+                    ts, ev1 or ev2, snap.__dict__ if hasattr(snap, "__dict__") else dict()
+                )
                 if e2:
                     for rule in eval_rules(_evdict(e2), ctx):
                         alert_id, ts_first_dt = await upsert_rule(rule, e2.ts)
@@ -863,8 +895,19 @@ async def run_pipeline(
                                 f"k={e2.fields.get('k')}"
                             )
                             await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
+                elif gating_reason:
+                    reason_map = {
+                        "basis_vel_low": {"disc_basis_vel_low": 1},
+                        "dep_low": {"disc_dep_low": 1},
+                        "refill_high": {"disc_refill_high": 1},
+                        "top_levels_gate": {"disc_top_levels_gate": 1},
+                    }
+                    bump_kwargs = reason_map.get(gating_reason, {})
+                    if bump_kwargs:
+                        telemetry.bump(
+                            ts, "R1/R2", (ev1 or ev2).side, **bump_kwargs,
+                        )
 
-            # tape pressure
             ev_tp = tape_det.on_trade(ts, side, px, qty)
             if ev_tp:
                 for rule in eval_rules(_evdict(ev_tp), ctx):
@@ -877,11 +920,10 @@ async def run_pipeline(
                         )
                         await router.send("rules", text, alert_id=aid, ts_first=t0)
 
-        # 4) Triggers de snapshot: dominance, depletion, basis_extreme, basis_mean-revert
+        # 4) Triggers de snapshot
         snap = engine.get_snapshot()
         ts_now = dt.datetime.now(dt.timezone.utc).timestamp()
 
-        # Dominance (timer-based) con telemetría de descartes por spread
         if getattr(snap, "spread_usd", None) is None:
             telemetry.bump(ts_now, "R9/R10", "na", disc_metrics_none=1)
         elif float(snap.spread_usd or 0.0) > det_dom.cfg.max_spread_usd:
@@ -899,7 +941,6 @@ async def run_pipeline(
                         )
                         await router.send("rules", text, alert_id=aid, ts_first=t0)
 
-        # Depletion masivo (R13/R14)
         ev_dep_bid = dep_bid_det.on_snapshot(ts_now, snap.__dict__ if hasattr(snap, "__dict__") else dict())
         ev_dep_ask = dep_ask_det.on_snapshot(ts_now, snap.__dict__ if hasattr(snap, "__dict__") else dict())
         for evd in [ev_dep_bid, ev_dep_ask]:
@@ -911,7 +952,6 @@ async def run_pipeline(
                         text = f"#{rule['rule']} {evd.side.upper()} depletion {evd.intensity:.2f}"
                         await router.send("rules", text, alert_id=aid, ts_first=t0)
 
-        # Basis extremos (R15/R16) a través de MetricTrigger
         if getattr(snap, "basis_bps", None) is None:
             telemetry.bump(ts_now, "R15/R16", "na", disc_metrics_none=1)
         else:
@@ -926,7 +966,6 @@ async def run_pipeline(
                             text = f"#{rule['rule']} basis_bps={evb.intensity:.1f}"
                             await router.send("rules", text, alert_id=aid, ts_first=t0)
 
-        # Basis mean-revert (R17/R18)
         if getattr(snap, "basis_bps", None) is None or getattr(snap, "basis_vel_bps_s", None) is None:
             telemetry.bump(ts_now, "R17/R18", "na", disc_metrics_none=1)
         else:
@@ -942,9 +981,12 @@ async def run_pipeline(
                         )
                         await router.send("rules", text, alert_id=aid, ts_first=t0)
 
-        # 5) Flush de métricas y telemetría (1 Hz)
+        # 5) Flush de métricas y telemetría (1 Hz REAL)
         now_ts = dt.datetime.now(dt.timezone.utc).timestamp()
-        if (now_ts - ts_now) >= 0:  # ts_now es de este mismo tick
+        
+        # [CORRECCIÓN] Usar temporizador real, no comparación con ts_now
+        if (now_ts - last_metric_flush) >= 1.0:
+            last_metric_flush = now_ts
             now_dt = dt.datetime.fromtimestamp(now_ts, tz=dt.timezone.utc)
             snap = engine.get_snapshot()
             rows: List[Tuple[str, dt.datetime, int, str, float, Optional[str], str]] = []
@@ -967,7 +1009,4 @@ async def run_pipeline(
             add("refill_bid_3s", getattr(snap, "refill_bid_3s", None))
             add("refill_ask_3s", getattr(snap, "refill_ask_3s", None))
 
-            await insert_metrics(rows)
-            await telemetry.flush_if_needed()
-
-        await asyncio.sleep(0.05)  # 50ms cadence
+       
