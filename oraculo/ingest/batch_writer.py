@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Iterable
 
@@ -42,6 +43,8 @@ class AsyncBatcher:
 
     def add(self, key: str, row: tuple) -> None:
         q = self._queues[key]
+        # Serializamos diccionarios para campos jsonb; asyncpg espera str y no objetos nativos
+        row = tuple(json.dumps(v) if isinstance(v, dict) else v for v in row)
         # Si la cola estaba vacía, marcamos el instante de la primera fila
         if not q:
             self._queued_first_ts[key] = time.monotonic()
