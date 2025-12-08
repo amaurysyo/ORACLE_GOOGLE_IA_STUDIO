@@ -341,7 +341,7 @@ class AuditOrderbookRunner:
             bid_qtys,
             ask_prices,
             ask_qtys,
-            {},
+            json.dumps({}),
         )
         self._batcher.add("audit_orderbook_snapshot", row)
         await self._batcher.flush_if_needed()
