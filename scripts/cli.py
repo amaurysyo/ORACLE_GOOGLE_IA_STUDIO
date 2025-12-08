@@ -71,7 +71,10 @@ def env_group() -> None:
 def env_doctor(full: bool) -> None:
     """Chequea UBWA, proxies/TLS, ping Binance y DB. Con --full dispara prueba REST."""
     _load_env()
-    cfg = load_config(str(ROOT / "config" / "config.yaml"))
+    from oraculo.config_hot import ConfigManager
+
+    cfg_mgr = ConfigManager(ROOT)
+    cfg = cfg_mgr.cfg
     setup_logging_json(ROOT, "INFO", "10 MB", "7 days", True)
 
     async def _run() -> None:
@@ -375,6 +378,7 @@ def ingest_run() -> None:
         from oraculo.ingest.binance_ws_spot import run_binance_spot_ingest
         from oraculo.ingest.binance_rest import run_open_interest_poller, run_top_traders_pollers
         from oraculo.ingest.deribit_ws import DeribitRunner
+        from oraculo.ingest.binance_orderbook_audit import AuditOrderbookRunner
 
         db = DB(cfg.app.storage.dsn)
         await db.connect()
@@ -455,10 +459,13 @@ def ingest_run() -> None:
            VALUES ($1,to_timestamp($2/1000.0),$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12)ON CONFLICT DO NOTHING"""
        )
         batcher.register_stmt(
-            "deriv_mark",
+           "deriv_mark",
             "INSERT INTO deribit.options_mark_price(instrument_id,event_time,mark_price,underlying_price,iv_mark,meta)"
             " VALUES ($1,to_timestamp($2/1000.0),$3,$4,$5,$6::jsonb) ON CONFLICT DO NOTHING",
         )
+
+        # Audit orderbook snapshots
+        audit_runner = AuditOrderbookRunner(db=db, batcher=batcher, cfg_mgr=cfg_mgr)
 
         tasks: list[asyncio.Task] = []
 
@@ -532,6 +539,21 @@ def ingest_run() -> None:
             )
             tasks.append(asyncio.create_task(runner.run(), name="ingest-deribit"))
             logger.info("DERIBIT WS habilitado.")
+
+        # Audit orderbook (hot-reload aware)
+        tasks.append(asyncio.create_task(audit_runner.run(), name="audit-orderbook"))
+        logger.info("Audit orderbook pipeline inicializado.")
+
+        # Hot reload watcher for config/rules
+        hot = True
+        debounce = 300
+        try:
+            hot_cfg = getattr(cfg, "hot_reload", None) or {}
+            hot = bool(hot_cfg.get("enabled", True))
+            debounce = int(hot_cfg.get("debounce_ms", 300))
+        except Exception:
+            pass
+        asyncio.create_task(cfg_mgr.watch(enabled=hot, debounce_ms=debounce))
 
         await asyncio.gather(*tasks)
 
