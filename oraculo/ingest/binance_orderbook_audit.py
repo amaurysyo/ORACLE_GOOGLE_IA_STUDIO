@@ -20,6 +20,7 @@ from .batch_writer import AsyncBatcher
 
 REST_BASE = "https://fapi.binance.com"
 WS_BASE = "wss://fstream.binance.com/stream"
+MAX_REST_LIMIT = 1000
 
 
 @dataclass
@@ -233,7 +234,7 @@ class AuditOrderbookRunner:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.error("Audit orderbook stream error: %s", exc)
+                logger.exception("Audit orderbook stream error: {}", exc)
                 await asyncio.sleep(1.0)
 
     async def _run_once(self, settings: AuditOrderbookSettings, book: LocalOrderBook) -> None:
@@ -242,6 +243,11 @@ class AuditOrderbookRunner:
             channel = f"{channel}@{settings.stream_speed}"
         url = f"{WS_BASE}?streams={channel}"
         limit = max(5, settings.max_levels_per_side * 2)
+        if limit > MAX_REST_LIMIT:
+            logger.warning(
+                "Requested depth limit %s exceeds REST max %s; clamping to %s", limit, MAX_REST_LIMIT, MAX_REST_LIMIT
+            )
+            limit = MAX_REST_LIMIT
 
         async with aiohttp.ClientSession() as http:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
@@ -258,33 +264,7 @@ class AuditOrderbookRunner:
 
                 reader_task = asyncio.create_task(_reader())
                 try:
-                    # 1) snapshot REST
-                    async with http.get(
-                        f"{REST_BASE}/fapi/v1/depth",
-                        params={"symbol": settings.symbol.upper(), "limit": limit},
-                        timeout=aiohttp.ClientTimeout(total=5),
-                    ) as r:
-                        r.raise_for_status()
-                        snap = await r.json()
-                    book.apply_snapshot(int(snap["lastUpdateId"]), snap.get("bids", []), snap.get("asks", []))
-
-                    # 2) vaciar buffer inicial
-                    while not queue.empty():
-                        buffer.append(await queue.get())
-                    buffer.sort(key=lambda e: e.get("u", 0))
-                    # 3) descartar viejos
-                    buffer = [e for e in buffer if int(e.get("u", 0)) >= book.last_update_id]
-                    # 4) procesar primer evento válido
-                    for evt in list(buffer):
-                        U = int(evt.get("U", 0))
-                        u = int(evt.get("u", 0))
-                        if U <= book.last_update_id <= u:
-                            book.apply_diff(evt)
-                            buffer = [e for e in buffer if int(e.get("u", 0)) > u]
-                            break
-                    # 5) resto de eventos en buffer
-                    for evt in buffer:
-                        await self._apply_or_resync(evt, book)
+                    await self._resync_from_snapshot(http, settings, queue, book, limit)
 
                     # 6) bucle principal
                     next_snapshot = asyncio.get_event_loop().time() + self._snapshot_interval_ms / 1000.0
@@ -296,6 +276,11 @@ class AuditOrderbookRunner:
                         except asyncio.TimeoutError:
                             await self._emit_snapshot(settings, book)
                             next_snapshot = asyncio.get_event_loop().time() + self._snapshot_interval_ms / 1000.0
+                        except GapDetected as gap:
+                            logger.warning(
+                                "Gap detected during audit stream pu=%s last=%s; resyncing", gap.pu, gap.last
+                            )
+                            await self._resync_from_snapshot(http, settings, queue, book, limit)
                 finally:
                     reader_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -304,8 +289,45 @@ class AuditOrderbookRunner:
     async def _apply_or_resync(self, event: Dict[str, Any], book: LocalOrderBook) -> None:
         pu = int(event.get("pu", 0))
         if book.last_update_id and pu != book.last_update_id:
-            raise RuntimeError(f"Gap detected pu={pu} last={book.last_update_id}")
+            raise GapDetected(pu, book.last_update_id)
         book.apply_diff(event)
+
+    async def _resync_from_snapshot(
+        self,
+        http: aiohttp.ClientSession,
+        settings: AuditOrderbookSettings,
+        queue: "asyncio.Queue[Dict[str, Any]]",
+        book: LocalOrderBook,
+        limit: int,
+    ) -> None:
+        # 1) snapshot REST
+        async with http.get(
+            f"{REST_BASE}/fapi/v1/depth",
+            params={"symbol": settings.symbol.upper(), "limit": limit},
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as r:
+            r.raise_for_status()
+            snap = await r.json()
+        book.apply_snapshot(int(snap["lastUpdateId"]), snap.get("bids", []), snap.get("asks", []))
+
+        # 2) vaciar buffer inicial
+        buffer: list[Dict[str, Any]] = []
+        while not queue.empty():
+            buffer.append(await queue.get())
+        buffer.sort(key=lambda e: e.get("u", 0))
+        # 3) descartar viejos
+        buffer = [e for e in buffer if int(e.get("u", 0)) >= book.last_update_id]
+        # 4) procesar primer evento válido
+        for evt in list(buffer):
+            U = int(evt.get("U", 0))
+            u = int(evt.get("u", 0))
+            if U <= book.last_update_id <= u:
+                book.apply_diff(evt)
+                buffer = [e for e in buffer if int(e.get("u", 0)) > u]
+                break
+        # 5) resto de eventos en buffer
+        for evt in buffer:
+            await self._apply_or_resync(evt, book)
 
     async def _emit_snapshot(self, settings: AuditOrderbookSettings, book: LocalOrderBook) -> None:
         if not book.bids or not book.asks:
@@ -325,10 +347,17 @@ class AuditOrderbookRunner:
             bid_qtys,
             ask_prices,
             ask_qtys,
-            {},
+            json.dumps({}),
         )
         self._batcher.add("audit_orderbook_snapshot", row)
         await self._batcher.flush_if_needed()
+
+
+class GapDetected(RuntimeError):
+    def __init__(self, pu: int, last: int):
+        super().__init__(f"Gap detected pu={pu} last={last}")
+        self.pu = pu
+        self.last = last
 
 
 __all__ = [
