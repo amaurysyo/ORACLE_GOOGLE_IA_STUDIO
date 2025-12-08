@@ -20,6 +20,7 @@ from .batch_writer import AsyncBatcher
 
 REST_BASE = "https://fapi.binance.com"
 WS_BASE = "wss://fstream.binance.com/stream"
+MAX_REST_LIMIT = 1000
 
 
 @dataclass
@@ -242,6 +243,11 @@ class AuditOrderbookRunner:
             channel = f"{channel}@{settings.stream_speed}"
         url = f"{WS_BASE}?streams={channel}"
         limit = max(5, settings.max_levels_per_side * 2)
+        if limit > MAX_REST_LIMIT:
+            logger.warning(
+                "Requested depth limit %s exceeds REST max %s; clamping to %s", limit, MAX_REST_LIMIT, MAX_REST_LIMIT
+            )
+            limit = MAX_REST_LIMIT
 
         async with aiohttp.ClientSession() as http:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
@@ -281,9 +287,35 @@ class AuditOrderbookRunner:
                         await reader_task
 
     async def _apply_or_resync(self, event: Dict[str, Any], book: LocalOrderBook) -> None:
+        """Apply a depth diff or trigger resync if a gap is detected.
+
+        Binance exige la siguiente condición para aplicar un diff tras el snapshot:
+        U <= lastUpdateId + 1 <= u. Además, para la continuidad entre diffs
+        sucesivos: U <= last_update_id + 1 <= u y (pu == last_update_id cuando pu
+        está presente). Esta lógica evita falsos positivos de gap cuando el REST
+        está clampado a MAX_REST_LIMIT.
+        """
+
         pu = int(event.get("pu", 0))
-        if book.last_update_id and pu != book.last_update_id:
-            raise GapDetected(pu, book.last_update_id)
+        U = int(event.get("U", 0))
+        u = int(event.get("u", 0))
+
+        # Eventos atrasados: los descartamos silenciosamente
+        if book.last_update_id and u <= book.last_update_id:
+            return
+
+        # Validar continuidad según reglas oficiales
+        if book.last_update_id:
+            expected_min = book.last_update_id + 1
+            if not (U <= expected_min <= u):
+                raise GapDetected(pu or U, book.last_update_id)
+            if pu and pu != book.last_update_id:
+                raise GapDetected(pu, book.last_update_id)
+        else:
+            # Primer evento tras snapshot: necesita U <= last <= u
+            if not (U <= u and (book.last_update_id or 0) <= u):
+                raise GapDetected(pu or U, book.last_update_id)
+
         book.apply_diff(event)
 
     async def _resync_from_snapshot(
