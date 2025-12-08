@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from oraculo.config import load_config
+from oraculo.config_hot import ConfigManager
 from oraculo.db import DB
 from oraculo.ingest.batch_writer import AsyncBatcher
 from oraculo.obs.logging import setup_logging_json
@@ -362,7 +363,10 @@ def ingest_group() -> None:
 def ingest_run() -> None:
     """WS FUTURES (trade/depth/mark/forceOrder) + REST (OI/top_traders) + WS SPOT + WS DERIBIT (si enabled)."""
     _load_env()
-    cfg = load_config(str(ROOT / "config" / "config.yaml"))
+
+    # Usar ConfigManager para poder tener hot-reload
+    cfg_mgr = ConfigManager(ROOT)
+    cfg = cfg_mgr.cfg
     logcfg = (cfg.observability or {}).get("logging", {}) if cfg.observability else {}
     setup_logging_json(
         ROOT,
