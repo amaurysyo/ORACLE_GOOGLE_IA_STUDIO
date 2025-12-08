@@ -323,17 +323,25 @@ class AuditOrderbookRunner:
         if book.last_update_id and u <= book.last_update_id:
             return
 
-        # Validar continuidad según reglas oficiales
+        # Validar continuidad según reglas oficiales, pero siendo tolerantes con
+        # diffs que aún no encajan y deberían ser descartados en lugar de
+        # forzar una resincronización inmediata.
         if book.last_update_id:
             expected_min = book.last_update_id + 1
-            if not (U <= expected_min <= u):
+            if u < expected_min:
+                return  # diff atrasado
+            if U > expected_min:
                 raise GapDetected(pu or U, book.last_update_id)
             if pu and pu != book.last_update_id:
-                raise GapDetected(pu, book.last_update_id)
+                logger.debug("Descartando diff con pu=%s; last=%s", pu, book.last_update_id)
+                return
         else:
-            # Primer evento tras snapshot: necesita U <= last <= u
-            if not (U <= u and (book.last_update_id or 0) <= u):
-                raise GapDetected(pu or U, book.last_update_id)
+            # Primer evento tras snapshot: necesita U <= last+1 <= u. Si no se
+            # cumple, descartamos y seguimos esperando un diff válido en lugar
+            # de resincronizar inmediatamente.
+            expected_min = (book.last_update_id or 0) + 1
+            if not (U <= expected_min <= u):
+                return
 
         book.apply_diff(event)
 
