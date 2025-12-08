@@ -13,10 +13,31 @@ class OrderBook:
         self.bids: Dict[float, float] = {}
         self.asks: Dict[float, float] = {}
 
-    def apply(self, side: str, action: str, price: float, qty: float) -> None:
+    def apply(self, side: str, action: str, price: float, qty: float, *, qty_is_delta: bool = False) -> None:
+        """Aplica cambios al libro manteniendo cantidades absolutas.
+
+        Los feeds de profundidad en Oráculo envían qty como delta (insert/delete) y
+        necesitamos reconstruir el tamaño absoluto del nivel antes de almacenarlo.
+        """
         book = self.bids if side == "buy" else self.asks
+        prev = book.get(price, 0.0)
+
+        if qty_is_delta:
+            if action == "delete":
+                qty_abs = max(prev - qty, 0.0)
+            else:
+                qty_abs = max(prev + qty, 0.0)
+
+            if qty_abs <= 0:
+                action = "delete"
+            elif prev == 0:
+                action = "insert"
+            else:
+                action = "update"
+            qty = qty_abs
+
         if action == "insert":
-            book[price] = book.get(price, 0.0) + qty
+            book[price] = qty
             if book[price] <= 0:
                 book.pop(price, None)
         elif action == "update":
@@ -25,8 +46,7 @@ class OrderBook:
                 book.pop(price, None)
         elif action == "delete":
             # qty = cantidad retirada (no la dejamos negativa)
-            old = book.get(price, 0.0)
-            left = max(old - qty, 0.0)
+            left = max(prev - qty, 0.0) if not qty_is_delta else 0.0
             if left <= 0:
                 book.pop(price, None)
             else:
@@ -89,8 +109,8 @@ class MetricsEngine:
 
     # ---- entradas ----
     def on_depth(self, ts: float, side: str, action: str, price: float, qty: float) -> None:
-        # book
-        self.book.apply(side, action, price, qty)
+        # book (las qty que vienen del feed son deltas; convertir a abs antes de mutar)
+        self.book.apply(side, action, price, qty, qty_is_delta=True)
 
         # activar contadores simples de ins/del
         ins, dels = 0.0, 0.0

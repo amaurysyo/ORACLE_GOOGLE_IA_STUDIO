@@ -38,12 +38,32 @@ class L2Book:
         except ValueError:
             pass
 
-    def apply(self, side: str, action: str, price: float, qty: float) -> None:
+    def apply(self, side: str, action: str, price: float, qty: float, *, qty_is_delta: bool = False) -> None:
         """
         side: 'buy'|'sell'
         action: 'insert'|'update'|'delete'
+
+        qty_is_delta: si True, qty representa el cambio incremental (±) y se
+        traduce a cantidad absoluta antes de mutar el libro. Útil cuando el
+        feed emite "insert/delete" con deltas en vez de cantidades absolutas.
         """
         book = self.bids if side == "buy" else self.asks
+        prev = book.get(price, 0.0)
+
+        # Convertir a cantidad absoluta cuando recibimos delta.
+        if qty_is_delta:
+            if action == "delete":
+                qty_abs = max(prev - qty, 0.0)
+            else:
+                qty_abs = max(prev + qty, 0.0)
+            if qty_abs <= 0:
+                action = "delete"
+            elif prev == 0:
+                action = "insert"
+            else:
+                action = "update"
+            qty = qty_abs
+
         if action == "delete" or qty <= 0:
             if price in book:
                 book.pop(price, None)
