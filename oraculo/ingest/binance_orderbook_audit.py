@@ -233,7 +233,7 @@ class AuditOrderbookRunner:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.error("Audit orderbook stream error: %s", exc)
+                logger.exception("Audit orderbook stream error: {}", exc)
                 await asyncio.sleep(1.0)
 
     async def _run_once(self, settings: AuditOrderbookSettings, book: LocalOrderBook) -> None:
