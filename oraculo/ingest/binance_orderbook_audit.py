@@ -287,7 +287,7 @@ class AuditOrderbookRunner:
                     with contextlib.suppress(asyncio.CancelledError):
                         await reader_task
 
-        async def _apply_or_resync(self, event: Dict[str, Any], book: LocalOrderBook) -> None:
+    async def _apply_or_resync(self, event: Dict[str, Any], book: LocalOrderBook) -> None:
         """Aplica un diff de depth o dispara resincronización si hay gap.
 
         Reglas Binance Futures:
@@ -301,43 +301,43 @@ class AuditOrderbookRunner:
           * Además, si pu está presente y pu != last_update_id -> gap -> resync.
         """
 
-            pu = int(event.get("pu", 0))
-            U = int(event.get("U", 0))
-            u = int(event.get("u", 0))
-    
-            last = int(book.last_update_id or 0)
-    
-            # 1) Eventos claramente atrasados
-            if last and u <= last:
-                return
-    
-            if not last:
-                # No deberíamos aplicar diffs sin haber aplicado antes un snapshot
-                # (o un diff "de enganche" en _resync_from_snapshot). Por seguridad,
-                # simplemente ignoramos hasta que _resync_from_snapshot fije last_update_id.
-                return
-    
-            expected_min = last + 1
-    
-            # 2) Chequeo de continuidad en IDs (U/u)
-            if not (U <= expected_min <= u):
-                # Esto significa que nos hemos saltado uno o más updates
-                raise GapDetected(pu or U, last)
-    
-            # 3) Chequeo de continuidad vía `pu`
-            if pu and pu != last:
-                # Regla oficial: si pu != u_anterior -> hay gap -> resync
-                logger.warning(
-                    "Audit orderbook gap by pu mismatch: pu=%s last=%s (U=%s u=%s)",
-                    pu,
-                    last,
-                    U,
-                    u,
-                )
-                raise GapDetected(pu, last)
-    
-            # 4) Todo OK: aplicamos diff
-            book.apply_diff(event)
+        pu = int(event.get("pu", 0))
+        U = int(event.get("U", 0))
+        u = int(event.get("u", 0))
+
+        last = int(book.last_update_id or 0)
+
+        # 1) Eventos claramente atrasados
+        if last and u <= last:
+            return
+
+        if not last:
+            # No deberíamos aplicar diffs sin haber aplicado antes un snapshot
+            # (o un diff "de enganche" en _resync_from_snapshot). Por seguridad,
+            # simplemente ignoramos hasta que _resync_from_snapshot fije last_update_id.
+            return
+
+        expected_min = last + 1
+
+        # 2) Chequeo de continuidad en IDs (U/u)
+        if not (U <= expected_min <= u):
+            # Esto significa que nos hemos saltado uno o más updates
+            raise GapDetected(pu or U, last)
+
+        # 3) Chequeo de continuidad vía `pu`
+        if pu and pu != last:
+            # Regla oficial: si pu != u_anterior -> hay gap -> resync
+            logger.warning(
+                "Audit orderbook gap by pu mismatch: pu=%s last=%s (U=%s u=%s)",
+                pu,
+                last,
+                U,
+                u,
+            )
+            raise GapDetected(pu, last)
+
+        # 4) Todo OK: aplicamos diff
+        book.apply_diff(event)
 
 
     async def _resync_from_snapshot(
