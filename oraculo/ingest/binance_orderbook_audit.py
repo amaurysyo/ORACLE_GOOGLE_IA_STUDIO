@@ -148,12 +148,12 @@ class AuditOrderbookRunner:
                 instrument_id, event_time, last_update_id,
                 best_bid, best_ask, spread_usd,
                 bid_prices, bid_qtys, ask_prices, ask_qtys,
-                meta
+                meta, inserted_at
             ) VALUES (
                 $1, to_timestamp($2/1000.0), $3,
                 $4, $5, $6,
                 $7, $8, $9, $10,
-                $11::jsonb
+                $11::jsonb, now()
             ) ON CONFLICT DO NOTHING
             """,
         )
@@ -182,6 +182,7 @@ class AuditOrderbookRunner:
                 ask_prices      double precision[]   NOT NULL,
                 ask_qtys        double precision[]   NOT NULL,
                 meta            jsonb                NOT NULL DEFAULT '{}'::jsonb,
+                inserted_at     timestamptz          NOT NULL DEFAULT now(),
                 PRIMARY KEY (instrument_id, event_time)
             );
             """
