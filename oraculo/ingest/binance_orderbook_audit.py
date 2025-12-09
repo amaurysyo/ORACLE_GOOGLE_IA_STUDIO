@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
-from aiohttp import ClientResponseError
 import websockets
 from loguru import logger
 
@@ -252,6 +251,7 @@ class AuditOrderbookRunner:
 
         async with aiohttp.ClientSession() as http:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                buffer: list[Dict[str, Any]] = []
                 queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
 
                 async def _reader() -> None:
@@ -263,86 +263,33 @@ class AuditOrderbookRunner:
                         await queue.put(evt)
 
                 reader_task = asyncio.create_task(_reader())
-                resync_backoff = 1.0
                 try:
-                    while True:
-                        try:
-                            await self._resync_from_snapshot(http, settings, queue, book, limit)
-                            resync_backoff = 1.0
-                        except ClientResponseError as exc:
-                            logger.warning(
-                                "Snapshot REST error status=%s url=%s; backoff %.1fs",
-                                exc.status,
-                                exc.request_info.real_url,
-                                resync_backoff,
-                            )
-                            await asyncio.sleep(resync_backoff)
-                            resync_backoff = min(resync_backoff * 2, 30.0)
-                            continue
+                    await self._resync_from_snapshot(http, settings, queue, book, limit)
 
-                        # 6) bucle principal
-                        next_snapshot = asyncio.get_event_loop().time() + self._snapshot_interval_ms / 1000.0
-                        while True:
-                            timeout = max(0.0, next_snapshot - asyncio.get_event_loop().time())
-                            try:
-                                evt = await asyncio.wait_for(queue.get(), timeout=timeout)
-                                await self._apply_or_resync(evt, book)
-                            except asyncio.TimeoutError:
-                                await self._emit_snapshot(settings, book)
-                                next_snapshot = asyncio.get_event_loop().time() + self._snapshot_interval_ms / 1000.0
-                            except GapDetected as gap:
-                                logger.warning(
-                                    "Gap detected during audit stream pu=%s last=%s; resyncing after %.1fs",
-                                    gap.pu,
-                                    gap.last,
-                                    resync_backoff,
-                                )
-                                await asyncio.sleep(resync_backoff)
-                                resync_backoff = min(resync_backoff * 2, 30.0)
-                                break
+                    # 6) bucle principal
+                    next_snapshot = asyncio.get_event_loop().time() + self._snapshot_interval_ms / 1000.0
+                    while True:
+                        timeout = max(0.0, next_snapshot - asyncio.get_event_loop().time())
+                        try:
+                            evt = await asyncio.wait_for(queue.get(), timeout=timeout)
+                            await self._apply_or_resync(evt, book)
+                        except asyncio.TimeoutError:
+                            await self._emit_snapshot(settings, book)
+                            next_snapshot = asyncio.get_event_loop().time() + self._snapshot_interval_ms / 1000.0
+                        except GapDetected as gap:
+                            logger.warning(
+                                "Gap detected during audit stream pu=%s last=%s; resyncing", gap.pu, gap.last
+                            )
+                            await self._resync_from_snapshot(http, settings, queue, book, limit)
                 finally:
                     reader_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await reader_task
 
     async def _apply_or_resync(self, event: Dict[str, Any], book: LocalOrderBook) -> None:
-        """Apply a depth diff or trigger resync if a gap is detected.
-
-        Binance exige la siguiente condición para aplicar un diff tras el snapshot:
-        U <= lastUpdateId + 1 <= u. Además, para la continuidad entre diffs
-        sucesivos: U <= last_update_id + 1 <= u y (pu == last_update_id cuando pu
-        está presente). Esta lógica evita falsos positivos de gap cuando el REST
-        está clampado a MAX_REST_LIMIT.
-        """
-
         pu = int(event.get("pu", 0))
-        U = int(event.get("U", 0))
-        u = int(event.get("u", 0))
-
-        # Eventos atrasados: los descartamos silenciosamente
-        if book.last_update_id and u <= book.last_update_id:
-            return
-
-        # Validar continuidad según reglas oficiales, pero siendo tolerantes con
-        # diffs que aún no encajan y deberían ser descartados en lugar de
-        # forzar una resincronización inmediata.
-        if book.last_update_id:
-            expected_min = book.last_update_id + 1
-            if u < expected_min:
-                return  # diff atrasado
-            if U > expected_min:
-                raise GapDetected(pu or U, book.last_update_id)
-            if pu and pu != book.last_update_id:
-                logger.debug("Descartando diff con pu=%s; last=%s", pu, book.last_update_id)
-                return
-        else:
-            # Primer evento tras snapshot: necesita U <= last+1 <= u. Si no se
-            # cumple, descartamos y seguimos esperando un diff válido en lugar
-            # de resincronizar inmediatamente.
-            expected_min = (book.last_update_id or 0) + 1
-            if not (U <= expected_min <= u):
-                return
-
+        if book.last_update_id and pu != book.last_update_id:
+            raise GapDetected(pu, book.last_update_id)
         book.apply_diff(event)
 
     async def _resync_from_snapshot(
@@ -418,4 +365,3 @@ __all__ = [
     "AuditOrderbookSettings",
     "LocalOrderBook",
 ]
-
