@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 import contextlib
 import datetime as dt
 import json
@@ -96,15 +97,19 @@ class UnicornDepthCache:
 
             filtered_kwargs = {name: value for name, value in kwargs.items() if name in params}
 
-            try:
-                return BinanceLocalDepthCacheManager(**filtered_kwargs)
-            except TypeError as exc:
-                # Some versions (e.g., 2.8.1) reject the legacy "symbols" argument even when
-                # present in the inspected signature. Retry once without it for compatibility.
-                if "unexpected keyword argument 'symbols'" in str(exc) and "symbols" in filtered_kwargs:
-                    filtered_kwargs = {k: v for k, v in filtered_kwargs.items() if k != "symbols"}
+            while True:
+                try:
                     return BinanceLocalDepthCacheManager(**filtered_kwargs)
-                raise
+                except TypeError as exc:
+                    match = re.search(r"unexpected keyword argument '([^']+)'", str(exc))
+                    if match:
+                        rejected = match.group(1)
+                        if rejected in filtered_kwargs:
+                            filtered_kwargs = {
+                                k: v for k, v in filtered_kwargs.items() if k != rejected
+                            }
+                            continue
+                    raise
 
         self._mgr = await asyncio.to_thread(_start)
         logger.info(
