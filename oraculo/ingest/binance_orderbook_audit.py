@@ -1,4 +1,4 @@
-"""Binance Futures orderbook audit pipeline with hot-reload support."""
+"""Binance Futures orderbook audit pipeline backed by unicorn local depth cache."""
 
 from __future__ import annotations
 
@@ -7,20 +7,18 @@ import contextlib
 import datetime as dt
 import json
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Iterable, List, Optional, Protocol
 
-import aiohttp
-import websockets
 from loguru import logger
 
 from ..config_hot import ConfigManager
 from ..db import DB
 from .batch_writer import AsyncBatcher
 
-
-REST_BASE = "https://fapi.binance.com"
-WS_BASE = "wss://fstream.binance.com/stream"
-MAX_REST_LIMIT = 1000
+try:  # pragma: no cover - optional dependency
+    from unicorn_binance_local_depth_cache import BinanceLocalDepthCacheManager  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    BinanceLocalDepthCacheManager = None
 
 
 @dataclass
@@ -52,75 +50,74 @@ class AuditOrderbookSettings:
         )
 
 
-class LocalOrderBook:
-    """In-memory orderbook that applies Binance depth diffs."""
+@dataclass
+class DepthCacheView:
+    bids: list[tuple[float, float]]
+    asks: list[tuple[float, float]]
+    last_update_id: int | None
+    event_time_ms: int | None
 
-    def __init__(self, max_levels_per_side: int) -> None:
-        self.max_levels_per_side = max_levels_per_side
-        self.last_update_id: int = 0
-        self.bids: Dict[float, float] = {}
-        self.asks: Dict[float, float] = {}
-        self.last_event_time_ms: int = 0
 
-    def _trim(self) -> None:
-        def _trim_side(side: Dict[float, float]) -> None:
-            if len(side) <= self.max_levels_per_side:
-                return
-            prices = sorted(side.keys(), reverse=True)
-            if side is self.asks:
-                prices = list(reversed(prices))
-            for p in prices[self.max_levels_per_side :]:
-                side.pop(p, None)
+class DepthCache(Protocol):
+    async def start(self) -> None:
+        """Initialize underlying subscriptions/cache."""
 
-        _trim_side(self.bids)
-        _trim_side(self.asks)
+    async def stop(self) -> None:
+        """Release any resources held by the cache."""
 
-    def apply_snapshot(self, last_update_id: int, bids: Iterable[Iterable[str | float]], asks: Iterable[Iterable[str | float]]) -> None:
-        self.last_update_id = last_update_id
-        self.bids = {float(p): float(q) for p, q in bids}
-        self.asks = {float(p): float(q) for p, q in asks}
-        self._trim()
+    def snapshot(self) -> DepthCacheView:
+        """Return the latest orderbook snapshot (already sorted)."""
 
-    def apply_diff(self, event: Dict[str, Any]) -> None:
-        self.last_update_id = int(event["u"])
-        self.last_event_time_ms = int(event.get("E") or 0)
-        for price, qty in event.get("b", []):
-            p = float(price)
-            q = float(qty)
-            if q == 0:
-                self.bids.pop(p, None)
-            else:
-                self.bids[p] = q
-        for price, qty in event.get("a", []):
-            p = float(price)
-            q = float(qty)
-            if q == 0:
-                self.asks.pop(p, None)
-            else:
-                self.asks[p] = q
-        self._trim()
 
-    def best_bid_ask(self) -> tuple[float, float]:
-        bids_sorted = sorted(self.bids.keys(), reverse=True)
-        asks_sorted = sorted(self.asks.keys())
-        if not bids_sorted or not asks_sorted:
-            raise ValueError("Orderbook missing best bid/ask")
-        return bids_sorted[0], asks_sorted[0]
+class UnicornDepthCache:
+    """Adapter around `unicorn_binance_local_depth_cache` for a single symbol."""
 
-    def to_snapshot_arrays(self) -> tuple[List[float], List[float], List[float], List[float]]:
-        def _pad(side: Dict[float, float], reverse: bool) -> tuple[List[float], List[float]]:
-            prices = sorted(side.keys(), reverse=reverse)
-            prices = prices[: self.max_levels_per_side]
-            qtys = [side[p] for p in prices]
-            # rellenamos con ceros
-            while len(prices) < self.max_levels_per_side:
-                prices.append(0.0)
-                qtys.append(0.0)
-            return prices, qtys
+    def __init__(self, settings: AuditOrderbookSettings) -> None:
+        if BinanceLocalDepthCacheManager is None:  # pragma: no cover - runtime guard
+            raise RuntimeError("unicorn-binance-local-depth-cache not available")
+        self._settings = settings
+        self._mgr: Any | None = None
 
-        bid_prices, bid_qtys = _pad(self.bids, True)
-        ask_prices, ask_qtys = _pad(self.asks, False)
-        return bid_prices, bid_qtys, ask_prices, ask_qtys
+    async def start(self) -> None:  # pragma: no cover - exercised in integration
+        def _start() -> Any:
+            return BinanceLocalDepthCacheManager(
+                exchange="binance.com-futures",
+                symbols=[self._settings.symbol.lower()],
+                depth_cache_size=max(self._settings.max_levels_per_side * 2, 20),
+                websocket_depth_socket_type=self._settings.stream_speed or "",
+            )
+
+        self._mgr = await asyncio.to_thread(_start)
+        logger.info(
+            "[audit-ob] unicorn depth cache started symbol=%s speed=%s levels=%s",
+            self._settings.symbol,
+            self._settings.stream_speed,
+            self._settings.max_levels_per_side,
+        )
+
+    async def stop(self) -> None:  # pragma: no cover - exercised in integration
+        if self._mgr is None:
+            return
+
+        def _stop() -> None:
+            with contextlib.suppress(Exception):
+                self._mgr.stop_manager_with_all_streams()
+
+        await asyncio.to_thread(_stop)
+        self._mgr = None
+
+    def snapshot(self) -> DepthCacheView:  # pragma: no cover - exercised in integration
+        if self._mgr is None:
+            raise RuntimeError("Depth cache not started")
+
+        cache = self._mgr.get_depth_cache(symbol=self._settings.symbol.lower())
+        bids = list(cache["bids"])
+        asks = list(cache["asks"])
+        bids.sort(key=lambda x: x[0], reverse=True)
+        asks.sort(key=lambda x: x[0])
+        last_update_id = int(cache.get("last_update_id") or 0)
+        event_time_ms = int(cache.get("last_update_time") or 0)
+        return DepthCacheView(bids=bids, asks=asks, last_update_id=last_update_id, event_time_ms=event_time_ms)
 
 
 class AuditOrderbookRunner:
@@ -129,15 +126,15 @@ class AuditOrderbookRunner:
         db: DB,
         batcher: AsyncBatcher,
         cfg_mgr: ConfigManager,
-        stream_factory: Optional[Callable[[AuditOrderbookSettings, LocalOrderBook], asyncio.Future]] = None,
+        depth_cache_factory: Optional[Callable[[AuditOrderbookSettings], DepthCache]] = None,
     ) -> None:
         self._db = db
         self._batcher = batcher
         self._cfg_mgr = cfg_mgr
-        self._stream_factory = stream_factory
+        self._depth_cache_factory = depth_cache_factory or (lambda settings: UnicornDepthCache(settings))
         self._settings: Optional[AuditOrderbookSettings] = None
-        self._book: Optional[LocalOrderBook] = None
-        self._task: Optional[asyncio.Task] = None
+        self._cache: DepthCache | None = None
+        self._task: Optional[asyncio.Task[None]] = None
         self._config_queue: "asyncio.Queue[AuditOrderbookSettings]" = asyncio.Queue()
         self._snapshot_interval_ms: int = 0
 
@@ -185,7 +182,7 @@ class AuditOrderbookRunner:
                 inserted_at     timestamptz          NOT NULL DEFAULT now(),
                 PRIMARY KEY (instrument_id, event_time)
             );
-            """
+            """,
         )
 
     async def _on_config(self, cfg: Any) -> None:
@@ -198,21 +195,17 @@ class AuditOrderbookRunner:
         self._snapshot_interval_ms = new.snapshot_interval_ms
 
         if not new.enabled:
-            if self._task:
-                self._task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._task
-            self._task = None
+            await self._stop_snapshot_task()
+            await self._stop_cache()
             logger.info("Audit orderbook disabled by config")
             return
 
-        if prev is None or new.requires_restart(prev) or self._task is None:
-            if self._task:
-                self._task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._task
-            self._book = LocalOrderBook(new.max_levels_per_side)
-            self._task = asyncio.create_task(self._stream_loop(new, self._book))
+        needs_restart = prev is None or new.requires_restart(prev) or self._task is None or self._cache is None
+        if needs_restart:
+            await self._stop_snapshot_task()
+            await self._stop_cache()
+            await self._start_cache(new)
+            self._task = asyncio.create_task(self._snapshot_loop())
             logger.info(
                 "Audit orderbook started for %s speed=%s levels=%s",
                 new.symbol,
@@ -225,169 +218,63 @@ class AuditOrderbookRunner:
                 new.snapshot_interval_ms,
             )
 
-    async def _stream_loop(self, settings: AuditOrderbookSettings, book: LocalOrderBook) -> None:
-        if self._stream_factory:
-            await self._stream_factory(settings, book)
+    async def _start_cache(self, settings: AuditOrderbookSettings) -> None:
+        cache = self._depth_cache_factory(settings)
+        try:
+            await cache.start()
+        except Exception:
+            logger.exception("Failed to start depth cache for %s", settings.symbol)
+            raise
+        self._cache = cache
+
+    async def _stop_cache(self) -> None:
+        if not self._cache:
             return
+        with contextlib.suppress(Exception):
+            await self._cache.stop()
+        self._cache = None
+
+    async def _stop_snapshot_task(self) -> None:
+        if self._task:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+        self._task = None
+
+    async def _snapshot_loop(self) -> None:
+        assert self._settings is not None
+        assert self._cache is not None
+        settings = self._settings
+        cache = self._cache
+
         while True:
             try:
-                await self._run_once(settings, book)
+                await asyncio.sleep(self._snapshot_interval_ms / 1000.0)
+                view = cache.snapshot()
+                await self._emit_snapshot(settings, view)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.exception("Audit orderbook stream error: {}", exc)
+                logger.exception("Audit orderbook snapshot error: {}", exc)
                 await asyncio.sleep(1.0)
 
-    async def _run_once(self, settings: AuditOrderbookSettings, book: LocalOrderBook) -> None:
-        channel = f"{settings.symbol.lower()}@depth"
-        if settings.stream_speed:
-            channel = f"{channel}@{settings.stream_speed}"
-        url = f"{WS_BASE}?streams={channel}"
-        limit = max(5, settings.max_levels_per_side * 2)
-        if limit > MAX_REST_LIMIT:
-            logger.warning(
-                "Requested depth limit %s exceeds REST max %s; clamping to %s", limit, MAX_REST_LIMIT, MAX_REST_LIMIT
-            )
-            limit = MAX_REST_LIMIT
-
-        async with aiohttp.ClientSession() as http:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-                buffer: list[Dict[str, Any]] = []
-                queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
-
-                async def _reader() -> None:
-                    async for raw in ws:
-                        msg = json.loads(raw)
-                        evt = msg.get("data", msg)
-                        if evt.get("e") != "depthUpdate":
-                            continue
-                        await queue.put(evt)
-
-                reader_task = asyncio.create_task(_reader())
-                try:
-                    await self._resync_from_snapshot(http, settings, queue, book, limit)
-
-                    # 6) bucle principal
-                    next_snapshot = asyncio.get_event_loop().time() + self._snapshot_interval_ms / 1000.0
-                    while True:
-                        timeout = max(0.0, next_snapshot - asyncio.get_event_loop().time())
-                        try:
-                            evt = await asyncio.wait_for(queue.get(), timeout=timeout)
-                            await self._apply_or_resync(evt, book)
-                        except asyncio.TimeoutError:
-                            await self._emit_snapshot(settings, book)
-                            next_snapshot = asyncio.get_event_loop().time() + self._snapshot_interval_ms / 1000.0
-                        except GapDetected as gap:
-                            logger.warning(
-                                "Gap detected during audit stream pu=%s last=%s; resyncing", gap.pu, gap.last
-                            )
-                            await self._resync_from_snapshot(http, settings, queue, book, limit)
-                finally:
-                    reader_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await reader_task
-
-    async def _apply_or_resync(self, event: Dict[str, Any], book: LocalOrderBook) -> None:
-        """Aplica un diff de depth o dispara resincronización si hay gap.
-
-        Reglas Binance Futures:
-
-        - Tras snapshot, mantenemos last_update_id = último `u` aplicado.
-        - Para cada nuevo evento (U, u, pu):
-          * Si u <= last_update_id -> evento atrasado, se ignora.
-          * Para aplicar:
-              U <= last_update_id + 1 <= u
-            Si no se cumple -> gap -> resync.
-          * Además, si pu está presente y pu != last_update_id -> gap -> resync.
-        """
-
-        pu = int(event.get("pu", 0))
-        U = int(event.get("U", 0))
-        u = int(event.get("u", 0))
-
-        last = int(book.last_update_id or 0)
-
-        # 1) Eventos claramente atrasados
-        if last and u <= last:
+    async def _emit_snapshot(self, settings: AuditOrderbookSettings, view: DepthCacheView) -> None:
+        if not view.bids or not view.asks:
             return
-
-        if not last:
-            # No deberíamos aplicar diffs sin haber aplicado antes un snapshot
-            # (o un diff "de enganche" en _resync_from_snapshot). Por seguridad,
-            # simplemente ignoramos hasta que _resync_from_snapshot fije last_update_id.
+        bid_prices, bid_qtys, ask_prices, ask_qtys = _to_snapshot_arrays(
+            view.bids, view.asks, settings.max_levels_per_side
+        )
+        best_bid = bid_prices[0]
+        best_ask = ask_prices[0]
+        if best_bid == 0.0 or best_ask == 0.0:
             return
-
-        expected_min = last + 1
-
-        # 2) Chequeo de continuidad en IDs (U/u)
-        if not (U <= expected_min <= u):
-            # Esto significa que nos hemos saltado uno o más updates
-            raise GapDetected(pu or U, last)
-
-        # 3) Chequeo de continuidad vía `pu`
-        if pu and pu != last:
-            # Regla oficial: si pu != u_anterior -> hay gap -> resync
-            logger.warning(
-                "Audit orderbook gap by pu mismatch: pu=%s last=%s (U=%s u=%s)",
-                pu,
-                last,
-                U,
-                u,
-            )
-            raise GapDetected(pu, last)
-
-        # 4) Todo OK: aplicamos diff
-        book.apply_diff(event)
-
-
-    async def _resync_from_snapshot(
-        self,
-        http: aiohttp.ClientSession,
-        settings: AuditOrderbookSettings,
-        queue: "asyncio.Queue[Dict[str, Any]]",
-        book: LocalOrderBook,
-        limit: int,
-    ) -> None:
-        # 1) snapshot REST
-        async with http.get(
-            f"{REST_BASE}/fapi/v1/depth",
-            params={"symbol": settings.symbol.upper(), "limit": limit},
-            timeout=aiohttp.ClientTimeout(total=5),
-        ) as r:
-            r.raise_for_status()
-            snap = await r.json()
-        book.apply_snapshot(int(snap["lastUpdateId"]), snap.get("bids", []), snap.get("asks", []))
-
-        # 2) vaciar buffer inicial
-        buffer: list[Dict[str, Any]] = []
-        while not queue.empty():
-            buffer.append(await queue.get())
-        buffer.sort(key=lambda e: e.get("u", 0))
-        # 3) descartar viejos
-        buffer = [e for e in buffer if int(e.get("u", 0)) >= book.last_update_id]
-        # 4) procesar primer evento válido
-        for evt in list(buffer):
-            U = int(evt.get("U", 0))
-            u = int(evt.get("u", 0))
-            if U <= book.last_update_id <= u:
-                book.apply_diff(evt)
-                buffer = [e for e in buffer if int(e.get("u", 0)) > u]
-                break
-        # 5) resto de eventos en buffer
-        for evt in buffer:
-            await self._apply_or_resync(evt, book)
-
-    async def _emit_snapshot(self, settings: AuditOrderbookSettings, book: LocalOrderBook) -> None:
-        if not book.bids or not book.asks:
-            return
-        best_bid, best_ask = book.best_bid_ask()
-        bid_prices, bid_qtys, ask_prices, ask_qtys = book.to_snapshot_arrays()
         spread = best_ask - best_bid
-        evt_time_ms = book.last_event_time_ms or int(dt.datetime.now(tz=dt.timezone.utc).timestamp() * 1000)
+        evt_time_ms = view.event_time_ms or int(dt.datetime.now(tz=dt.timezone.utc).timestamp() * 1000)
+        last_update_id = view.last_update_id or 0
         row = (
             settings.instrument_id,
             evt_time_ms,
-            book.last_update_id,
+            last_update_id,
             best_bid,
             best_ask,
             spread,
@@ -401,15 +288,33 @@ class AuditOrderbookRunner:
         await self._batcher.flush_if_needed()
 
 
-class GapDetected(RuntimeError):
-    def __init__(self, pu: int, last: int):
-        super().__init__(f"Gap detected pu={pu} last={last}")
-        self.pu = pu
-        self.last = last
+def _pad_side(levels: Iterable[tuple[float, float]], max_levels: int, reverse: bool) -> tuple[List[float], List[float]]:
+    levels_list = list(levels)
+    prices = [p for p, _ in sorted(levels_list, key=lambda x: x[0], reverse=reverse)[:max_levels]]
+    qtys = []
+    for p in prices:
+        for price, qty in levels_list:
+            if price == p:
+                qtys.append(qty)
+                break
+    while len(prices) < max_levels:
+        prices.append(0.0)
+        qtys.append(0.0)
+    return prices, qtys
+
+
+def _to_snapshot_arrays(
+    bids: Iterable[tuple[float, float]], asks: Iterable[tuple[float, float]], max_levels: int
+) -> tuple[List[float], List[float], List[float], List[float]]:
+    bid_prices, bid_qtys = _pad_side(bids, max_levels, True)
+    ask_prices, ask_qtys = _pad_side(asks, max_levels, False)
+    return bid_prices, bid_qtys, ask_prices, ask_qtys
 
 
 __all__ = [
     "AuditOrderbookRunner",
     "AuditOrderbookSettings",
-    "LocalOrderBook",
+    "DepthCacheView",
+    "DepthCache",
+    "UnicornDepthCache",
 ]
