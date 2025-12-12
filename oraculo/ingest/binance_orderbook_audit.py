@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import contextlib
 import datetime as dt
 import json
@@ -80,12 +81,21 @@ class UnicornDepthCache:
 
     async def start(self) -> None:  # pragma: no cover - exercised in integration
         def _start() -> Any:
-            return BinanceLocalDepthCacheManager(
-                exchange="binance.com-futures",
-                symbols=[self._settings.symbol.lower()],
-                depth_cache_size=max(self._settings.max_levels_per_side * 2, 20),
-                websocket_depth_socket_type=self._settings.stream_speed or "",
-            )
+            kwargs: dict[str, Any] = {
+                "exchange": "binance.com-futures",
+                "symbols": [self._settings.symbol.lower()],
+                "symbol": self._settings.symbol.lower(),
+                "depth_cache_size": max(self._settings.max_levels_per_side * 2, 20),
+                "websocket_depth_socket_type": self._settings.stream_speed or "",
+            }
+
+            try:
+                params = set(inspect.signature(BinanceLocalDepthCacheManager).parameters.keys())
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                params = set(kwargs.keys())
+
+            filtered_kwargs = {name: value for name, value in kwargs.items() if name in params}
+            return BinanceLocalDepthCacheManager(**filtered_kwargs)
 
         self._mgr = await asyncio.to_thread(_start)
         logger.info(
