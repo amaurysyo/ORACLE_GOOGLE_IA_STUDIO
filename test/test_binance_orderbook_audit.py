@@ -105,6 +105,21 @@ class _FakeCfgMgr:
         return None
 
 
+def _run_async(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
 def test_local_orderbook_rebuilds_from_diffs():
     book = LocalOrderBook(max_levels_per_side=2)
     book.apply_snapshot(100, [["100.0", "1"], ["99.5", "2"]], [["100.5", "1.5"], ["101.0", "3"]])
@@ -169,5 +184,5 @@ def test_config_change_triggers_resubscribe():
             with pytest.raises(asyncio.CancelledError):
                 await runner._task
 
-    asyncio.run(_run())
+    _run_async(_run())
 
