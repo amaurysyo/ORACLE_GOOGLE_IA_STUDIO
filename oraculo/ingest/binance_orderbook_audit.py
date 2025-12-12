@@ -134,7 +134,7 @@ class UnicornDepthCache:
         if self._mgr is None:
             raise RuntimeError("Depth cache not started")
 
-        cache = self._mgr.get_depth_cache(symbol=self._settings.symbol.lower())
+        cache = self._get_cache_for_symbol()
         bids = list(cache["bids"])
         asks = list(cache["asks"])
         bids.sort(key=lambda x: x[0], reverse=True)
@@ -142,6 +142,61 @@ class UnicornDepthCache:
         last_update_id = int(cache.get("last_update_id") or 0)
         event_time_ms = int(cache.get("last_update_time") or 0)
         return DepthCacheView(bids=bids, asks=asks, last_update_id=last_update_id, event_time_ms=event_time_ms)
+
+    def _get_cache_for_symbol(self) -> Any:
+        """Return raw cache data for the configured symbol, with broad compatibility.
+
+        Some versions of ``BinanceLocalDepthCacheManager`` expose ``get_depth_cache``
+        while others store depth caches in internal dictionaries. This helper tries a
+        handful of common patterns before failing with a clear error.
+        """
+
+        symbol = self._settings.symbol.lower()
+        mgr = self._mgr
+        if mgr is None:  # pragma: no cover - defensive
+            raise RuntimeError("Depth cache manager is not initialized")
+
+        # Preferred getter-style APIs
+        getter_names = [
+            "get_depth_cache",
+            "get_depth_cache_by_symbol",
+            "get_cache",
+            "get_cache_by_symbol",
+        ]
+        for name in getter_names:
+            getter = getattr(mgr, name, None)
+            if callable(getter):
+                for call in (
+                    lambda: getter(symbol=symbol),
+                    lambda: getter(symbol),
+                ):
+                    try:
+                        return call()
+                    except TypeError:
+                        continue
+                    except Exception:
+                        continue
+
+        # Fallback to dictionary-like attributes
+        dict_attrs = ["depth_caches", "_depth_caches", "caches", "depth_cache"]
+        for attr in dict_attrs:
+            cache_dict = getattr(mgr, attr, None)
+            if cache_dict is None:
+                continue
+            for accessor in (
+                lambda: cache_dict[symbol],
+                lambda: cache_dict.get(symbol),
+            ):
+                try:
+                    result = accessor()
+                    if result is not None:
+                        return result
+                except Exception:
+                    continue
+
+        raise AttributeError(
+            "BinanceLocalDepthCacheManager does not expose a compatible depth cache accessor"
+        )
 
 
 class AuditOrderbookRunner:
