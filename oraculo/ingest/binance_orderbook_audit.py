@@ -95,7 +95,16 @@ class UnicornDepthCache:
                 params = set(kwargs.keys())
 
             filtered_kwargs = {name: value for name, value in kwargs.items() if name in params}
-            return BinanceLocalDepthCacheManager(**filtered_kwargs)
+
+            try:
+                return BinanceLocalDepthCacheManager(**filtered_kwargs)
+            except TypeError as exc:
+                # Some versions (e.g., 2.8.1) reject the legacy "symbols" argument even when
+                # present in the inspected signature. Retry once without it for compatibility.
+                if "unexpected keyword argument 'symbols'" in str(exc) and "symbols" in filtered_kwargs:
+                    filtered_kwargs = {k: v for k, v in filtered_kwargs.items() if k != "symbols"}
+                    return BinanceLocalDepthCacheManager(**filtered_kwargs)
+                raise
 
         self._mgr = await asyncio.to_thread(_start)
         logger.info(
