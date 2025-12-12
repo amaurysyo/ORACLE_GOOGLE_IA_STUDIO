@@ -16,6 +16,7 @@ from loguru import logger
 from ..config_hot import ConfigManager
 from ..db import DB
 from .batch_writer import AsyncBatcher
+from ..obs.metrics import ws_msgs_total, ws_resync_total, ws_heartbeat_miss_total, ws_last_msg_age_s
 
 
 REST_BASE = "https://fapi.binance.com"
@@ -140,6 +141,9 @@ class AuditOrderbookRunner:
         self._task: Optional[asyncio.Task] = None
         self._config_queue: "asyncio.Queue[AuditOrderbookSettings]" = asyncio.Queue()
         self._snapshot_interval_ms: int = 0
+        self._venue = "binance_futures_audit"
+        self._last_msg_ts: dict[str, float] = {"depth": 0.0}
+        self._hb_thresholds: dict[str, float] = {"depth": 5.0}
 
         self._batcher.register_stmt(
             "audit_orderbook_snapshot",
@@ -277,11 +281,19 @@ class AuditOrderbookRunner:
                         except asyncio.TimeoutError:
                             await self._emit_snapshot(settings, book)
                             next_snapshot = asyncio.get_event_loop().time() + self._snapshot_interval_ms / 1000.0
+                            await self._check_heartbeat()
                         except GapDetected as gap:
                             logger.warning(
                                 "Gap detected during audit stream pu=%s last=%s; resyncing", gap.pu, gap.last
                             )
+                            ws_resync_total.labels(self._venue, "depth").inc()
                             await self._resync_from_snapshot(http, settings, queue, book, limit)
+                        except HeartbeatMiss as hb:
+                            ws_resync_total.labels(self._venue, "depth").inc()
+                            logger.warning(
+                                "Audit orderbook heartbeat miss idle=%.1fs thr=%.1fs -> reconnect", hb.age, hb.threshold
+                            )
+                            raise
                 finally:
                     reader_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -300,6 +312,9 @@ class AuditOrderbookRunner:
             Si no se cumple -> gap -> resync.
           * Además, si pu está presente y pu != last_update_id -> gap -> resync.
         """
+
+        self._record_msg("depth")
+        ws_msgs_total.labels(event.get("e", "depthUpdate")).inc()
 
         pu = int(event.get("pu", 0))
         U = int(event.get("U", 0))
@@ -370,6 +385,8 @@ class AuditOrderbookRunner:
             U = int(evt.get("U", 0))
             u = int(evt.get("u", 0))
             if U <= book.last_update_id <= u:
+                self._record_msg("depth")
+                ws_msgs_total.labels(evt.get("e", "depthUpdate")).inc()
                 book.apply_diff(evt)
                 buffer = [e for e in buffer if int(e.get("u", 0)) > u]
                 break
@@ -398,7 +415,30 @@ class AuditOrderbookRunner:
             json.dumps({}),
         )
         self._batcher.add("audit_orderbook_snapshot", row)
-        await self._batcher.flush_if_needed()
+
+    def _record_msg(self, stream: str) -> None:
+        now = asyncio.get_event_loop().time()
+        self._last_msg_ts[stream] = now
+        ws_last_msg_age_s.labels(self._venue, stream).set(0.0)
+
+    async def _check_heartbeat(self) -> None:
+        now = asyncio.get_event_loop().time()
+        ts = self._last_msg_ts.get("depth", 0.0)
+        if ts == 0.0:
+            return
+        age = now - ts
+        ws_last_msg_age_s.labels(self._venue, "depth").set(age)
+        thr = float(self._hb_thresholds.get("depth", 5.0))
+        if age > thr:
+            ws_heartbeat_miss_total.labels(self._venue, "depth").inc()
+            raise HeartbeatMiss(age, thr)
+
+
+class HeartbeatMiss(Exception):
+    def __init__(self, age: float, threshold: float) -> None:
+        super().__init__(f"idle {age:.2f}s over threshold {threshold:.2f}s")
+        self.age = age
+        self.threshold = threshold
 
 
 class GapDetected(RuntimeError):
