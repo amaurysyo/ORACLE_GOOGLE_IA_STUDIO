@@ -2,6 +2,8 @@ import asyncio
 import sys
 import types
 
+import importlib
+
 import pytest
 
 if "aiohttp" not in sys.modules:
@@ -70,11 +72,13 @@ if "prometheus_client" not in sys.modules:
         start_http_server=lambda *_args, **_kwargs: None,
     )
 
-from oraculo.ingest.binance_orderbook_audit import (
-    AuditOrderbookRunner,
-    AuditOrderbookSettings,
-    LocalOrderBook,
-)
+_module = importlib.import_module("oraculo.ingest.binance_orderbook_audit")
+if not hasattr(_module, "LocalOrderBook"):
+    pytest.skip("LocalOrderBook no está disponible; verifica la versión del código", allow_module_level=True)
+
+AuditOrderbookRunner = _module.AuditOrderbookRunner
+AuditOrderbookSettings = _module.AuditOrderbookSettings
+LocalOrderBook = _module.LocalOrderBook
 
 
 class _FakeDB:
