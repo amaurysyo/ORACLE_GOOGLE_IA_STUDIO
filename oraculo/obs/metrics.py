@@ -10,7 +10,9 @@ Created on Fri Oct 31 19:34:01 2025
 # oraculo/obs/metrics.py
 from __future__ import annotations
 
+import asyncio
 import os
+from typing import Dict
 
 from loguru import logger
 from prometheus_client import Counter, Gauge, Summary, start_http_server, Histogram
@@ -131,6 +133,41 @@ dispatch_last_success_ts = Gauge(
     "Timestamp of last successful dispatch",
     ["channel"],
 )
+
+# ---------- Event loop lag ----------
+event_loop_lag_seconds = Gauge(
+    "oraculo_event_loop_lag_seconds",
+    "Asyncio event-loop lag in seconds (timer drift). Indicates event loop starvation/blocking.",
+    ["service"],
+)
+
+# Mantener una tarea por servicio para evitar monitores duplicados
+_loop_lag_tasks: Dict[str, asyncio.Task] = {}
+
+
+async def _monitor_event_loop_lag(service: str, period: float = 1.0) -> None:
+    loop = asyncio.get_running_loop()
+    expected = loop.time() + period
+    while True:
+        await asyncio.sleep(period)
+        now = loop.time()
+        lag = now - expected
+        if lag < 0:
+            lag = 0.0
+        event_loop_lag_seconds.labels(service=service).set(lag)
+        expected += period
+
+
+def start_event_loop_lag_monitor(service: str, period: float = 1.0) -> None:
+    """Arranca monitor de lag del event loop. Idempotente por servicio."""
+
+    task = _loop_lag_tasks.get(service)
+    if task is not None and not task.done():
+        return
+    _loop_lag_tasks[service] = asyncio.create_task(
+        _monitor_event_loop_lag(service, period)
+    )
+
 
 # ---------- DB ----------
 db_upsert_rule_alert_ms = Histogram(
