@@ -90,14 +90,15 @@ class TelegramRouter:
             self._last_refill = now
 
     async def send(self, kind: str, text: str, *, alert_id: Optional[int] = None, ts_first: Optional[Any] = None) -> None:
+        channel = f"telegram/{kind}"
+        obs_metrics.dispatch_attempts_total.labels(channel=channel).inc()
+        obs_metrics.dispatch_last_attempt_ts.labels(channel=channel).set(time.time())
+
         # RL
         async with self._lock:
             self._refill()
             if self._tokens <= 0:
                 logger.warning("[telegram] token bucket exhausted")
-                channel = f"telegram/{kind}"
-                obs_metrics.dispatch_attempts_total.labels(channel=channel).inc()
-                obs_metrics.dispatch_last_attempt_ts.labels(channel=channel).set(time.time())
                 obs_metrics.dispatch_dropped_total.labels(
                     channel=channel, reason="rate_limit"
                 ).inc()
@@ -107,11 +108,6 @@ class TelegramRouter:
         target_cfg = self._targets.get(kind) or {}
         token = target_cfg.get("token")
         chat_id = int(target_cfg.get("chat_id") or 0)
-        channel = f"telegram/{kind}"
-
-        obs_metrics.dispatch_attempts_total.labels(channel=channel).inc()
-        obs_metrics.dispatch_last_attempt_ts.labels(channel=channel).set(time.time())
-
         if not token or chat_id == 0:
             logger.warning(f"[telegram] missing credentials for kind={kind}")
             obs_metrics.dispatch_dropped_total.labels(

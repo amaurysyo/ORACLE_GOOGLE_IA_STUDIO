@@ -7,6 +7,7 @@ import asyncio
 import datetime as dt
 import json
 import math
+import os
 import time
 from typing import Any, Dict, Optional, Tuple, List, Sequence
 
@@ -144,6 +145,26 @@ def _routing_to_dict(routing_cfg: Any) -> Dict[str, Any]:
         return routing_cfg.dict()
     # fallback conservador
     return {"telegram": {}}
+
+
+class TimeSlicedYield:
+    def __init__(self, every_ms: float = 20.0, stage: str | None = None):
+        self.every = max(every_ms / 1000.0, 0.0)
+        self._last = time.perf_counter()
+        self.stage = stage
+
+    def reset(self) -> None:
+        self._last = time.perf_counter()
+
+    async def maybe_yield(self) -> None:
+        if self.every <= 0:
+            return
+        now = time.perf_counter()
+        if (now - self._last) >= self.every:
+            self._last = now
+            if self.stage:
+                obs_metrics.alerts_stage_yields_total.labels(stage=self.stage).inc()
+            await asyncio.sleep(0)
 
 
 # ---- Telemetría (agregada y volcada a tabla oraculo.rule_telemetry) ----
@@ -510,6 +531,33 @@ def _apply_rules_to_detectors(
     )
 
 
+def _get_yield_every_ms(cfg_mgr: Any | None, default_ms: float = 20.0) -> float:
+    env_val = os.getenv("ORACULO_ALERTS_YIELD_MS")
+    if env_val is not None:
+        try:
+            val = float(env_val)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+
+    obs_cfg = getattr(getattr(cfg_mgr, "cfg", None), "observability", None) or {}
+    cfg_val = None
+    try:
+        cfg_val = obs_cfg.get("alerts_yield_ms")
+    except Exception:
+        cfg_val = None
+    if cfg_val is not None:
+        try:
+            val = float(cfg_val)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
+
+    return default_ms
+
+
 # ----------------- Runner principal -----------------
 async def run_pipeline(
     db: DB,
@@ -722,16 +770,38 @@ async def run_pipeline(
                 except Exception as e2:
                     logger.error(f"[metrics] drop row {r}: {e2!s}")
 
-    async def _cooperative_yield(idx: int, every: int = 500) -> None:
-        if idx % every == 0:
-            await asyncio.sleep(0)
+    yield_every_ms = _get_yield_every_ms(cfg_mgr, default_ms=20.0)
+    yielder_depth = TimeSlicedYield(yield_every_ms, stage="depth")
+    yielder_mark = TimeSlicedYield(yield_every_ms, stage="mark")
+    yielder_deribit = TimeSlicedYield(yield_every_ms, stage="deribit")
+    yielder_trades = TimeSlicedYield(yield_every_ms, stage="trades")
+    yielder_snapshots = TimeSlicedYield(yield_every_ms, stage="snapshots")
+    yielder_dispatch = TimeSlicedYield(yield_every_ms, stage="dispatch")
+    yielder_flush = TimeSlicedYield(yield_every_ms, stage="flush")
+
+    def _observe_stage_duration(stage: str, start_t: float) -> None:
+        obs_metrics.alerts_stage_duration_ms.labels(stage=stage).observe(
+            (time.perf_counter() - start_t) * 1000
+        )
+
+    async def _dispatch_with_metrics(
+        kind: str, text: str, *, alert_id: Optional[int] = None, ts_first: Optional[Any] = None
+    ) -> None:
+        t0 = time.perf_counter()
+        await yielder_dispatch.maybe_yield()
+        await router.send(kind, text, alert_id=alert_id, ts_first=ts_first)
+        _observe_stage_duration("dispatch", t0)
 
     # ------------------- bucle principal -------------------
     while True:
         # 1) depth -> book & métricas + slicing pasivo + spoofing
         # Paginación por ID (seq)
-        for idx, r in enumerate(await tail_depth.fetch_new(BINANCE_FUT_INST, limit=5000)):
-            await _cooperative_yield(idx)
+        depth_start = time.perf_counter()
+        depth_rows = await tail_depth.fetch_new(BINANCE_FUT_INST, limit=5000)
+        if depth_rows:
+            obs_metrics.alerts_stage_rows_total.labels(stage="depth").inc(len(depth_rows))
+        for r in depth_rows:
+            await yielder_depth.maybe_yield()
             ts = r["event_time"].timestamp()
             qty_delta = float(r["qty"])
             price = float(r["price"])
@@ -753,7 +823,7 @@ async def run_pipeline(
                                 f"#{rule['rule']} {evp.side.upper()} slicing_pass @ {evp.price} | "
                                 f"qty={evp.intensity:.2f} BTC"
                             )
-                            await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
+                            await _dispatch_with_metrics("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
 
             # spoofing detector (necesita bests)
             bb, ba = engine.book.best()
@@ -771,20 +841,27 @@ async def run_pipeline(
                             f"#{rule['rule']} {ev_sp.side.upper()} spoofing {ev_sp.intensity:.2f} BTC @ "
                             f"{ev_sp.price} | cancel={ev_sp.fields.get('cancel_rate'):.2f}"
                         )
-                        await router.send("rules", text, alert_id=aid, ts_first=t0)
+                        await _dispatch_with_metrics("rules", text, alert_id=aid, ts_first=t0)
+        _observe_stage_duration("depth", depth_start)
 
         # 2) mark funding -> basis
         # Paginación por Tiempo (legacy para mark)
-        for idx, r in enumerate(await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000)):
-            await _cooperative_yield(idx)
+        mark_start = time.perf_counter()
+        mark_rows = await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000)
+        if mark_rows:
+            obs_metrics.alerts_stage_rows_total.labels(stage="mark").inc(len(mark_rows))
+        for r in mark_rows:
+            await yielder_mark.maybe_yield()
             engine.on_mark(
                 r["event_time"].timestamp(),
                 float(r.get("mark_price") or 0) or None,
                 float(r.get("index_price") or 0) or None,
             )
+        _observe_stage_duration("mark", mark_start)
 
         # 2b) Deribit opciones ticker -> IV spikes (R19/R20) + OI skew (R21/R22)
         # Nota: Mantenemos el polling directo por tiempo aquí ya que es otra tabla/lógica
+        deriv_start = time.perf_counter()
         rows_opt = await db.fetch(
             """
             SELECT instrument_id,
@@ -799,9 +876,10 @@ async def run_pipeline(
             last_deriv_opt_ts,
         )
         if rows_opt:
+            obs_metrics.alerts_stage_rows_total.labels(stage="deribit").inc(len(rows_opt))
             last_deriv_opt_ts = rows_opt[-1]["event_time"]
-            for idx, r in enumerate(rows_opt):
-                await _cooperative_yield(idx)
+            for r in rows_opt:
+                await yielder_deribit.maybe_yield()
                 ts_opt = r["event_time"].timestamp()
                 inst_id = str(r["instrument_id"])
                 mark_iv = r.get("mark_iv")
@@ -822,7 +900,7 @@ async def run_pipeline(
                                     f"#{rule['rule']} IV spike {ev_iv.intensity:.2f}% "
                                     f"({inst_id})"
                                 )
-                                await router.send("rules", text, alert_id=aid, ts_first=t0)
+                                await _dispatch_with_metrics("rules", text, alert_id=aid, ts_first=t0)
 
                 # -------- OI skew (R21/R22) --------
                 if oi_val is None:
@@ -865,12 +943,17 @@ async def run_pipeline(
                         if aid is not None:
                             telemetry.bump(ev_oi.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                             text = f"#{rule['rule']} OI skew {ev_oi.intensity:.2f} ({underlying})"
-                            await router.send("rules", text, alert_id=aid, ts_first=t0)
+                            await _dispatch_with_metrics("rules", text, alert_id=aid, ts_first=t0)
+        _observe_stage_duration("deribit", deriv_start)
 
         # 3) trades -> slicing (iceberg/hitting) + absorción + break_wall + tape_pressure + spoofing_exec
         # Paginación por ID (trade_id_ext)
-        for idx, r in enumerate(await tail_trades.fetch_new(BINANCE_FUT_INST, limit=5000)):
-            await _cooperative_yield(idx)
+        trades_start = time.perf_counter()
+        trade_rows = await tail_trades.fetch_new(BINANCE_FUT_INST, limit=5000)
+        if trade_rows:
+            obs_metrics.alerts_stage_rows_total.labels(stage="trades").inc(len(trade_rows))
+        for r in trade_rows:
+            await yielder_trades.maybe_yield()
             ts = r["event_time"].timestamp()
             side = r["side"]
             px = float(r["price"])
@@ -896,7 +979,7 @@ async def run_pipeline(
                             f"#{rule['rule']} {side.upper()} slicing_{label} @ {px} | "
                             f"qty={ev.intensity:.2f} BTC"
                         )
-                        await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
+                        await _dispatch_with_metrics("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
 
             # Absorción (usa bests actuales para validar drift)
             bb, ba = engine.book.best()
@@ -911,7 +994,7 @@ async def run_pipeline(
                             f"#{rule['rule']} {ev_abs.side.upper()} absorption @ {ev_abs.price} | "
                             f"vol={ev_abs.intensity:.2f} BTC"
                         )
-                        await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
+                        await _dispatch_with_metrics("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
 
             # BreakWall: gating por snapshot (depleción/refill/basis_vel)
             snap = engine.get_snapshot()
@@ -931,7 +1014,7 @@ async def run_pipeline(
                                 f"#{rule['rule']} {e2.side.upper()} break_wall @ {e2.price} | "
                                 f"k={e2.fields.get('k')}"
                             )
-                            await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
+                            await _dispatch_with_metrics("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
                 elif gating_reason:
                     reason_map = {
                         "basis_vel_low": {"disc_basis_vel_low": 1},
@@ -956,9 +1039,12 @@ async def run_pipeline(
                             f"#{rule['rule']} {ev_tp.side.upper()} tape_pressure "
                             f"{ev_tp.intensity:.2f} @ {ev_tp.price}"
                         )
-                        await router.send("rules", text, alert_id=aid, ts_first=t0)
+                        await _dispatch_with_metrics("rules", text, alert_id=aid, ts_first=t0)
+        _observe_stage_duration("trades", trades_start)
 
         # 4) Triggers de snapshot: dominance, depletion, basis_extreme, basis_mean-revert
+        snapshots_start = time.perf_counter()
+        await yielder_snapshots.maybe_yield()
         snap = engine.get_snapshot()
         ts_now = dt.datetime.now(dt.timezone.utc).timestamp()
 
@@ -978,7 +1064,7 @@ async def run_pipeline(
                             f"#{rule['rule']} {evd.side.upper()} dominance {evd.intensity:.1f}% "
                             f"@ {evd.price}"
                         )
-                        await router.send("rules", text, alert_id=aid, ts_first=t0)
+                        await _dispatch_with_metrics("rules", text, alert_id=aid, ts_first=t0)
 
         # Depletion masivo (R13/R14)
         ev_dep_bid = dep_bid_det.on_snapshot(ts_now, snap.__dict__ if hasattr(snap, "__dict__") else dict())
@@ -990,7 +1076,7 @@ async def run_pipeline(
                     if aid is not None:
                         telemetry.bump(evd.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                         text = f"#{rule['rule']} {evd.side.upper()} depletion {evd.intensity:.2f}"
-                        await router.send("rules", text, alert_id=aid, ts_first=t0)
+                        await _dispatch_with_metrics("rules", text, alert_id=aid, ts_first=t0)
 
         # Basis extremos (R15/R16) a través de MetricTrigger
         if getattr(snap, "basis_bps", None) is None:
@@ -1005,7 +1091,7 @@ async def run_pipeline(
                         if aid is not None:
                             telemetry.bump(evb.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                             text = f"#{rule['rule']} basis_bps={evb.intensity:.1f}"
-                            await router.send("rules", text, alert_id=aid, ts_first=t0)
+                            await _dispatch_with_metrics("rules", text, alert_id=aid, ts_first=t0)
 
         # Basis mean-revert (R17/R18)
         if getattr(snap, "basis_bps", None) is None or getattr(snap, "basis_vel_bps_s", None) is None:
@@ -1021,11 +1107,15 @@ async def run_pipeline(
                             f"#{rule['rule']} basis_mean_revert {ev_mr.side.upper()} | "
                             f"vel={ev_mr.intensity:.2f} bps/s"
                         )
-                        await router.send("rules", text, alert_id=aid, ts_first=t0)
+                        await _dispatch_with_metrics("rules", text, alert_id=aid, ts_first=t0)
+        await yielder_snapshots.maybe_yield()
+        _observe_stage_duration("snapshots", snapshots_start)
 
         # 5) Flush de métricas y telemetría (1 Hz)
+        flush_start = time.perf_counter()
         now_ts = dt.datetime.now(dt.timezone.utc).timestamp()
         if (now_ts - ts_now) >= 0:  # ts_now es de este mismo tick
+            await yielder_flush.maybe_yield()
             now_dt = dt.datetime.fromtimestamp(now_ts, tz=dt.timezone.utc)
             snap = engine.get_snapshot()
             rows: List[Tuple[str, dt.datetime, int, str, float, Optional[str], str]] = []
@@ -1050,5 +1140,7 @@ async def run_pipeline(
 
             await insert_metrics(rows)
             await telemetry.flush_if_needed()
+        _observe_stage_duration("flush", flush_start)
+        obs_metrics.alerts_pipeline_tick_ts.set(time.time())
 
         await asyncio.sleep(0.05)  # 50ms cadence

@@ -83,6 +83,31 @@ http_latency_ms = Histogram(
     buckets=(5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000),
 )
 
+# ---------- Alerts pipeline ----------
+alerts_stage_duration_ms = Histogram(
+    "oraculo_alerts_stage_duration_ms",
+    "Duration per alerts stage (ms)",
+    ["stage"],
+    buckets=(1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000),
+)
+
+alerts_stage_rows_total = Counter(
+    "oraculo_alerts_stage_rows_total",
+    "Rows processed per alerts stage",
+    ["stage"],
+)
+
+alerts_stage_yields_total = Counter(
+    "oraculo_alerts_stage_yields_total",
+    "Cooperative yields executed per alerts stage",
+    ["stage"],
+)
+
+alerts_pipeline_tick_ts = Gauge(
+    "oraculo_alerts_pipeline_tick_timestamp_seconds",
+    "Timestamp (epoch seconds) of the last completed alerts pipeline tick",
+)
+
 # ---------- Rules ----------
 rule_eval_total = Counter("oraculo_rule_eval_total", "Rule evaluations", ["rule"])
 rule_eval_errors_total = Counter(
