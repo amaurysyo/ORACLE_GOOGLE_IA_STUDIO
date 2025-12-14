@@ -7,6 +7,7 @@ import asyncio
 import datetime as dt
 import json
 import math
+import time
 from typing import Any, Dict, Optional, Tuple, List, Sequence
 
 import aiohttp
@@ -29,6 +30,7 @@ from oraculo.detect.detectors import (
     OISkewCfg, OISkewDetector,
     Event,
 )
+from oraculo.obs import metrics as obs_metrics
 from oraculo.rules.engine import eval_rules, RuleContext
 from oraculo.rules.router import TelegramRouter
 
@@ -643,8 +645,24 @@ async def run_pipeline(
             ctx.profile,
         )
 
+    def _observe_rule_event(rule: dict, event_ts: float) -> None:
+        try:
+            rule_code = rule.get("rule") or "unknown"
+            event_ts_epoch = float(event_ts)
+            now = time.time()
+            lag = max(0.0, now - event_ts_epoch)
+            obs_metrics.rule_alert_lag_seconds.labels(rule=rule_code).observe(lag)
+            obs_metrics.rule_event_age_seconds.labels(rule=rule_code).set(lag)
+            obs_metrics.rule_watermark_event_time.labels(rule=rule_code).set(
+                event_ts_epoch
+            )
+        except Exception:
+            logger.debug("[metrics] failed to observe rule event", exc_info=True)
+
     async def upsert_rule(rule: dict, event_ts: float):
         """UPSERT y devuelve (alert_id, ts_first_dt) para registrar el envío con FK válida."""
+        _observe_rule_event(rule, event_ts)
+        t0 = time.perf_counter()
         try:
             sev_db = _sev_norm(rule["severity"])
             rows = await db.fetch(
@@ -669,11 +687,18 @@ async def run_pipeline(
             )
             row = rows[0] if rows else None
             if row:
+                obs_metrics.rule_alerts_upsert_total.labels(
+                    rule=rule["rule"], severity=sev_db
+                ).inc()
                 return int(row["id"]), row["ts_first"]
             return None, None
         except Exception as e:
             logger.error(f"upsert_rule_alert failed: {e!s}")
             return None, None
+        finally:
+            obs_metrics.db_upsert_rule_alert_ms.observe(
+                (time.perf_counter() - t0) * 1000
+            )
 
     async def insert_metrics(
         rows: Sequence[Tuple[str, dt.datetime, int, str, float, Optional[str], str]]
@@ -697,11 +722,16 @@ async def run_pipeline(
                 except Exception as e2:
                     logger.error(f"[metrics] drop row {r}: {e2!s}")
 
+    async def _cooperative_yield(idx: int, every: int = 500) -> None:
+        if idx % every == 0:
+            await asyncio.sleep(0)
+
     # ------------------- bucle principal -------------------
     while True:
         # 1) depth -> book & métricas + slicing pasivo + spoofing
         # Paginación por ID (seq)
-        for r in await tail_depth.fetch_new(BINANCE_FUT_INST, limit=5000):
+        for idx, r in enumerate(await tail_depth.fetch_new(BINANCE_FUT_INST, limit=5000)):
+            await _cooperative_yield(idx)
             ts = r["event_time"].timestamp()
             qty_delta = float(r["qty"])
             price = float(r["price"])
@@ -745,7 +775,8 @@ async def run_pipeline(
 
         # 2) mark funding -> basis
         # Paginación por Tiempo (legacy para mark)
-        for r in await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000):
+        for idx, r in enumerate(await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000)):
+            await _cooperative_yield(idx)
             engine.on_mark(
                 r["event_time"].timestamp(),
                 float(r.get("mark_price") or 0) or None,
@@ -769,7 +800,8 @@ async def run_pipeline(
         )
         if rows_opt:
             last_deriv_opt_ts = rows_opt[-1]["event_time"]
-            for r in rows_opt:
+            for idx, r in enumerate(rows_opt):
+                await _cooperative_yield(idx)
                 ts_opt = r["event_time"].timestamp()
                 inst_id = str(r["instrument_id"])
                 mark_iv = r.get("mark_iv")
@@ -837,7 +869,8 @@ async def run_pipeline(
 
         # 3) trades -> slicing (iceberg/hitting) + absorción + break_wall + tape_pressure + spoofing_exec
         # Paginación por ID (trade_id_ext)
-        for r in await tail_trades.fetch_new(BINANCE_FUT_INST, limit=5000):
+        for idx, r in enumerate(await tail_trades.fetch_new(BINANCE_FUT_INST, limit=5000)):
+            await _cooperative_yield(idx)
             ts = r["event_time"].timestamp()
             side = r["side"]
             px = float(r["price"])
