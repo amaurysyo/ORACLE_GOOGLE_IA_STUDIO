@@ -722,11 +722,16 @@ async def run_pipeline(
                 except Exception as e2:
                     logger.error(f"[metrics] drop row {r}: {e2!s}")
 
+    async def _cooperative_yield(idx: int, every: int = 500) -> None:
+        if idx % every == 0:
+            await asyncio.sleep(0)
+
     # ------------------- bucle principal -------------------
     while True:
         # 1) depth -> book & métricas + slicing pasivo + spoofing
         # Paginación por ID (seq)
-        for r in await tail_depth.fetch_new(BINANCE_FUT_INST, limit=5000):
+        for idx, r in enumerate(await tail_depth.fetch_new(BINANCE_FUT_INST, limit=5000)):
+            await _cooperative_yield(idx)
             ts = r["event_time"].timestamp()
             qty_delta = float(r["qty"])
             price = float(r["price"])
@@ -770,7 +775,8 @@ async def run_pipeline(
 
         # 2) mark funding -> basis
         # Paginación por Tiempo (legacy para mark)
-        for r in await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000):
+        for idx, r in enumerate(await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000)):
+            await _cooperative_yield(idx)
             engine.on_mark(
                 r["event_time"].timestamp(),
                 float(r.get("mark_price") or 0) or None,
@@ -794,7 +800,8 @@ async def run_pipeline(
         )
         if rows_opt:
             last_deriv_opt_ts = rows_opt[-1]["event_time"]
-            for r in rows_opt:
+            for idx, r in enumerate(rows_opt):
+                await _cooperative_yield(idx)
                 ts_opt = r["event_time"].timestamp()
                 inst_id = str(r["instrument_id"])
                 mark_iv = r.get("mark_iv")
@@ -862,7 +869,8 @@ async def run_pipeline(
 
         # 3) trades -> slicing (iceberg/hitting) + absorción + break_wall + tape_pressure + spoofing_exec
         # Paginación por ID (trade_id_ext)
-        for r in await tail_trades.fetch_new(BINANCE_FUT_INST, limit=5000):
+        for idx, r in enumerate(await tail_trades.fetch_new(BINANCE_FUT_INST, limit=5000)):
+            await _cooperative_yield(idx)
             ts = r["event_time"].timestamp()
             side = r["side"]
             px = float(r["price"])
