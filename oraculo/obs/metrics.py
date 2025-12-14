@@ -10,7 +10,10 @@ Created on Fri Oct 31 19:34:01 2025
 # oraculo/obs/metrics.py
 from __future__ import annotations
 
-from prometheus_client import Counter, Gauge, Summary, start_http_server,Histogram
+import os
+
+from loguru import logger
+from prometheus_client import Counter, Gauge, Summary, start_http_server, Histogram
 
 # WS mensajes por tipo de evento
 ws_msgs_total = Counter("oraculo_ws_msgs_total", "WS messages by event type", ["event"])
@@ -78,6 +81,69 @@ http_latency_ms = Histogram(
     buckets=(5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000),
 )
 
+# ---------- Rules ----------
+rule_eval_total = Counter("oraculo_rule_eval_total", "Rule evaluations", ["rule"])
+rule_eval_errors_total = Counter(
+    "oraculo_rule_eval_errors_total", "Rule evaluation errors", ["rule", "kind"]
+)
+rule_alerts_upsert_total = Counter(
+    "oraculo_rule_alerts_upsert_total",
+    "Upserts into rule_alerts by rule and severity",
+    ["rule", "severity"],
+)
+rule_alert_lag_seconds = Histogram(
+    "oraculo_rule_alert_lag_seconds",
+    "Lag between event_time and alert insertion (seconds)",
+    ["rule"],
+    buckets=(0.1, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300),
+)
+rule_event_age_seconds = Gauge(
+    "oraculo_rule_event_age_seconds",
+    "Age of last observed event for rule (seconds)",
+    ["rule"],
+)
+rule_watermark_event_time = Gauge(
+    "oraculo_rule_watermark_event_time",
+    "Event time watermark for last processed event (epoch seconds)",
+    ["rule"],
+)
+
+# ---------- Dispatch (Telegram) ----------
+dispatch_attempts_total = Counter(
+    "oraculo_dispatch_attempts_total", "Dispatch attempts", ["channel"]
+)
+dispatch_success_total = Counter(
+    "oraculo_dispatch_success_total", "Successful dispatches", ["channel"]
+)
+dispatch_fail_total = Counter(
+    "oraculo_dispatch_fail_total", "Failed dispatches", ["channel", "kind"]
+)
+dispatch_dropped_total = Counter(
+    "oraculo_dispatch_dropped_total", "Dropped dispatches", ["channel", "reason"]
+)
+dispatch_last_attempt_ts = Gauge(
+    "oraculo_dispatch_last_attempt_timestamp_seconds",
+    "Timestamp of last dispatch attempt",
+    ["channel"],
+)
+dispatch_last_success_ts = Gauge(
+    "oraculo_dispatch_last_success_timestamp_seconds",
+    "Timestamp of last successful dispatch",
+    ["channel"],
+)
+
+# ---------- DB ----------
+db_upsert_rule_alert_ms = Histogram(
+    "oraculo_db_upsert_rule_alert_ms",
+    "Latency of upsert_rule_alert DB call (ms)",
+    buckets=(1, 2, 5, 10, 20, 50, 100, 200, 500, 1000),
+)
+db_insert_dispatch_log_ms = Histogram(
+    "oraculo_db_insert_dispatch_log_ms",
+    "Latency of alert_dispatch_log insert (ms)",
+    buckets=(1, 2, 5, 10, 20, 50, 100, 200, 500, 1000),
+)
+
 
 _exporter_running = False
 
@@ -87,5 +153,17 @@ def run_exporter(port: int = 9000) -> None:
     global _exporter_running
     if _exporter_running:
         return
-    start_http_server(port)
-    _exporter_running = True
+    env_port = os.getenv("ORACULO_METRICS_PORT")
+    if env_port:
+        try:
+            port = int(env_port)
+        except ValueError:
+            logger.warning(
+                f"[metrics] Invalid ORACULO_METRICS_PORT={env_port!r}, using default {port}"
+            )
+    try:
+        start_http_server(port)
+        _exporter_running = True
+        logger.info(f"[metrics] Exporter started on port {port}")
+    except OSError as e:
+        logger.error(f"[metrics] Failed to start exporter on port {port}: {e!s}")

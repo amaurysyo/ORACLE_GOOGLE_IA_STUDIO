@@ -14,6 +14,7 @@ from telegram import Bot
 from telegram.error import TelegramError
 
 from oraculo.db import DB
+from oraculo.obs import metrics as obs_metrics
 
 
 def _as_mapping(obj: Any) -> Dict[str, Any]:
@@ -94,14 +95,28 @@ class TelegramRouter:
             self._refill()
             if self._tokens <= 0:
                 logger.warning("[telegram] token bucket exhausted")
+                channel = f"telegram/{kind}"
+                obs_metrics.dispatch_attempts_total.labels(channel=channel).inc()
+                obs_metrics.dispatch_last_attempt_ts.labels(channel=channel).set(time.time())
+                obs_metrics.dispatch_dropped_total.labels(
+                    channel=channel, reason="rate_limit"
+                ).inc()
                 return
             self._tokens -= 1
 
         target_cfg = self._targets.get(kind) or {}
         token = target_cfg.get("token")
         chat_id = int(target_cfg.get("chat_id") or 0)
+        channel = f"telegram/{kind}"
+
+        obs_metrics.dispatch_attempts_total.labels(channel=channel).inc()
+        obs_metrics.dispatch_last_attempt_ts.labels(channel=channel).set(time.time())
+
         if not token or chat_id == 0:
             logger.warning(f"[telegram] missing credentials for kind={kind}")
+            obs_metrics.dispatch_dropped_total.labels(
+                channel=channel, reason="disabled"
+            ).inc()
             return
 
         status = "sent=0"
@@ -111,12 +126,20 @@ class TelegramRouter:
             await bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
             logger.info(f"[telegram] {kind}@{chat_id}: {text}")
             status = "sent=1"
+            obs_metrics.dispatch_success_total.labels(channel=channel).inc()
+            obs_metrics.dispatch_last_success_ts.labels(channel=channel).set(time.time())
         except TelegramError as e:
             err = str(e)
             logger.error(f"[telegram] error: {e!s}")
+            obs_metrics.dispatch_fail_total.labels(
+                channel=channel, kind=type(e).__name__
+            ).inc()
         except Exception as e:
             err = str(e)
             logger.error(f"[telegram] unexpected error: {e!s}")
+            obs_metrics.dispatch_fail_total.labels(
+                channel=channel, kind=type(e).__name__
+            ).inc()
 
         # DB logging (FK-safe). Ignora si no hay DB o FK inválida.
         try:
@@ -128,12 +151,15 @@ class TelegramRouter:
                 )
                 if ts_first_db is None:
                     logger.warning(f"[telegram] skip dispatch log: alert_id={alert_id} not found in rule_alerts")
+                    obs_metrics.dispatch_dropped_total.labels(
+                        channel=channel, reason="stale"
+                    ).inc()
                 else:
                     # event_time: ahora mismo
                     event_time = dt.datetime.now(dt.timezone.utc)
                     # target NO nulo (antes estaba NULL y rompía el NOT NULL)
                     target = f"{kind}@{chat_id}"
-
+                    t0 = time.perf_counter()
                     await self._db.execute(
                         """
                         INSERT INTO oraculo.alert_dispatch_log(
@@ -160,6 +186,9 @@ class TelegramRouter:
                         f"telegram/{kind}",        # channel
                         text,                      # text enviado a Telegram
                         "{}",                      # extra
+                    )
+                    obs_metrics.db_insert_dispatch_log_ms.observe(
+                        (time.perf_counter() - t0) * 1000
                     )
         except Exception as e:
             logger.error(f"[telegram] failed to log dispatch: {e!s}")
