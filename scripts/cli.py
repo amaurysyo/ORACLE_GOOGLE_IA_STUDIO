@@ -22,7 +22,7 @@ from oraculo.config_hot import ConfigManager
 from oraculo.db import DB
 from oraculo.ingest.batch_writer import AsyncBatcher
 from oraculo.obs.logging import setup_logging_json
-from oraculo.obs.metrics import run_exporter
+from oraculo.obs.metrics import run_exporter, start_event_loop_lag_monitor
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -626,6 +626,12 @@ def alerts_run() -> None:
 
         # Lanzar watcher en background
         asyncio.create_task(cfgmgr.watch(enabled=hot, debounce_ms=debounce))
+
+        # Exporter dedicado para alertas (puerto 9001 por defecto)
+        if (cfg.observability or {}).get("prometheus_exporter", False):
+            run_exporter(9001)
+            logger.info("Prometheus exporter (alerts) en :9001")
+            start_event_loop_lag_monitor(service="alerts", period=1.0)
 
         # Pasamos cfg_mgr para aplicar reglas en caliente
         await run_pipeline(db, {"telegram": routing}, rules_profile="EU", cfg_mgr=cfgmgr)

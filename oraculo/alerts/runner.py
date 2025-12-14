@@ -7,6 +7,8 @@ import asyncio
 import datetime as dt
 import json
 import math
+import time
+from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional, Tuple, List, Sequence
 
 import aiohttp
@@ -29,6 +31,7 @@ from oraculo.detect.detectors import (
     OISkewCfg, OISkewDetector,
     Event,
 )
+from oraculo.obs import metrics as obs_metrics
 from oraculo.rules.engine import eval_rules, RuleContext
 from oraculo.rules.router import TelegramRouter
 
@@ -514,6 +517,8 @@ async def run_pipeline(
     routing_cfg: Dict[str, Any],
     rules_profile: str = "EU",
     cfg_mgr: Any | None = None,
+    *,
+    yield_every_ms: float = 20.0,
 ) -> None:
     engine = MetricsEngine(top_n=1000)
 
@@ -643,8 +648,24 @@ async def run_pipeline(
             ctx.profile,
         )
 
+    def _observe_rule_event(rule: dict, event_ts: float) -> None:
+        try:
+            rule_code = rule.get("rule") or "unknown"
+            event_ts_epoch = float(event_ts)
+            now = time.time()
+            lag = max(0.0, now - event_ts_epoch)
+            obs_metrics.rule_alert_lag_seconds.labels(rule=rule_code).observe(lag)
+            obs_metrics.rule_event_age_seconds.labels(rule=rule_code).set(lag)
+            obs_metrics.rule_watermark_event_time.labels(rule=rule_code).set(
+                event_ts_epoch
+            )
+        except Exception:
+            logger.debug("[metrics] failed to observe rule event", exc_info=True)
+
     async def upsert_rule(rule: dict, event_ts: float):
         """UPSERT y devuelve (alert_id, ts_first_dt) para registrar el envío con FK válida."""
+        _observe_rule_event(rule, event_ts)
+        t0 = time.perf_counter()
         try:
             sev_db = _sev_norm(rule["severity"])
             rows = await db.fetch(
@@ -669,11 +690,18 @@ async def run_pipeline(
             )
             row = rows[0] if rows else None
             if row:
+                obs_metrics.rule_alerts_upsert_total.labels(
+                    rule=rule["rule"], severity=sev_db
+                ).inc()
                 return int(row["id"]), row["ts_first"]
             return None, None
         except Exception as e:
             logger.error(f"upsert_rule_alert failed: {e!s}")
             return None, None
+        finally:
+            obs_metrics.db_upsert_rule_alert_ms.observe(
+                (time.perf_counter() - t0) * 1000
+            )
 
     async def insert_metrics(
         rows: Sequence[Tuple[str, dt.datetime, int, str, float, Optional[str], str]]
@@ -697,60 +725,93 @@ async def run_pipeline(
                 except Exception as e2:
                     logger.error(f"[metrics] drop row {r}: {e2!s}")
 
+    class TimeSlicedYield:
+        def __init__(self, stage: str, every_ms: float = 20.0) -> None:
+            self.stage = stage
+            self.every = max(0.0, float(every_ms)) / 1000.0
+            self._last = time.perf_counter()
+
+        async def maybe_yield(self) -> None:
+            if self.every <= 0:
+                return
+            now = time.perf_counter()
+            if (now - self._last) >= self.every:
+                self._last = now
+                obs_metrics.alerts_stage_yields_total.labels(stage=self.stage).inc()
+                await asyncio.sleep(0)
+
+    @asynccontextmanager
+    async def stage_timer(stage: str):
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            obs_metrics.alerts_stage_duration_ms.labels(stage=stage).observe(
+                (time.perf_counter() - t0) * 1000
+            )
+
     # ------------------- bucle principal -------------------
     while True:
         # 1) depth -> book & métricas + slicing pasivo + spoofing
         # Paginación por ID (seq)
-        for r in await tail_depth.fetch_new(BINANCE_FUT_INST, limit=5000):
-            ts = r["event_time"].timestamp()
-            qty_delta = float(r["qty"])
-            price = float(r["price"])
-            side = r["side"]
+        depth_yield = TimeSlicedYield("depth", yield_every_ms)
+        async with stage_timer("depth"):
+            for idx, r in enumerate(await tail_depth.fetch_new(BINANCE_FUT_INST, limit=5000)):
+                await depth_yield.maybe_yield()
+                obs_metrics.alerts_stage_rows_total.labels(stage="depth").inc()
+                ts = r["event_time"].timestamp()
+                qty_delta = float(r["qty"])
+                price = float(r["price"])
+                side = r["side"]
 
-            engine.on_depth(ts, side, r["action"], price, qty_delta)
+                engine.on_depth(ts, side, r["action"], price, qty_delta)
 
-            # slicing pasivo
-            if r["action"] == "insert" and qty_delta > 0:
-                evp = det_pass.on_depth(ts, side, price, qty_delta)
-                if evp:
-                    await insert_slice(evp)
-                    for rule in eval_rules(_evdict(evp), ctx):
-                        alert_id, ts_first_dt = await upsert_rule(rule, evp.ts)
-                        if alert_id is not None:
-                            # telemetría de emisión
-                            telemetry.bump(evp.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                # slicing pasivo
+                if r["action"] == "insert" and qty_delta > 0:
+                    evp = det_pass.on_depth(ts, side, price, qty_delta)
+                    if evp:
+                        await insert_slice(evp)
+                        for rule in eval_rules(_evdict(evp), ctx):
+                            alert_id, ts_first_dt = await upsert_rule(rule, evp.ts)
+                            if alert_id is not None:
+                                # telemetría de emisión
+                                telemetry.bump(evp.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                                text = (
+                                    f"#{rule['rule']} {evp.side.upper()} slicing_pass @ {evp.price} | "
+                                    f"qty={evp.intensity:.2f} BTC"
+                                )
+                                await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
+
+                # spoofing detector (necesita bests)
+                bb, ba = engine.book.best()
+                book_qty = (
+                    engine.book.bids.get(price) if side == "buy" else engine.book.asks.get(price)
+                )
+                spoof_qty = book_qty if book_qty is not None else qty_delta
+                ev_sp = det_spoof.on_depth(ts, side, r["action"], price, spoof_qty, bb, ba)
+                if ev_sp:
+                    for rule in eval_rules(_evdict(ev_sp), ctx):
+                        aid, t0 = await upsert_rule(rule, ev_sp.ts)
+                        if aid is not None:
+                            telemetry.bump(ev_sp.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                             text = (
-                                f"#{rule['rule']} {evp.side.upper()} slicing_pass @ {evp.price} | "
-                                f"qty={evp.intensity:.2f} BTC"
+                                f"#{rule['rule']} {ev_sp.side.upper()} spoofing {ev_sp.intensity:.2f} BTC @ "
+                                f"{ev_sp.price} | cancel={ev_sp.fields.get('cancel_rate'):.2f}"
                             )
-                            await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
-
-            # spoofing detector (necesita bests)
-            bb, ba = engine.book.best()
-            book_qty = (
-                engine.book.bids.get(price) if side == "buy" else engine.book.asks.get(price)
-            )
-            spoof_qty = book_qty if book_qty is not None else qty_delta
-            ev_sp = det_spoof.on_depth(ts, side, r["action"], price, spoof_qty, bb, ba)
-            if ev_sp:
-                for rule in eval_rules(_evdict(ev_sp), ctx):
-                    aid, t0 = await upsert_rule(rule, ev_sp.ts)
-                    if aid is not None:
-                        telemetry.bump(ev_sp.ts, rule["rule"], rule.get("side", "na"), emitted=1)
-                        text = (
-                            f"#{rule['rule']} {ev_sp.side.upper()} spoofing {ev_sp.intensity:.2f} BTC @ "
-                            f"{ev_sp.price} | cancel={ev_sp.fields.get('cancel_rate'):.2f}"
-                        )
-                        await router.send("rules", text, alert_id=aid, ts_first=t0)
+                            await router.send("rules", text, alert_id=aid, ts_first=t0)
 
         # 2) mark funding -> basis
         # Paginación por Tiempo (legacy para mark)
-        for r in await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000):
-            engine.on_mark(
-                r["event_time"].timestamp(),
-                float(r.get("mark_price") or 0) or None,
-                float(r.get("index_price") or 0) or None,
-            )
+        mark_yield = TimeSlicedYield("mark", yield_every_ms)
+        async with stage_timer("mark"):
+            for idx, r in enumerate(await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000)):
+                await mark_yield.maybe_yield()
+                obs_metrics.alerts_stage_rows_total.labels(stage="mark").inc()
+                engine.on_mark(
+                    r["event_time"].timestamp(),
+                    float(r.get("mark_price") or 0) or None,
+                    float(r.get("index_price") or 0) or None,
+                )
 
         # 2b) Deribit opciones ticker -> IV spikes (R19/R20) + OI skew (R21/R22)
         # Nota: Mantenemos el polling directo por tiempo aquí ya que es otra tabla/lógica
@@ -767,13 +828,17 @@ async def run_pipeline(
             """,
             last_deriv_opt_ts,
         )
-        if rows_opt:
-            last_deriv_opt_ts = rows_opt[-1]["event_time"]
-            for r in rows_opt:
-                ts_opt = r["event_time"].timestamp()
-                inst_id = str(r["instrument_id"])
-                mark_iv = r.get("mark_iv")
-                oi_val = r.get("open_interest")
+        async with stage_timer("deribit"):
+            if rows_opt:
+                last_deriv_opt_ts = rows_opt[-1]["event_time"]
+                deribit_yield = TimeSlicedYield("deribit", yield_every_ms)
+                for idx, r in enumerate(rows_opt):
+                    await deribit_yield.maybe_yield()
+                    obs_metrics.alerts_stage_rows_total.labels(stage="deribit").inc()
+                    ts_opt = r["event_time"].timestamp()
+                    inst_id = str(r["instrument_id"])
+                    mark_iv = r.get("mark_iv")
+                    oi_val = r.get("open_interest")
 
                 # -------- IV spikes (R19/R20) --------
                 if mark_iv is None or float(mark_iv) <= 0.0:
@@ -837,185 +902,196 @@ async def run_pipeline(
 
         # 3) trades -> slicing (iceberg/hitting) + absorción + break_wall + tape_pressure + spoofing_exec
         # Paginación por ID (trade_id_ext)
-        for r in await tail_trades.fetch_new(BINANCE_FUT_INST, limit=5000):
-            ts = r["event_time"].timestamp()
-            side = r["side"]
-            px = float(r["price"])
-            qty = float(r["qty"])
+        trades_yield = TimeSlicedYield("trades", yield_every_ms)
+        async with stage_timer("trades"):
+            for idx, r in enumerate(await tail_trades.fetch_new(BINANCE_FUT_INST, limit=5000)):
+                await trades_yield.maybe_yield()
+                obs_metrics.alerts_stage_rows_total.labels(stage="trades").inc()
+                ts = r["event_time"].timestamp()
+                side = r["side"]
+                px = float(r["price"])
+                qty = float(r["qty"])
 
-            # actualizar métricas por trade si tu engine lo usa
-            engine.on_trade(ts, side, px, qty)
+                # actualizar métricas por trade si tu engine lo usa
+                engine.on_trade(ts, side, px, qty)
 
-            # spoofing: registrar ejecuciones cerca del muro
-            det_spoof.on_trade(ts, side, px, qty)
+                # spoofing: registrar ejecuciones cerca del muro
+                det_spoof.on_trade(ts, side, px, qty)
 
-            # slicing iceberg/hitting
-            ev1 = det_slice_eq.on_trade(ts, side, px, qty)
-            ev2 = det_slice_hit.on_trade(ts, side, px, qty)
-            for ev in filter(None, [ev1, ev2]):  # type: ignore
-                await insert_slice(ev)  # persistir slice event
-                for rule in eval_rules(_evdict(ev), ctx):
-                    alert_id, ts_first_dt = await upsert_rule(rule, ev.ts)
-                    if alert_id is not None:
-                        telemetry.bump(ev.ts, rule["rule"], rule.get("side", "na"), emitted=1)
-                        label = "iceberg" if ev.fields.get("mode") == "iceberg" else "hitting"
-                        text = (
-                            f"#{rule['rule']} {side.upper()} slicing_{label} @ {px} | "
-                            f"qty={ev.intensity:.2f} BTC"
-                        )
-                        await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
-
-            # Absorción (usa bests actuales para validar drift)
-            bb, ba = engine.book.best()
-            det_abs.on_best(bb, ba)
-            ev_abs = det_abs.on_trade(ts, side, px, qty)
-            if ev_abs:
-                for rule in eval_rules(_evdict(ev_abs), ctx):
-                    alert_id, ts_first_dt = await upsert_rule(rule, ev_abs.ts)
-                    if alert_id is not None:
-                        telemetry.bump(ev_abs.ts, rule["rule"], rule.get("side", "na"), emitted=1)
-                        text = (
-                            f"#{rule['rule']} {ev_abs.side.upper()} absorption @ {ev_abs.price} | "
-                            f"vol={ev_abs.intensity:.2f} BTC"
-                        )
-                        await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
-
-            # BreakWall: gating por snapshot (depleción/refill/basis_vel)
-            snap = engine.get_snapshot()
-            if ev1 or ev2:
-                # Telemetría de descarte por falta de métricas (basis_vel)
-                if getattr(snap, "basis_vel_bps_s", None) is None:
-                    telemetry.bump(ts, "R1/R2", (ev1 or ev2).side, disc_metrics_none=1)
-                e2, gating_reason = det_bw.on_slicing(
-                    ts, ev1 or ev2, snap.__dict__ if hasattr(snap, "__dict__") else dict()
-                )
-                if e2:
-                    for rule in eval_rules(_evdict(e2), ctx):
-                        alert_id, ts_first_dt = await upsert_rule(rule, e2.ts)
+                # slicing iceberg/hitting
+                ev1 = det_slice_eq.on_trade(ts, side, px, qty)
+                ev2 = det_slice_hit.on_trade(ts, side, px, qty)
+                for ev in filter(None, [ev1, ev2]):  # type: ignore
+                    await insert_slice(ev)  # persistir slice event
+                    for rule in eval_rules(_evdict(ev), ctx):
+                        alert_id, ts_first_dt = await upsert_rule(rule, ev.ts)
                         if alert_id is not None:
-                            telemetry.bump(e2.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                            telemetry.bump(ev.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                            label = "iceberg" if ev.fields.get("mode") == "iceberg" else "hitting"
                             text = (
-                                f"#{rule['rule']} {e2.side.upper()} break_wall @ {e2.price} | "
-                                f"k={e2.fields.get('k')}"
+                                f"#{rule['rule']} {side.upper()} slicing_{label} @ {px} | "
+                                f"qty={ev.intensity:.2f} BTC"
                             )
                             await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
-                elif gating_reason:
-                    reason_map = {
-                        "basis_vel_low": {"disc_basis_vel_low": 1},
-                        "dep_low": {"disc_dep_low": 1},
-                        "refill_high": {"disc_refill_high": 1},
-                        "top_levels_gate": {"disc_top_levels_gate": 1},
-                    }
-                    bump_kwargs = reason_map.get(gating_reason, {})
-                    if bump_kwargs:
-                        telemetry.bump(
-                            ts, "R1/R2", (ev1 or ev2).side, **bump_kwargs,
-                        )
 
-            # tape pressure
-            ev_tp = tape_det.on_trade(ts, side, px, qty)
-            if ev_tp:
-                for rule in eval_rules(_evdict(ev_tp), ctx):
-                    aid, t0 = await upsert_rule(rule, ev_tp.ts)
-                    if aid is not None:
-                        telemetry.bump(ev_tp.ts, rule["rule"], rule.get("side", "na"), emitted=1)
-                        text = (
-                            f"#{rule['rule']} {ev_tp.side.upper()} tape_pressure "
-                            f"{ev_tp.intensity:.2f} @ {ev_tp.price}"
-                        )
-                        await router.send("rules", text, alert_id=aid, ts_first=t0)
+                # Absorción (usa bests actuales para validar drift)
+                bb, ba = engine.book.best()
+                det_abs.on_best(bb, ba)
+                ev_abs = det_abs.on_trade(ts, side, px, qty)
+                if ev_abs:
+                    for rule in eval_rules(_evdict(ev_abs), ctx):
+                        alert_id, ts_first_dt = await upsert_rule(rule, ev_abs.ts)
+                        if alert_id is not None:
+                            telemetry.bump(ev_abs.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                            text = (
+                                f"#{rule['rule']} {ev_abs.side.upper()} absorption @ {ev_abs.price} | "
+                                f"vol={ev_abs.intensity:.2f} BTC"
+                            )
+                            await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
 
-        # 4) Triggers de snapshot: dominance, depletion, basis_extreme, basis_mean-revert
-        snap = engine.get_snapshot()
-        ts_now = dt.datetime.now(dt.timezone.utc).timestamp()
+                # BreakWall: gating por snapshot (depleción/refill/basis_vel)
+                snap = engine.get_snapshot()
+                if ev1 or ev2:
+                    # Telemetría de descarte por falta de métricas (basis_vel)
+                    if getattr(snap, "basis_vel_bps_s", None) is None:
+                        telemetry.bump(ts, "R1/R2", (ev1 or ev2).side, disc_metrics_none=1)
+                    e2, gating_reason = det_bw.on_slicing(
+                        ts, ev1 or ev2, snap.__dict__ if hasattr(snap, "__dict__") else dict()
+                    )
+                    if e2:
+                        for rule in eval_rules(_evdict(e2), ctx):
+                            alert_id, ts_first_dt = await upsert_rule(rule, e2.ts)
+                            if alert_id is not None:
+                                telemetry.bump(e2.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                                text = (
+                                    f"#{rule['rule']} {e2.side.upper()} break_wall @ {e2.price} | "
+                                    f"k={e2.fields.get('k')}"
+                                )
+                                await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
+                    elif gating_reason:
+                        reason_map = {
+                            "basis_vel_low": {"disc_basis_vel_low": 1},
+                            "dep_low": {"disc_dep_low": 1},
+                            "refill_high": {"disc_refill_high": 1},
+                            "top_levels_gate": {"disc_top_levels_gate": 1},
+                        }
+                        bump_kwargs = reason_map.get(gating_reason, {})
+                        if bump_kwargs:
+                            telemetry.bump(
+                                ts, "R1/R2", (ev1 or ev2).side, **bump_kwargs,
+                            )
 
-        # Dominance (timer-based) con telemetría de descartes por spread
-        if getattr(snap, "spread_usd", None) is None:
-            telemetry.bump(ts_now, "R9/R10", "na", disc_metrics_none=1)
-        elif float(snap.spread_usd or 0.0) > det_dom.cfg.max_spread_usd:
-            telemetry.bump(ts_now, "R9/R10", "na", disc_dom_spread=1)
-        else:
-            evd = det_dom.maybe_emit(ts_now, spread_usd=float(snap.spread_usd or 0.0))
-            if evd:
-                for rule in eval_rules(_evdict(evd), ctx):
-                    aid, t0 = await upsert_rule(rule, evd.ts)
-                    if aid is not None:
-                        telemetry.bump(evd.ts, rule["rule"], rule.get("side", "na"), emitted=1)
-                        text = (
-                            f"#{rule['rule']} {evd.side.upper()} dominance {evd.intensity:.1f}% "
-                            f"@ {evd.price}"
-                        )
-                        await router.send("rules", text, alert_id=aid, ts_first=t0)
-
-        # Depletion masivo (R13/R14)
-        ev_dep_bid = dep_bid_det.on_snapshot(ts_now, snap.__dict__ if hasattr(snap, "__dict__") else dict())
-        ev_dep_ask = dep_ask_det.on_snapshot(ts_now, snap.__dict__ if hasattr(snap, "__dict__") else dict())
-        for evd in [ev_dep_bid, ev_dep_ask]:
-            if evd:
-                for rule in eval_rules(_evdict(evd), ctx):
-                    aid, t0 = await upsert_rule(rule, evd.ts)
-                    if aid is not None:
-                        telemetry.bump(evd.ts, rule["rule"], rule.get("side", "na"), emitted=1)
-                        text = f"#{rule['rule']} {evd.side.upper()} depletion {evd.intensity:.2f}"
-                        await router.send("rules", text, alert_id=aid, ts_first=t0)
-
-        # Basis extremos (R15/R16) a través de MetricTrigger
-        if getattr(snap, "basis_bps", None) is None:
-            telemetry.bump(ts_now, "R15/R16", "na", disc_metrics_none=1)
-        else:
-            ev_bpos = basis_pos_trig.on_snapshot(ts_now, snap.__dict__ if hasattr(snap, "__dict__") else dict())
-            ev_bneg = basis_neg_trig.on_snapshot(ts_now, snap.__dict__ if hasattr(snap, "__dict__") else dict())
-            for evb in [ev_bpos, ev_bneg]:
-                if evb:
-                    for rule in eval_rules(_evdict(evb), ctx):
-                        aid, t0 = await upsert_rule(rule, evb.ts)
+                # tape pressure
+                ev_tp = tape_det.on_trade(ts, side, px, qty)
+                if ev_tp:
+                    for rule in eval_rules(_evdict(ev_tp), ctx):
+                        aid, t0 = await upsert_rule(rule, ev_tp.ts)
                         if aid is not None:
-                            telemetry.bump(evb.ts, rule["rule"], rule.get("side", "na"), emitted=1)
-                            text = f"#{rule['rule']} basis_bps={evb.intensity:.1f}"
+                            telemetry.bump(ev_tp.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                            text = (
+                                f"#{rule['rule']} {ev_tp.side.upper()} tape_pressure "
+                                f"{ev_tp.intensity:.2f} @ {ev_tp.price}"
+                            )
                             await router.send("rules", text, alert_id=aid, ts_first=t0)
 
-        # Basis mean-revert (R17/R18)
-        if getattr(snap, "basis_bps", None) is None or getattr(snap, "basis_vel_bps_s", None) is None:
-            telemetry.bump(ts_now, "R17/R18", "na", disc_metrics_none=1)
-        else:
-            ev_mr = basis_mr.on_snapshot(ts_now, snap.__dict__ if hasattr(snap, "__dict__") else dict())
-            if ev_mr:
-                for rule in eval_rules(_evdict(ev_mr), ctx):
-                    aid, t0 = await upsert_rule(rule, ev_mr.ts)
-                    if aid is not None:
-                        telemetry.bump(ev_mr.ts, rule["rule"], rule.get("side", "na"), emitted=1)
-                        text = (
-                            f"#{rule['rule']} basis_mean_revert {ev_mr.side.upper()} | "
-                            f"vel={ev_mr.intensity:.2f} bps/s"
-                        )
-                        await router.send("rules", text, alert_id=aid, ts_first=t0)
+        # 4) Triggers de snapshot: dominance, depletion, basis_extreme, basis_mean-revert
+        snapshot_yield = TimeSlicedYield("snapshots", yield_every_ms)
+        async with stage_timer("snapshots"):
+            snap = engine.get_snapshot()
+            ts_now = dt.datetime.now(dt.timezone.utc).timestamp()
+
+            # Dominance (timer-based) con telemetría de descartes por spread
+            if getattr(snap, "spread_usd", None) is None:
+                telemetry.bump(ts_now, "R9/R10", "na", disc_metrics_none=1)
+            elif float(snap.spread_usd or 0.0) > det_dom.cfg.max_spread_usd:
+                telemetry.bump(ts_now, "R9/R10", "na", disc_dom_spread=1)
+            else:
+                evd = det_dom.maybe_emit(ts_now, spread_usd=float(snap.spread_usd or 0.0))
+                if evd:
+                    for rule in eval_rules(_evdict(evd), ctx):
+                        aid, t0 = await upsert_rule(rule, evd.ts)
+                        if aid is not None:
+                            telemetry.bump(evd.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                            text = (
+                                f"#{rule['rule']} {evd.side.upper()} dominance {evd.intensity:.1f}% "
+                                f"@ {evd.price}"
+                            )
+                            await router.send("rules", text, alert_id=aid, ts_first=t0)
+            await snapshot_yield.maybe_yield()
+
+            # Depletion masivo (R13/R14)
+            ev_dep_bid = dep_bid_det.on_snapshot(ts_now, snap.__dict__ if hasattr(snap, "__dict__") else dict())
+            ev_dep_ask = dep_ask_det.on_snapshot(ts_now, snap.__dict__ if hasattr(snap, "__dict__") else dict())
+            for evd in [ev_dep_bid, ev_dep_ask]:
+                if evd:
+                    for rule in eval_rules(_evdict(evd), ctx):
+                        aid, t0 = await upsert_rule(rule, evd.ts)
+                        if aid is not None:
+                            telemetry.bump(evd.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                            text = f"#{rule['rule']} {evd.side.upper()} depletion {evd.intensity:.2f}"
+                            await router.send("rules", text, alert_id=aid, ts_first=t0)
+            await snapshot_yield.maybe_yield()
+
+            # Basis extremos (R15/R16) a través de MetricTrigger
+            if getattr(snap, "basis_bps", None) is None:
+                telemetry.bump(ts_now, "R15/R16", "na", disc_metrics_none=1)
+            else:
+                ev_bpos = basis_pos_trig.on_snapshot(ts_now, snap.__dict__ if hasattr(snap, "__dict__") else dict())
+                ev_bneg = basis_neg_trig.on_snapshot(ts_now, snap.__dict__ if hasattr(snap, "__dict__") else dict())
+                for evb in [ev_bpos, ev_bneg]:
+                    if evb:
+                        for rule in eval_rules(_evdict(evb), ctx):
+                            aid, t0 = await upsert_rule(rule, evb.ts)
+                            if aid is not None:
+                                telemetry.bump(evb.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                                text = f"#{rule['rule']} basis_bps={evb.intensity:.1f}"
+                                await router.send("rules", text, alert_id=aid, ts_first=t0)
+            await snapshot_yield.maybe_yield()
+
+            # Basis mean-revert (R17/R18)
+            if getattr(snap, "basis_bps", None) is None or getattr(snap, "basis_vel_bps_s", None) is None:
+                telemetry.bump(ts_now, "R17/R18", "na", disc_metrics_none=1)
+            else:
+                ev_mr = basis_mr.on_snapshot(ts_now, snap.__dict__ if hasattr(snap, "__dict__") else dict())
+                if ev_mr:
+                    for rule in eval_rules(_evdict(ev_mr), ctx):
+                        aid, t0 = await upsert_rule(rule, ev_mr.ts)
+                        if aid is not None:
+                            telemetry.bump(ev_mr.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                            text = (
+                                f"#{rule['rule']} basis_mean_revert {ev_mr.side.upper()} | "
+                                f"vel={ev_mr.intensity:.2f} bps/s"
+                            )
+                            await router.send("rules", text, alert_id=aid, ts_first=t0)
 
         # 5) Flush de métricas y telemetría (1 Hz)
-        now_ts = dt.datetime.now(dt.timezone.utc).timestamp()
-        if (now_ts - ts_now) >= 0:  # ts_now es de este mismo tick
-            now_dt = dt.datetime.fromtimestamp(now_ts, tz=dt.timezone.utc)
-            snap = engine.get_snapshot()
-            rows: List[Tuple[str, dt.datetime, int, str, float, Optional[str], str]] = []
+        async with stage_timer("flush"):
+            now_ts = dt.datetime.now(dt.timezone.utc).timestamp()
+            if (now_ts - ts_now) >= 0:  # ts_now es de este mismo tick
+                now_dt = dt.datetime.fromtimestamp(now_ts, tz=dt.timezone.utc)
+                snap = engine.get_snapshot()
+                rows: List[Tuple[str, dt.datetime, int, str, float, Optional[str], str]] = []
 
-            def add(name: str, val):
-                if val is None:
-                    return
-                if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
-                    return
-                rows.append((BINANCE_FUT_INST, now_dt, 1, name, float(val), ctx.profile, "{}"))
+                def add(name: str, val):
+                    if val is None:
+                        return
+                    if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+                        return
+                    rows.append((BINANCE_FUT_INST, now_dt, 1, name, float(val), ctx.profile, "{}"))
 
-            add("spread_usd", getattr(snap, "spread_usd", None))
-            add("basis_bps", getattr(snap, "basis_bps", None))
-            add("basis_vel_bps_s", getattr(snap, "basis_vel_bps_s", None))
-            add("dom_bid", getattr(snap, "dom_bid", None))
-            add("dom_ask", getattr(snap, "dom_ask", None))
-            add("imbalance", getattr(snap, "imbalance", None))
-            add("dep_bid", getattr(snap, "dep_bid", None))
-            add("dep_ask", getattr(snap, "dep_ask", None))
-            add("refill_bid_3s", getattr(snap, "refill_bid_3s", None))
-            add("refill_ask_3s", getattr(snap, "refill_ask_3s", None))
+                add("spread_usd", getattr(snap, "spread_usd", None))
+                add("basis_bps", getattr(snap, "basis_bps", None))
+                add("basis_vel_bps_s", getattr(snap, "basis_vel_bps_s", None))
+                add("dom_bid", getattr(snap, "dom_bid", None))
+                add("dom_ask", getattr(snap, "dom_ask", None))
+                add("imbalance", getattr(snap, "imbalance", None))
+                add("dep_bid", getattr(snap, "dep_bid", None))
+                add("dep_ask", getattr(snap, "dep_ask", None))
+                add("refill_bid_3s", getattr(snap, "refill_bid_3s", None))
+                add("refill_ask_3s", getattr(snap, "refill_ask_3s", None))
 
-            await insert_metrics(rows)
-            await telemetry.flush_if_needed()
+                await insert_metrics(rows)
+                await telemetry.flush_if_needed()
 
+        obs_metrics.alerts_pipeline_tick_ts.set(dt.datetime.now(dt.timezone.utc).timestamp())
         await asyncio.sleep(0.05)  # 50ms cadence
