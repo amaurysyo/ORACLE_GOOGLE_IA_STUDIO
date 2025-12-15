@@ -82,6 +82,10 @@ alerts_stage_yields_total = Counter(
     "Cooperative yields per stage in alerts pipeline",
     ["stage"],
 )
+alerts_queue_dropped_total = Counter(
+    "oraculo_alerts_queue_dropped_total",
+    "Dropped events in alerts hot path queue",
+)
 
 #  Retardo en colas del batcher
 batch_queue_delay_ms = Summary(
