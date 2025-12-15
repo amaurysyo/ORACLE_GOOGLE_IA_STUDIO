@@ -159,7 +159,14 @@ class WsEventSource(EventSource):
         self._depth_levels = depth_levels
         self._depth_ms = depth_ms
         self._symbol = symbol.lower()
-        self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=20_000)
+        self._trade_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=50_000)
+        self._depth_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=50_000)
+        self._mark_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=10_000)
+        self._queues: Dict[str, asyncio.Queue[Any]] = {
+            "trade": self._trade_queue,
+            "depth": self._depth_queue,
+            "mark": self._mark_queue,
+        }
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._mgr: Optional[Any] = None
@@ -193,9 +200,31 @@ class WsEventSource(EventSource):
 
     async def _iter_queue(self) -> AsyncIterator[Any]:
         while self._running:
-            ev = await self._queue.get()
-            obs_metrics.alerts_queue_depth.labels(stream="all").set(self._queue.qsize())
+            ev = await self._next_event()
+            self._set_queue_depth_metrics()
             yield ev
+
+    async def _next_event(self) -> Any:
+        tasks: Dict[asyncio.Task[Any], str] = {
+            asyncio.create_task(queue.get()): name for name, queue in self._queues.items()
+        }
+        done, pending = await asyncio.wait(
+            tasks.keys(), return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+        done_task = done.pop()
+        return done_task.result()
+
+    def _set_queue_depth_metrics(self) -> None:
+        total = 0
+        for name, queue in self._queues.items():
+            size = queue.qsize()
+            total += size
+            obs_metrics.alerts_queue_depth.labels(stream=name).set(size)
+        obs_metrics.alerts_queue_depth.labels(stream="all").set(total)
 
     async def _run(self) -> None:
         try:
@@ -244,17 +273,17 @@ class WsEventSource(EventSource):
                     price=float(data.get("p", 0)),
                     qty=float(data.get("q", 0)),
                 )
-                await self._put_event(ev)
+                await self._put_event(ev, queue_name="trade")
             elif etype == "depthUpdate":
                 obs_metrics.ws_msgs_total.labels("depth").inc()
                 self._last_msg_ts["depth"] = now
                 ts = float(data.get("E", 0)) / 1000.0
                 for p, q in data.get("b", []):
                     ev = DepthEvent(ts=ts, side="buy", action="insert" if float(q) > 0 else "delete", price=float(p), qty=float(q))
-                    await self._put_event(ev)
+                    await self._put_event(ev, queue_name="depth")
                 for p, q in data.get("a", []):
                     ev = DepthEvent(ts=ts, side="sell", action="insert" if float(q) > 0 else "delete", price=float(p), qty=float(q))
-                    await self._put_event(ev)
+                    await self._put_event(ev, queue_name="depth")
             elif etype in ("markPriceUpdate", "24hrMiniTicker", "24hrTicker"):
                 obs_metrics.ws_msgs_total.labels("mark").inc()
                 self._last_msg_ts["mark"] = now
@@ -263,25 +292,29 @@ class WsEventSource(EventSource):
                     mark_price=float(data.get("p") or data.get("c") or 0),
                     index_price=float(data.get("i") or data.get("P") or data.get("i")),
                 )
-                await self._put_event(ev)
+                await self._put_event(ev, queue_name="mark")
             self._observe_last_msg_age()
 
-    async def _put_event(self, ev: Any) -> None:
+    async def _put_event(self, ev: Any, queue_name: str) -> None:
+        queue = self._queues.get(queue_name)
+        if queue is None:
+            return
         try:
-            self._queue.put_nowait(ev)
+            queue.put_nowait(ev)
         except asyncio.QueueFull:
             self._drop_since_last_log += 1
             obs_metrics.alerts_queue_dropped_total.inc()
-            self._log_drops_if_needed()
-        obs_metrics.alerts_queue_depth.labels(stream="all").set(self._queue.qsize())
+            self._log_drops_if_needed(queue_name)
+        self._set_queue_depth_metrics()
 
-    def _log_drops_if_needed(self) -> None:
+    def _log_drops_if_needed(self, queue_name: str) -> None:
         now = asyncio.get_event_loop().time()
         if (now - self._last_drop_log_ts) < self._drop_log_window_s:
             return
         if self._drop_since_last_log > 0:
             logger.warning(
-                "[alerts-ws] queue full, dropping event ({} drops in last {:.0f}s)",
+                "[alerts-ws] queue '{}' full, dropping event ({} drops in last {:.0f}s)",
+                queue_name,
                 self._drop_since_last_log,
                 self._drop_log_window_s,
             )
