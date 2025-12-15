@@ -62,6 +62,32 @@ ws_reconnects_total = Counter(
     ["venue", "stream"],
 )
 
+# Alertas: tamaños de cola y tiempos por etapa (hot path)
+alerts_queue_depth = Gauge(
+    "oraculo_alerts_queue_depth", "Queue depth for alerts hot path", ["stream"],
+)
+alerts_queue_dropped_total = Counter(
+    "oraculo_alerts_queue_dropped_total",
+    "Dropped events due to alerts hot-path queue overflow",
+    ["stream"],
+)
+alerts_stage_duration_ms = Histogram(
+    "oraculo_alerts_stage_duration_ms",
+    "Stage duration in milliseconds for alerts pipeline",
+    ["stage"],
+    buckets=(1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000),
+)
+alerts_stage_rows_total = Counter(
+    "oraculo_alerts_stage_rows_total",
+    "Rows/events processed per stage in alerts pipeline",
+    ["stage"],
+)
+alerts_stage_yields_total = Counter(
+    "oraculo_alerts_stage_yields_total",
+    "Cooperative yields per stage in alerts pipeline",
+    ["stage"],
+)
+
 #  Retardo en colas del batcher
 batch_queue_delay_ms = Summary(
     "oraculo_batch_queue_delay_ms",

@@ -6,6 +6,15 @@ app:
     dsn: ${PG_DSN}
     batch_max_rows: 200
     flush_ms: 100
+alerts:
+  source: ws   # ws | db
+  depth_levels: 20
+  depth_ms: 100
+  queue_maxsize: 20000
+  queue_high_watermark_pct: 0.7
+  queue_backpressure_sleep_ms: 1
+  queue_batch_size: 256
+  queue_batch_wait_ms: 10.0
 heartbeat:
   deribit: { trade: 20, book: 5, ticker: 15, mark: 15 }
   futures:
