@@ -66,6 +66,11 @@ ws_reconnects_total = Counter(
 alerts_queue_depth = Gauge(
     "oraculo_alerts_queue_depth", "Queue depth for alerts hot path", ["stream"],
 )
+alerts_queue_backpressure_skipped_total = Counter(
+    "oraculo_alerts_queue_backpressure_skipped_total",
+    "Events skipped due to backpressure in alerts hot path",
+    ["kind"],
+)
 alerts_stage_duration_ms = Histogram(
     "oraculo_alerts_stage_duration_ms",
     "Stage duration in milliseconds for alerts pipeline",

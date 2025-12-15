@@ -168,6 +168,10 @@ class WsEventSource(EventSource):
         self._drop_log_window_s = 5.0
         self._last_drop_log_ts = 0.0
 
+    @property
+    def queue(self) -> asyncio.Queue[Any]:
+        return self._queue
+
     async def start(self) -> None:
         if self._running:
             return
@@ -1030,8 +1034,55 @@ async def run_pipeline(
         if idx % every == 0:
             await asyncio.sleep(0)
 
-    async def process_depth_event(ts: float, side: str, action: str, price: float, qty_delta: float) -> None:
+    async def _apply_queue_backpressure(
+        kind: str, source_queue: Optional[asyncio.Queue[Any]]
+    ) -> None:
+        if source_queue is None or source_queue.maxsize <= 0:
+            return
+
+        maxsize = source_queue.maxsize
+        qsize = source_queue.qsize()
+        ratio = qsize / maxsize if maxsize else 0.0
+
+        if ratio >= 0.7:
+            target = int(maxsize * 0.6)
+            skipped = 0
+            while source_queue.qsize() > target:
+                try:
+                    source_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                else:
+                    skipped += 1
+
+            if skipped:
+                obs_metrics.alerts_queue_backpressure_skipped_total.labels(kind=kind).inc(
+                    skipped
+                )
+                logger.warning(
+                    "[alerts] backpressure skipping {} pending {} events (queue {}/{})",
+                    skipped,
+                    kind,
+                    qsize,
+                    maxsize,
+                )
+                obs_metrics.alerts_queue_depth.labels(stream="all").set(
+                    source_queue.qsize()
+                )
+        elif ratio >= 0.5:
+            await asyncio.sleep(0.001)
+
+    async def process_depth_event(
+        ts: float,
+        side: str,
+        action: str,
+        price: float,
+        qty_delta: float,
+        *,
+        source_queue: Optional[asyncio.Queue[Any]] = None,
+    ) -> None:
         t0 = time.perf_counter()
+        await _apply_queue_backpressure("depth", source_queue)
         engine.on_depth(ts, side, action, price, qty_delta)
 
         # slicing pasivo
@@ -1067,8 +1118,16 @@ async def run_pipeline(
 
         obs_metrics.alerts_stage_duration_ms.labels(stage="depth").observe((time.perf_counter() - t0) * 1000)
 
-    async def process_trade_event(ts: float, side: str, px: float, qty: float) -> None:
+    async def process_trade_event(
+        ts: float,
+        side: str,
+        px: float,
+        qty: float,
+        *,
+        source_queue: Optional[asyncio.Queue[Any]] = None,
+    ) -> None:
         t0 = time.perf_counter()
+        await _apply_queue_backpressure("trade", source_queue)
         engine.on_trade(ts, side, px, qty)
         det_spoof.on_trade(ts, side, px, qty)
 
@@ -1243,10 +1302,23 @@ async def run_pipeline(
             async for batch in ws_source.iter_batches(max_batch_ms=0.01):
                 for ev in batch:
                     if isinstance(ev, DepthEvent):
-                        await process_depth_event(ev.ts, ev.side, ev.action, ev.price, ev.qty)
+                        await process_depth_event(
+                            ev.ts,
+                            ev.side,
+                            ev.action,
+                            ev.price,
+                            ev.qty,
+                            source_queue=ws_source.queue,
+                        )
                         obs_metrics.alerts_stage_rows_total.labels(stage="depth").inc()
                     elif isinstance(ev, TradeEvent):
-                        await process_trade_event(ev.ts, ev.side, ev.price, ev.qty)
+                        await process_trade_event(
+                            ev.ts,
+                            ev.side,
+                            ev.price,
+                            ev.qty,
+                            source_queue=ws_source.queue,
+                        )
                         obs_metrics.alerts_stage_rows_total.labels(stage="trades").inc()
                     elif isinstance(ev, MarkEvent):
                         engine.on_mark(ev.ts, ev.mark_price, ev.index_price)
