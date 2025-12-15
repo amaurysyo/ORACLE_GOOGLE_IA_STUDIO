@@ -225,6 +225,39 @@ class WsEventSource(EventSource):
             total += size
             obs_metrics.alerts_queue_depth.labels(stream=name).set(size)
         obs_metrics.alerts_queue_depth.labels(stream="all").set(total)
+    async def iter_batches(
+        self, *, max_batch_ms: float = 0.01, max_items: int = 10_000
+    ) -> AsyncIterator[list[Any]]:
+        """
+        Agrupa eventos del WS en micro-batches antes de entregarlos al
+        consumidor.
+
+        Un batch espera hasta ``max_batch_ms`` milisegundos adicionales para
+        acumular eventos (hasta ``max_items``) y exponerlos juntos, reduciendo
+        el overhead de ``queue.get()`` en el hot path.
+        """
+        loop = asyncio.get_event_loop()
+        while self._running:
+            try:
+                first = await asyncio.wait_for(self._queue.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+
+            batch: list[Any] = [first]
+            deadline = loop.time() + (max_batch_ms / 1000.0)
+
+            while len(batch) < max_items:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    ev = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+                batch.append(ev)
+
+            obs_metrics.alerts_queue_depth.labels(stream="all").set(self._queue.qsize())
+            yield batch
 
     async def _run(self) -> None:
         try:
@@ -1239,16 +1272,17 @@ async def run_pipeline(
         last_snapshot = time.perf_counter()
         last_opt_poll = time.perf_counter()
         try:
-            async for ev in ws_source:
-                if isinstance(ev, DepthEvent):
-                    await process_depth_event(ev.ts, ev.side, ev.action, ev.price, ev.qty)
-                    obs_metrics.alerts_stage_rows_total.labels(stage="depth").inc()
-                elif isinstance(ev, TradeEvent):
-                    await process_trade_event(ev.ts, ev.side, ev.price, ev.qty)
-                    obs_metrics.alerts_stage_rows_total.labels(stage="trades").inc()
-                elif isinstance(ev, MarkEvent):
-                    engine.on_mark(ev.ts, ev.mark_price, ev.index_price)
-                    obs_metrics.alerts_stage_rows_total.labels(stage="mark").inc()
+            async for batch in ws_source.iter_batches(max_batch_ms=0.01):
+                for ev in batch:
+                    if isinstance(ev, DepthEvent):
+                        await process_depth_event(ev.ts, ev.side, ev.action, ev.price, ev.qty)
+                        obs_metrics.alerts_stage_rows_total.labels(stage="depth").inc()
+                    elif isinstance(ev, TradeEvent):
+                        await process_trade_event(ev.ts, ev.side, ev.price, ev.qty)
+                        obs_metrics.alerts_stage_rows_total.labels(stage="trades").inc()
+                    elif isinstance(ev, MarkEvent):
+                        engine.on_mark(ev.ts, ev.mark_price, ev.index_price)
+                        obs_metrics.alerts_stage_rows_total.labels(stage="mark").inc()
 
                 now = time.perf_counter()
                 if now - last_opt_poll >= 0.5:
@@ -1258,6 +1292,8 @@ async def run_pipeline(
                 if now - last_snapshot >= 0.05:
                     await process_snapshot_and_flush(time.time())
                     last_snapshot = now
+
+                await asyncio.sleep(0)
         finally:
             await ws_source.stop()
 
