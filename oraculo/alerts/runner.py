@@ -164,6 +164,9 @@ class WsEventSource(EventSource):
         self._running = False
         self._mgr: Optional[Any] = None
         self._last_msg_ts: Dict[str, float] = {"trade": 0.0, "depth": 0.0, "mark": 0.0}
+        self._drop_since_last_log = 0
+        self._drop_log_window_s = 5.0
+        self._last_drop_log_ts = 0.0
 
     async def start(self) -> None:
         if self._running:
@@ -267,8 +270,23 @@ class WsEventSource(EventSource):
         try:
             self._queue.put_nowait(ev)
         except asyncio.QueueFull:
-            logger.warning("[alerts-ws] queue full, dropping event")
+            self._drop_since_last_log += 1
+            obs_metrics.alerts_queue_dropped_total.inc()
+            self._log_drops_if_needed()
         obs_metrics.alerts_queue_depth.labels(stream="all").set(self._queue.qsize())
+
+    def _log_drops_if_needed(self) -> None:
+        now = asyncio.get_event_loop().time()
+        if (now - self._last_drop_log_ts) < self._drop_log_window_s:
+            return
+        if self._drop_since_last_log > 0:
+            logger.warning(
+                "[alerts-ws] queue full, dropping event ({} drops in last {:.0f}s)",
+                self._drop_since_last_log,
+                self._drop_log_window_s,
+            )
+            self._drop_since_last_log = 0
+        self._last_drop_log_ts = now
 
     def _observe_last_msg_age(self) -> None:
         now = asyncio.get_event_loop().time()
