@@ -1,0 +1,46 @@
+groups:
+  - name: oraculo-alerts
+    rules:
+      - alert: OraculoAlertsQueueDepthHigh
+        expr: max_over_time(oraculo_alerts_queue_depth{stream="all"}[1m]) > 15000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Oráculo alerts queue building up"
+          description: |
+            Queue depth has exceeded 15k items for more than 2 minutes. Review
+            consumers or upstream WS connectivity for the alerts hot path.
+
+      - alert: OraculoAlertsQueueDepthCritical
+        expr: max_over_time(oraculo_alerts_queue_depth{stream="all"}[1m]) > 18000
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Oráculo alerts queue nearing capacity"
+          description: |
+            Queue depth is above 18k items for over a minute (capacity ~20k).
+            Dispatchers may start dropping messages.
+
+      - alert: OraculoAlertsQueueDrops
+        expr: increase(oraculo_alerts_queue_dropped_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Oráculo alerts queue is dropping events"
+          description: |
+            At least one alerts event was dropped in the last 5 minutes. Check
+            downstream consumers and queue sizing.
+
+      - alert: OraculoAlertsQueueDropsSustained
+        expr: increase(oraculo_alerts_queue_dropped_total[15m]) > 50
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Oráculo alerts queue drop rate high"
+          description: |
+            More than 50 alerts events dropped over 15 minutes. The pipeline is
+            overloaded or failing to keep up with inbound traffic.

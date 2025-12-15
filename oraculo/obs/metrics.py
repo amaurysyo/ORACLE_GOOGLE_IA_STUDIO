@@ -189,8 +189,17 @@ def start_event_loop_lag_monitor(service: str, period: float = 1.0) -> None:
     task = _loop_lag_tasks.get(service)
     if task is not None and not task.done():
         return
-    _loop_lag_tasks[service] = asyncio.create_task(
-        _monitor_event_loop_lag(service, period)
+    loop = asyncio.get_running_loop()
+    _loop_lag_tasks[service] = loop.create_task(
+        _monitor_event_loop_lag(service, period),
+        name=f"loop-lag:{service}",
+    )
+    _loop_lag_tasks[service].add_done_callback(
+        lambda t: logger.warning(
+            "event loop lag monitor for %s stopped: %s", service, t.exception()
+        )
+        if t.cancelled() is False and t.exception() is not None
+        else None
     )
 
 
