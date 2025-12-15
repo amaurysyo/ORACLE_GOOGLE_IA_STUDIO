@@ -93,5 +93,6 @@ class ConfigManager:
         debounce = debounce_ms / 1000.0
         watch_set = {str(self._cfg_path), str(self._env_path), str(self._rules_path)}
         async for _changes in awatch(*watch_set):
+            await asyncio.sleep(0)
             await asyncio.sleep(debounce)
             await self.reload()
