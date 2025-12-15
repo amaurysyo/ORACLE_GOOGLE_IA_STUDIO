@@ -6,6 +6,10 @@ app:
     dsn: ${PG_DSN}
     batch_max_rows: 200
     flush_ms: 100
+alerts:
+  source: ws   # ws | db
+  depth_levels: 20
+  depth_ms: 100
 heartbeat:
   deribit: { trade: 20, book: 5, ticker: 15, mark: 15 }
   futures:
