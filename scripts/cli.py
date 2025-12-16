@@ -23,6 +23,7 @@ from oraculo.db import DB
 from oraculo.ingest.batch_writer import AsyncBatcher
 from oraculo.obs.logging import setup_logging_json
 from oraculo.obs.metrics import run_exporter, start_event_loop_lag_monitor
+from scripts.loadtest_ws import DEFAULT_METRICS, LoadTestConfig, run_loadtest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -56,6 +57,65 @@ def _run_async(coro) -> None:
 @click.group()
 def cli() -> None:
     """Oráculo CLI."""
+
+
+# ===========================================
+# LOADTEST GROUP
+# ===========================================
+
+
+@cli.group("loadtest")
+def loadtest_group() -> None:
+    """Herramientas de pruebas de carga."""
+
+
+@loadtest_group.command("alerts")
+@click.option("--target", required=True, help="URL WS de destino (ej. ws://localhost:8765/ws)")
+@click.option("--stream", default="depth", show_default=True, help="Streams a enviar, separados por coma")
+@click.option("--rps", default=1000, show_default=True, help="Mensajes por segundo")
+@click.option("--duration", default=60, show_default=True, help="Duración de la prueba (s)")
+@click.option("--symbols", default=10, show_default=True, help="Símbolos sintéticos a rotar")
+@click.option("--batch-size", default=100, show_default=True, help="Mensajes por batch")
+@click.option("--prom-url", default=None, help="Endpoint Prometheus opcional para métricas")
+@click.option(
+    "--metrics",
+    default=",".join(DEFAULT_METRICS),
+    show_default=True,
+    help="Métricas separadas por coma a capturar",
+)
+@click.option("--artifacts-dir", default=None, help="Ruta donde guardar resultados")
+def loadtest_alerts(
+    target: str,
+    stream: str,
+    rps: int,
+    duration: int,
+    symbols: int,
+    batch_size: int,
+    prom_url: Optional[str],
+    metrics: str,
+    artifacts_dir: Optional[str],
+) -> None:
+    """Dispara el generador de carga WS para alerts."""
+
+    _load_env()
+    setup_logging_json(ROOT, "INFO", "10 MB", "7 days", True)
+
+    async def _run() -> None:
+        cfg = LoadTestConfig(
+            target_ws=target,
+            stream=stream,
+            rps=rps,
+            duration=duration,
+            symbols=symbols,
+            batch_size=batch_size,
+            prom_url=prom_url,
+            metrics=[m.strip() for m in (metrics or "").split(",") if m.strip()],
+            artifacts_dir=Path(artifacts_dir) if artifacts_dir else None,
+        )
+        result = await run_loadtest(cfg)
+        logger.info(result.to_json())
+
+    _run_async(_run())
 
 
 # ===========================================
