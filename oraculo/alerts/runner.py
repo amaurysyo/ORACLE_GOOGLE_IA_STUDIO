@@ -162,6 +162,8 @@ class WsEventSource(EventSource):
         self._trade_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=50_000)
         self._depth_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=50_000)
         self._mark_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=10_000)
+        # Cola agregada para consumo downstream (batching/backpressure)
+        self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=120_000)
         self._queues: Dict[str, asyncio.Queue[Any]] = {
             "trade": self._trade_queue,
             "depth": self._depth_queue,
@@ -204,7 +206,7 @@ class WsEventSource(EventSource):
 
     async def _iter_queue(self) -> AsyncIterator[Any]:
         while self._running:
-            ev = await self._next_event()
+            ev = await self._queue.get()
             self._set_queue_depth_metrics()
             yield ev
 
@@ -223,12 +225,11 @@ class WsEventSource(EventSource):
         return done_task.result()
 
     def _set_queue_depth_metrics(self) -> None:
-        total = 0
         for name, queue in self._queues.items():
             size = queue.qsize()
-            total += size
             obs_metrics.alerts_queue_depth.labels(stream=name).set(size)
-        obs_metrics.alerts_queue_depth.labels(stream="all").set(total)
+        # La cola agregada refleja el backlog real hacia el consumidor
+        obs_metrics.alerts_queue_depth.labels(stream="all").set(self._queue.qsize())
     async def iter_batches(
         self, *, max_batch_ms: float = 0.01, max_items: int = 10_000
     ) -> AsyncIterator[list[Any]]:
@@ -333,15 +334,13 @@ class WsEventSource(EventSource):
             self._observe_last_msg_age()
 
     async def _put_event(self, ev: Any, queue_name: str) -> None:
-        queue = self._queues.get(queue_name)
-        if queue is None:
-            return
         try:
-            queue.put_nowait(ev)
+            self._queue.put_nowait(ev)
         except asyncio.QueueFull:
             self._drop_since_last_log += 1
             obs_metrics.alerts_queue_dropped_total.inc()
             self._log_drops_if_needed(queue_name)
+
         self._set_queue_depth_metrics()
 
     def _log_drops_if_needed(self, queue_name: str) -> None:
