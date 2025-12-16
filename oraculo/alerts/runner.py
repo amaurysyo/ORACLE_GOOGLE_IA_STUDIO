@@ -159,14 +159,8 @@ class WsEventSource(EventSource):
         self._depth_levels = depth_levels
         self._depth_ms = depth_ms
         self._symbol = symbol.lower()
-        self._trade_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=50_000)
-        self._depth_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=50_000)
-        self._mark_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=10_000)
-        self._queues: Dict[str, asyncio.Queue[Any]] = {
-            "trade": self._trade_queue,
-            "depth": self._depth_queue,
-            "mark": self._mark_queue,
-        }
+        self._queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(maxsize=120_000)
+        self._stream_counts: Dict[str, int] = {"trade": 0, "depth": 0, "mark": 0}
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._mgr: Optional[Any] = None
@@ -209,29 +203,19 @@ class WsEventSource(EventSource):
             yield ev
 
     async def _next_event(self) -> Any:
-        tasks: Dict[asyncio.Task[Any], str] = {
-            asyncio.create_task(queue.get()): name for name, queue in self._queues.items()
-        }
-        done, pending = await asyncio.wait(
-            tasks.keys(), return_when=asyncio.FIRST_COMPLETED
-        )
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-
-        done_task = done.pop()
-        return done_task.result()
+        stream, ev = await self._queue.get()
+        self._stream_counts[stream] = max(0, self._stream_counts.get(stream, 0) - 1)
+        return stream, ev
 
     def _set_queue_depth_metrics(self) -> None:
-        total = 0
-        for name, queue in self._queues.items():
-            size = queue.qsize()
-            total += size
-            obs_metrics.alerts_queue_depth.labels(stream=name).set(size)
+        total = self._queue.qsize()
+        for name, size in self._stream_counts.items():
+            obs_metrics.alerts_queue_depth.labels(stream=name).set(max(0, size))
         obs_metrics.alerts_queue_depth.labels(stream="all").set(total)
+
     async def iter_batches(
         self, *, max_batch_ms: float = 0.01, max_items: int = 10_000
-    ) -> AsyncIterator[list[Any]]:
+    ) -> AsyncIterator[list[tuple[str, Any]]]:
         """
         Agrupa eventos del WS en micro-batches antes de entregarlos al
         consumidor.
@@ -243,11 +227,12 @@ class WsEventSource(EventSource):
         loop = asyncio.get_event_loop()
         while self._running:
             try:
-                first = await asyncio.wait_for(self._queue.get(), timeout=0.1)
+                stream, first = await asyncio.wait_for(self._queue.get(), timeout=0.1)
+                self._stream_counts[stream] = max(0, self._stream_counts.get(stream, 0) - 1)
             except asyncio.TimeoutError:
                 continue
 
-            batch: list[Any] = [first]
+            batch: list[tuple[str, Any]] = [(stream, first)]
             deadline = loop.time() + (max_batch_ms / 1000.0)
 
             while len(batch) < max_items:
@@ -255,12 +240,13 @@ class WsEventSource(EventSource):
                 if remaining <= 0:
                     break
                 try:
-                    ev = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                    stream, ev = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                    self._stream_counts[stream] = max(0, self._stream_counts.get(stream, 0) - 1)
                 except asyncio.TimeoutError:
                     break
-                batch.append(ev)
+                batch.append((stream, ev))
 
-            obs_metrics.alerts_queue_depth.labels(stream="all").set(self._queue.qsize())
+            self._set_queue_depth_metrics()
             yield batch
 
     async def _run(self) -> None:
@@ -333,11 +319,9 @@ class WsEventSource(EventSource):
             self._observe_last_msg_age()
 
     async def _put_event(self, ev: Any, queue_name: str) -> None:
-        queue = self._queues.get(queue_name)
-        if queue is None:
-            return
         try:
-            queue.put_nowait(ev)
+            self._queue.put_nowait((queue_name, ev))
+            self._stream_counts[queue_name] = self._stream_counts.get(queue_name, 0) + 1
         except asyncio.QueueFull:
             self._drop_since_last_log += 1
             obs_metrics.alerts_queue_dropped_total.inc()
@@ -357,6 +341,12 @@ class WsEventSource(EventSource):
             )
             self._drop_since_last_log = 0
         self._last_drop_log_ts = now
+
+    def handle_drop(self, item: Any) -> None:
+        if isinstance(item, tuple) and len(item) == 2:
+            stream = item[0]
+            self._stream_counts[stream] = max(0, self._stream_counts.get(stream, 0) - 1)
+        self._set_queue_depth_metrics()
 
     def _observe_last_msg_age(self) -> None:
         now = asyncio.get_event_loop().time()
@@ -1067,7 +1057,10 @@ async def run_pipeline(
             await asyncio.sleep(0)
 
     async def _apply_queue_backpressure(
-        kind: str, source_queue: Optional[asyncio.Queue[Any]]
+        kind: str,
+        source_queue: Optional[asyncio.Queue[Any]],
+        *,
+        on_drop: Optional[Any] = None,
     ) -> None:
         if source_queue is None or source_queue.maxsize <= 0:
             return
@@ -1081,11 +1074,16 @@ async def run_pipeline(
             skipped = 0
             while source_queue.qsize() > target:
                 try:
-                    source_queue.get_nowait()
+                    item = source_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
                 else:
                     skipped += 1
+                    if on_drop:
+                        try:
+                            on_drop(item)
+                        except Exception:
+                            logger.debug("[alerts] backpressure drop hook failed", exc_info=True)
 
             if skipped:
                 obs_metrics.alerts_queue_backpressure_skipped_total.labels(kind=kind).inc(
@@ -1112,9 +1110,10 @@ async def run_pipeline(
         qty_delta: float,
         *,
         source_queue: Optional[asyncio.Queue[Any]] = None,
+        drop_cb: Optional[Any] = None,
     ) -> None:
         t0 = time.perf_counter()
-        await _apply_queue_backpressure("depth", source_queue)
+        await _apply_queue_backpressure("depth", source_queue, on_drop=drop_cb)
         engine.on_depth(ts, side, action, price, qty_delta)
 
         # slicing pasivo
@@ -1157,9 +1156,10 @@ async def run_pipeline(
         qty: float,
         *,
         source_queue: Optional[asyncio.Queue[Any]] = None,
+        drop_cb: Optional[Any] = None,
     ) -> None:
         t0 = time.perf_counter()
-        await _apply_queue_backpressure("trade", source_queue)
+        await _apply_queue_backpressure("trade", source_queue, on_drop=drop_cb)
         engine.on_trade(ts, side, px, qty)
         det_spoof.on_trade(ts, side, px, qty)
 
@@ -1330,9 +1330,10 @@ async def run_pipeline(
         )
         last_snapshot = time.perf_counter()
         last_opt_poll = time.perf_counter()
+        processed = 0
         try:
             async for batch in ws_source.iter_batches(max_batch_ms=0.01):
-                for ev in batch:
+                for stream, ev in batch:
                     if isinstance(ev, DepthEvent):
                         await process_depth_event(
                             ev.ts,
@@ -1341,6 +1342,7 @@ async def run_pipeline(
                             ev.price,
                             ev.qty,
                             source_queue=ws_source.queue,
+                            drop_cb=ws_source.handle_drop,
                         )
                         obs_metrics.alerts_stage_rows_total.labels(stage="depth").inc()
                     elif isinstance(ev, TradeEvent):
@@ -1350,11 +1352,16 @@ async def run_pipeline(
                             ev.price,
                             ev.qty,
                             source_queue=ws_source.queue,
+                            drop_cb=ws_source.handle_drop,
                         )
                         obs_metrics.alerts_stage_rows_total.labels(stage="trades").inc()
                     elif isinstance(ev, MarkEvent):
                         engine.on_mark(ev.ts, ev.mark_price, ev.index_price)
                         obs_metrics.alerts_stage_rows_total.labels(stage="mark").inc()
+
+                    processed += 1
+                    if processed % 500 == 0:
+                        await asyncio.sleep(0)
 
                 now = time.perf_counter()
                 if now - last_opt_poll >= 0.5:
