@@ -53,7 +53,10 @@ class LoadTestResult:
     artifacts_path: Path
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2)
+        data = asdict(self)
+        # json.dumps no soporta Path directamente; convertimos el campo a str
+        data["artifacts_path"] = str(self.artifacts_path)
+        return json.dumps(data, indent=2)
 
 
 async def _scrape_prometheus(url: str, metrics: Iterable[str]) -> Dict[str, float]:
