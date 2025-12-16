@@ -9,7 +9,7 @@ import json
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Dict, Optional, Tuple, List, Sequence
+from typing import Any, AsyncIterator, Dict, Optional, Tuple, List, Sequence, Callable, Awaitable
 
 import aiohttp
 from loguru import logger
@@ -61,6 +61,21 @@ class MarkEvent:
     ts: float
     mark_price: Optional[float]
     index_price: Optional[float]
+
+
+@dataclass
+class QueuedEvent:
+    stream: str
+    event: Any
+    enqueued_at: float
+
+
+@dataclass
+class DBRequest:
+    kind: str
+    payload: Any
+    future: Optional[asyncio.Future]
+    enqueued_at: float
 
 
 class EventSource:
@@ -147,43 +162,45 @@ class DBTail:
         return [dict(r) for r in rows]
 
 
-class WsEventSource(EventSource):
-    """WS-driven hot path for trades/depth/mark events."""
+class WsReader(EventSource):
+    """Lectura WS con colas por stream y backpressure temprano."""
 
     def __init__(
         self,
         depth_levels: int = 20,
         depth_ms: int = 100,
         symbol: str = "btcusdt",
+        *,
+        stream_cfg: Optional[Dict[str, Dict[str, float]]] = None,
     ) -> None:
         self._depth_levels = depth_levels
         self._depth_ms = depth_ms
         self._symbol = symbol.lower()
-        self._trade_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=50_000)
-        self._depth_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=50_000)
-        self._mark_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=10_000)
-        self._queues: Dict[str, asyncio.Queue[Any]] = {
-            "trade": self._trade_queue,
-            "depth": self._depth_queue,
-            "mark": self._mark_queue,
+        self._stream_cfg = stream_cfg or {
+            "trade": {"maxsize": 5_000, "backpressure": 0.45, "stale_after": 2.0},
+            "depth": {"maxsize": 10_000, "backpressure": 0.5, "stale_after": 2.0},
+            "mark": {"maxsize": 1_000, "backpressure": 0.4, "stale_after": 1.0},
+        }
+        self._queues: Dict[str, asyncio.Queue[QueuedEvent]] = {
+            name: asyncio.Queue(maxsize=int(cfg.get("maxsize", 1_000)))
+            for name, cfg in self._stream_cfg.items()
         }
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._mgr: Optional[Any] = None
         self._last_msg_ts: Dict[str, float] = {"trade": 0.0, "depth": 0.0, "mark": 0.0}
-        self._drop_since_last_log = 0
         self._drop_log_window_s = 5.0
-        self._last_drop_log_ts = 0.0
+        self._last_drop_log_ts: Dict[str, float] = {"trade": 0.0, "depth": 0.0, "mark": 0.0}
 
     @property
-    def queue(self) -> asyncio.Queue[Any]:
-        return self._queue
+    def queues(self) -> Dict[str, asyncio.Queue[QueuedEvent]]:
+        return self._queues
 
     async def start(self) -> None:
         if self._running:
             return
         self._running = True
-        self._task = asyncio.create_task(self._run())
+        self._task = asyncio.create_task(self._run(), name="alerts-ws-reader")
 
     async def stop(self) -> None:
         self._running = False
@@ -199,28 +216,32 @@ class WsEventSource(EventSource):
             except Exception:
                 pass
 
-    def __aiter__(self) -> AsyncIterator[Any]:
-        return self._iter_queue()
+    async def get_batch(
+        self, stream: str, *, max_items: int = 300, max_wait_s: float = 0.02
+    ) -> list[QueuedEvent]:
+        queue = self._queues.get(stream)
+        if queue is None:
+            return []
 
-    async def _iter_queue(self) -> AsyncIterator[Any]:
-        while self._running:
-            ev = await self._next_event()
-            self._set_queue_depth_metrics()
-            yield ev
+        try:
+            first = await asyncio.wait_for(queue.get(), timeout=max_wait_s)
+        except asyncio.TimeoutError:
+            return []
 
-    async def _next_event(self) -> Any:
-        tasks: Dict[asyncio.Task[Any], str] = {
-            asyncio.create_task(queue.get()): name for name, queue in self._queues.items()
-        }
-        done, pending = await asyncio.wait(
-            tasks.keys(), return_when=asyncio.FIRST_COMPLETED
-        )
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        batch = [first]
+        deadline = asyncio.get_event_loop().time() + max_wait_s
+        while len(batch) < max_items:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                ev = await asyncio.wait_for(queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            batch.append(ev)
 
-        done_task = done.pop()
-        return done_task.result()
+        self._set_queue_depth_metrics()
+        return batch
 
     def _set_queue_depth_metrics(self) -> None:
         total = 0
@@ -229,39 +250,76 @@ class WsEventSource(EventSource):
             total += size
             obs_metrics.alerts_queue_depth.labels(stream=name).set(size)
         obs_metrics.alerts_queue_depth.labels(stream="all").set(total)
-    async def iter_batches(
-        self, *, max_batch_ms: float = 0.01, max_items: int = 10_000
-    ) -> AsyncIterator[list[Any]]:
-        """
-        Agrupa eventos del WS en micro-batches antes de entregarlos al
-        consumidor.
 
-        Un batch espera hasta ``max_batch_ms`` milisegundos adicionales para
-        acumular eventos (hasta ``max_items``) y exponerlos juntos, reduciendo
-        el overhead de ``queue.get()`` en el hot path.
-        """
-        loop = asyncio.get_event_loop()
-        while self._running:
-            try:
-                first = await asyncio.wait_for(self._queue.get(), timeout=0.1)
-            except asyncio.TimeoutError:
+    def _observe_last_msg_age(self) -> None:
+        now = asyncio.get_event_loop().time()
+        for k, ts in self._last_msg_ts.items():
+            if ts <= 0:
                 continue
+            obs_metrics.ws_last_msg_age_s.labels(venue="futures", stream=k).set(
+                max(0.0, now - ts)
+            )
 
-            batch: list[Any] = [first]
-            deadline = loop.time() + (max_batch_ms / 1000.0)
+    def _apply_backpressure(self, stream: str) -> None:
+        queue = self._queues.get(stream)
+        cfg = self._stream_cfg.get(stream, {})
+        if not queue or queue.maxsize <= 0:
+            return
 
-            while len(batch) < max_items:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    break
-                try:
-                    ev = await asyncio.wait_for(self._queue.get(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    break
-                batch.append(ev)
+        ratio = queue.qsize() / float(queue.maxsize)
+        threshold = float(cfg.get("backpressure", 0.5))
+        if ratio < threshold:
+            return
 
-            obs_metrics.alerts_queue_depth.labels(stream="all").set(self._queue.qsize())
-            yield batch
+        target = max(0, int(queue.maxsize * threshold * 0.9))
+        dropped = 0
+        while queue.qsize() > target:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                dropped += 1
+        if dropped:
+            obs_metrics.alerts_queue_discarded_total.labels(
+                stream=stream, cause="backlog_drop"
+            ).inc(dropped)
+            obs_metrics.alerts_queue_backpressure_skipped_total.labels(kind=stream).inc(
+                dropped
+            )
+            obs_metrics.alerts_queue_dropped_total.inc(dropped)
+            self._log_drops_if_needed(stream, dropped, "backlog")
+
+    def _log_drops_if_needed(self, stream: str, dropped: int, cause: str) -> None:
+        now = asyncio.get_event_loop().time()
+        last = self._last_drop_log_ts.get(stream, 0.0)
+        if (now - last) < self._drop_log_window_s:
+            return
+        logger.warning(
+            "[alerts-ws] queue '{}' dropping {} events due to {} (depth={}/{})",
+            stream,
+            dropped,
+            cause,
+            self._queues.get(stream).qsize() if self._queues.get(stream) else 0,
+            self._queues.get(stream).maxsize if self._queues.get(stream) else 0,
+        )
+        self._last_drop_log_ts[stream] = now
+
+    def _publish(self, stream: str, ev: Any) -> None:
+        queue = self._queues.get(stream)
+        if queue is None:
+            return
+
+        self._apply_backpressure(stream)
+        try:
+            queue.put_nowait(QueuedEvent(stream=stream, event=ev, enqueued_at=time.perf_counter()))
+        except asyncio.QueueFull:
+            obs_metrics.alerts_queue_discarded_total.labels(
+                stream=stream, cause="full_drop"
+            ).inc()
+            obs_metrics.alerts_queue_dropped_total.inc()
+            self._log_drops_if_needed(stream, 1, "full")
+        self._set_queue_depth_metrics()
 
     async def _run(self) -> None:
         try:
@@ -310,17 +368,17 @@ class WsEventSource(EventSource):
                     price=float(data.get("p", 0)),
                     qty=float(data.get("q", 0)),
                 )
-                await self._put_event(ev, queue_name="trade")
+                self._publish("trade", ev)
             elif etype == "depthUpdate":
                 obs_metrics.ws_msgs_total.labels("depth").inc()
                 self._last_msg_ts["depth"] = now
                 ts = float(data.get("E", 0)) / 1000.0
                 for p, q in data.get("b", []):
                     ev = DepthEvent(ts=ts, side="buy", action="insert" if float(q) > 0 else "delete", price=float(p), qty=float(q))
-                    await self._put_event(ev, queue_name="depth")
+                    self._publish("depth", ev)
                 for p, q in data.get("a", []):
                     ev = DepthEvent(ts=ts, side="sell", action="insert" if float(q) > 0 else "delete", price=float(p), qty=float(q))
-                    await self._put_event(ev, queue_name="depth")
+                    self._publish("depth", ev)
             elif etype in ("markPriceUpdate", "24hrMiniTicker", "24hrTicker"):
                 obs_metrics.ws_msgs_total.labels("mark").inc()
                 self._last_msg_ts["mark"] = now
@@ -329,41 +387,223 @@ class WsEventSource(EventSource):
                     mark_price=float(data.get("p") or data.get("c") or 0),
                     index_price=float(data.get("i") or data.get("P") or data.get("i")),
                 )
-                await self._put_event(ev, queue_name="mark")
+                self._publish("mark", ev)
             self._observe_last_msg_age()
 
-    async def _put_event(self, ev: Any, queue_name: str) -> None:
-        queue = self._queues.get(queue_name)
-        if queue is None:
+# ----------------- Persistencia asíncrona -----------------
+class DBWriter:
+    """Canaliza escrituras hacia la base de datos en un solo punto."""
+
+    def __init__(
+        self,
+        db: DB,
+        telemetry: Telemetry,
+        *,
+        instrument_id: str,
+        profile: str,
+        flush_interval: float = 0.05,
+        max_batch: int = 200,
+        max_queue: int = 10_000,
+    ) -> None:
+        self.db = db
+        self.telemetry = telemetry
+        self.instrument_id = instrument_id
+        self.profile = profile
+        self.flush_interval = flush_interval
+        self.max_batch = max_batch
+        self.queue: asyncio.Queue[DBRequest] = asyncio.Queue(maxsize=max_queue)
+        self._task: Optional[asyncio.Task] = None
+        self._running = False
+
+    async def start(self) -> None:
+        if self._running:
             return
+        self._running = True
+        self._task = asyncio.create_task(self._run(), name="alerts-db-writer")
+
+    async def stop(self) -> None:
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except Exception:
+                pass
+
+    async def submit(self, kind: str, payload: Any, *, expect_result: bool = False) -> Any:
+        loop = asyncio.get_event_loop()
+        future: Optional[asyncio.Future] = loop.create_future() if expect_result else None
+        req = DBRequest(kind=kind, payload=payload, future=future, enqueued_at=time.perf_counter())
         try:
-            queue.put_nowait(ev)
+            self.queue.put_nowait(req)
         except asyncio.QueueFull:
-            self._drop_since_last_log += 1
+            obs_metrics.alerts_queue_discarded_total.labels(stream="db_writer", cause="full_drop").inc()
             obs_metrics.alerts_queue_dropped_total.inc()
-            self._log_drops_if_needed(queue_name)
-        self._set_queue_depth_metrics()
+            if future is not None:
+                future.set_exception(asyncio.QueueFull("db_writer queue full"))
+                return await future
+            return None
+        return await future if future is not None else None
 
-    def _log_drops_if_needed(self, queue_name: str) -> None:
-        now = asyncio.get_event_loop().time()
-        if (now - self._last_drop_log_ts) < self._drop_log_window_s:
-            return
-        if self._drop_since_last_log > 0:
-            logger.warning(
-                "[alerts-ws] queue '{}' full, dropping event ({} drops in last {:.0f}s)",
-                queue_name,
-                self._drop_since_last_log,
-                self._drop_log_window_s,
+    async def _run(self) -> None:
+        try:
+            while self._running:
+                batch = await self._drain_batch()
+                if not batch:
+                    continue
+                await self._process_batch(batch)
+        except asyncio.CancelledError:
+            pass
+
+    async def _drain_batch(self) -> list[DBRequest]:
+        batch: list[DBRequest] = []
+        try:
+            first = await asyncio.wait_for(self.queue.get(), timeout=self.flush_interval)
+        except asyncio.TimeoutError:
+            return batch
+        batch.append(first)
+
+        deadline = time.perf_counter() + self.flush_interval
+        while len(batch) < self.max_batch:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            try:
+                req = await asyncio.wait_for(self.queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            batch.append(req)
+        return batch
+
+    async def _process_batch(self, batch: list[DBRequest]) -> None:
+        slice_events: list[Event] = []
+        metric_rows: List[Tuple[str, dt.datetime, int, str, float, Optional[str], str]] = []
+        telemetry_flushes = 0
+        upserts: list[DBRequest] = []
+
+        for req in batch:
+            if req.kind == "insert_slice":
+                slice_events.append(req.payload)
+            elif req.kind == "insert_metrics":
+                metric_rows.extend(req.payload or [])
+            elif req.kind == "telemetry_flush":
+                telemetry_flushes += 1
+            elif req.kind == "upsert_rule":
+                upserts.append(req)
+            else:
+                if req.future and not req.future.done():
+                    req.future.set_result(None)
+
+        if slice_events:
+            await self._insert_slice_bulk(slice_events)
+
+        if metric_rows:
+            await self._insert_metrics(metric_rows)
+
+        for _ in range(telemetry_flushes):
+            await self.telemetry.flush_if_needed()
+
+        for req in upserts:
+            try:
+                res = await self._upsert_rule(req.payload)
+                if req.future and not req.future.done():
+                    req.future.set_result(res)
+            except Exception as e:
+                logger.error(f"[db-writer] upsert_rule failed: {e!s}")
+                if req.future and not req.future.done():
+                    req.future.set_exception(e)
+
+    async def _insert_slice_bulk(self, events: list[Event]) -> None:
+        sql = (
+            "INSERT INTO oraculo.slice_events("
+            " instrument_id,event_time,event_type,side,intensity,price,duration_ms,fields,latency_ms,profile)"
+            " VALUES ($1,$2,$3,$4::side_t,$5,$6,$7,$8::jsonb,$9,$10)"
+            " ON CONFLICT DO NOTHING"
+        )
+        rows = [
+            (
+                self.instrument_id,
+                dt.datetime.fromtimestamp(ev.ts, tz=dt.timezone.utc),
+                ev.kind,
+                ev.side,
+                ev.intensity,
+                ev.price,
+                int((getattr(ev, "fields", {}) or {}).get("dur_s", 0) * 1000),
+                json.dumps(getattr(ev, "fields", {}) or {}),
+                None,
+                self.profile,
             )
-            self._drop_since_last_log = 0
-        self._last_drop_log_ts = now
+            for ev in events
+        ]
+        try:
+            await self.db.execute_many(sql, rows)
+        except Exception as e:
+            logger.warning(f"[db-writer] bulk insert_slice failed ({e!s}); fallback row-by-row")
+            for row in rows:
+                try:
+                    await self.db.execute(sql, *row)
+                except Exception as e2:
+                    logger.error(f"[db-writer] drop slice row {row}: {e2!s}")
 
-    def _observe_last_msg_age(self) -> None:
-        now = asyncio.get_event_loop().time()
-        for k, ts in self._last_msg_ts.items():
-            if ts <= 0:
-                continue
-            obs_metrics.ws_last_msg_age_s.labels(venue="futures", stream=k).set(max(0.0, now - ts))
+    async def _insert_metrics(
+        self, rows: Sequence[Tuple[str, dt.datetime, int, str, float, Optional[str], str]]
+    ) -> None:
+        if not rows:
+            return
+        sql = (
+            "INSERT INTO oraculo.metrics_series("
+            " instrument_id,event_time,window_s,metric,value,profile,meta"
+            ") VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)"
+            " ON CONFLICT DO NOTHING"
+        )
+        try:
+            await self.db.execute_many(sql, rows)
+        except Exception as e:
+            logger.warning(f"[metrics] bulk insert failed ({e!s}); fallback row-by-row")
+            for r in rows:
+                try:
+                    await self.db.execute(sql, *r)
+                except Exception as e2:
+                    logger.error(f"[metrics] drop row {r}: {e2!s}")
+
+    async def _upsert_rule(self, payload: Tuple[dict, float]):
+        rule, event_ts = payload
+        _observe_rule_event(rule, event_ts)
+        t0 = time.perf_counter()
+        try:
+            sev_db = _sev_norm(rule["severity"])
+            rows = await self.db.fetch(
+                """
+                WITH up AS (
+                  SELECT oraculo.upsert_rule_alert(
+                    $1, $2, $3, $4::severity_t, $5, $6::jsonb, $7, $8
+                  ) AS id
+                )
+                SELECT r.id, r.ts_first
+                FROM up
+                JOIN oraculo.rule_alerts r ON r.id = up.id
+            """,
+                self.instrument_id,
+                dt.datetime.fromtimestamp(event_ts, tz=dt.timezone.utc),
+                rule["rule"],
+                sev_db,
+                rule["dedup_key"],
+                json.dumps(rule["context"] or {}),
+                None,
+                self.profile,
+            )
+            row = rows[0] if rows else None
+            if row:
+                obs_metrics.rule_alerts_upsert_total.labels(
+                    rule=rule["rule"], severity=sev_db
+                ).inc()
+                return int(row["id"]), row["ts_first"]
+            return None, None
+        except Exception as e:
+            logger.error(f"upsert_rule_alert failed: {e!s}")
+            return None, None
+        finally:
+            obs_metrics.db_upsert_rule_alert_ms.observe((time.perf_counter() - t0) * 1000)
 
 
 async def fetch_orderbook_snapshot(
@@ -399,6 +639,19 @@ def _routing_to_dict(routing_cfg: Any) -> Dict[str, Any]:
         return routing_cfg.dict()
     # fallback conservador
     return {"telegram": {}}
+
+
+def _observe_rule_event(rule: dict, event_ts: float) -> None:
+    try:
+        rule_code = rule.get("rule") or "unknown"
+        event_ts_epoch = float(event_ts)
+        now = time.time()
+        lag = max(0.0, now - event_ts_epoch)
+        obs_metrics.rule_alert_lag_seconds.labels(rule=rule_code).observe(lag)
+        obs_metrics.rule_event_age_seconds.labels(rule=rule_code).set(lag)
+        obs_metrics.rule_watermark_event_time.labels(rule=rule_code).set(event_ts_epoch)
+    except Exception:
+        logger.debug("[metrics] failed to observe rule event", exc_info=True)
 
 
 # ---- Telemetría (agregada y volcada a tabla oraculo.rule_telemetry) ----
@@ -842,6 +1095,15 @@ async def run_pipeline(
 
     # Telemetría
     telemetry = Telemetry(db, BINANCE_FUT_INST, ctx.profile)
+    db_writer = DBWriter(
+        db,
+        telemetry,
+        instrument_id=BINANCE_FUT_INST,
+        profile=ctx.profile,
+        flush_interval=0.05,
+        max_batch=200,
+        max_queue=20_000,
+    )
 
     # --- DB Tails configurados por ID ---
     # Trades: Paginamos por 'trade_id_ext' para no perder ráfagas del mismo milisegundo
@@ -904,7 +1166,7 @@ async def run_pipeline(
 
         last_deriv_opt_ts = rows_opt[-1]["event_time"]
         for idx, r in enumerate(rows_opt):
-            await _cooperative_yield(idx)
+            await _yield_if_needed("options", idx, every=50)
             ts_opt = r["event_time"].timestamp()
             inst_id = str(r["instrument_id"])
             mark_iv = r.get("mark_iv")
@@ -917,7 +1179,7 @@ async def run_pipeline(
                 if ev_iv is not None:
                     ev_iv.fields.setdefault("instrument_id", inst_id)
                     for rule in eval_rules(_evdict(ev_iv), ctx):
-                        aid, t0_dt = await upsert_rule(rule, ev_iv.ts)
+                        aid, t0_dt = await enqueue_rule(rule, ev_iv.ts)
                         if aid is not None:
                             telemetry.bump(ev_iv.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                             text = (
@@ -960,149 +1222,29 @@ async def run_pipeline(
             if ev_oi is not None:
                 ev_oi.fields.setdefault("underlying", underlying)
                 for rule in eval_rules(_evdict(ev_oi), ctx):
-                    aid, t0_dt = await upsert_rule(rule, ev_oi.ts)
+                    aid, t0_dt = await enqueue_rule(rule, ev_oi.ts)
                     if aid is not None:
                         telemetry.bump(ev_oi.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                         text = f"#{rule['rule']} OI skew {ev_oi.intensity:.2f} ({underlying})"
                         await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
 
-    # ---------- persistencia anidada ----------
-    async def insert_slice(ev: Event) -> None:
-        await db.execute(
-            "INSERT INTO oraculo.slice_events("
-            " instrument_id,event_time,event_type,side,intensity,price,duration_ms,fields,latency_ms,profile)"
-            " VALUES ($1,$2,$3,$4::side_t,$5,$6,$7,$8::jsonb,$9,$10)"
-            " ON CONFLICT DO NOTHING",
-            BINANCE_FUT_INST,
-            dt.datetime.fromtimestamp(ev.ts, tz=dt.timezone.utc),
-            ev.kind,
-            ev.side,
-            ev.intensity,
-            ev.price,
-            int((ev.fields.get("dur_s") or 0) * 1000),
-            json.dumps(ev.fields or {}),
-            None,
-            ctx.profile,
-        )
-
-    def _observe_rule_event(rule: dict, event_ts: float) -> None:
-        try:
-            rule_code = rule.get("rule") or "unknown"
-            event_ts_epoch = float(event_ts)
-            now = time.time()
-            lag = max(0.0, now - event_ts_epoch)
-            obs_metrics.rule_alert_lag_seconds.labels(rule=rule_code).observe(lag)
-            obs_metrics.rule_event_age_seconds.labels(rule=rule_code).set(lag)
-            obs_metrics.rule_watermark_event_time.labels(rule=rule_code).set(
-                event_ts_epoch
-            )
-        except Exception:
-            logger.debug("[metrics] failed to observe rule event", exc_info=True)
-
-    async def upsert_rule(rule: dict, event_ts: float):
-        """UPSERT y devuelve (alert_id, ts_first_dt) para registrar el envío con FK válida."""
-        _observe_rule_event(rule, event_ts)
-        t0 = time.perf_counter()
-        try:
-            sev_db = _sev_norm(rule["severity"])
-            rows = await db.fetch(
-                """
-                WITH up AS (
-                  SELECT oraculo.upsert_rule_alert(
-                    $1, $2, $3, $4::severity_t, $5, $6::jsonb, $7, $8
-                  ) AS id
-                )
-                SELECT r.id, r.ts_first
-                FROM up
-                JOIN oraculo.rule_alerts r ON r.id = up.id
-            """,
-                BINANCE_FUT_INST,
-                dt.datetime.fromtimestamp(event_ts, tz=dt.timezone.utc),
-                rule["rule"],
-                sev_db,
-                rule["dedup_key"],
-                json.dumps(rule["context"] or {}),
-                None,
-                ctx.profile,
-            )
-            row = rows[0] if rows else None
-            if row:
-                obs_metrics.rule_alerts_upsert_total.labels(
-                    rule=rule["rule"], severity=sev_db
-                ).inc()
-                return int(row["id"]), row["ts_first"]
-            return None, None
-        except Exception as e:
-            logger.error(f"upsert_rule_alert failed: {e!s}")
-            return None, None
-        finally:
-            obs_metrics.db_upsert_rule_alert_ms.observe(
-                (time.perf_counter() - t0) * 1000
-            )
-
-    async def insert_metrics(
-        rows: Sequence[Tuple[str, dt.datetime, int, str, float, Optional[str], str]]
-    ) -> None:
-        """Inserta en bloque en oraculo.metrics_series; si falla, fila a fila."""
-        if not rows:
-            return
-        sql = (
-            "INSERT INTO oraculo.metrics_series("
-            " instrument_id,event_time,window_s,metric,value,profile,meta"
-            ") VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)"
-            " ON CONFLICT DO NOTHING"
-        )
-        try:
-            await db.execute_many(sql, rows)
-        except Exception as e:
-            logger.warning(f"[metrics] bulk insert failed ({e!s}); fallback row-by-row")
-            for r in rows:
-                try:
-                    await db.execute(sql, *r)
-                except Exception as e2:
-                    logger.error(f"[metrics] drop row {r}: {e2!s}")
-
-    async def _cooperative_yield(idx: int, every: int = 500) -> None:
-        if idx % every == 0:
+    async def _yield_if_needed(stage: str, idx: int, every: int = 50) -> None:
+        if idx and idx % every == 0:
+            obs_metrics.alerts_stage_yields_total.labels(stage=stage).inc()
             await asyncio.sleep(0)
 
-    async def _apply_queue_backpressure(
-        kind: str, source_queue: Optional[asyncio.Queue[Any]]
-    ) -> None:
-        if source_queue is None or source_queue.maxsize <= 0:
-            return
+    async def enqueue_rule(rule: dict, event_ts: float):
+        return await db_writer.submit("upsert_rule", (rule, event_ts), expect_result=True)
 
-        maxsize = source_queue.maxsize
-        qsize = source_queue.qsize()
-        ratio = qsize / maxsize if maxsize else 0.0
+    async def enqueue_slice(ev: Event) -> None:
+        await db_writer.submit("insert_slice", ev)
 
-        if ratio >= 0.7:
-            target = int(maxsize * 0.6)
-            skipped = 0
-            while source_queue.qsize() > target:
-                try:
-                    source_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                else:
-                    skipped += 1
+    async def enqueue_metrics(rows: Sequence[Tuple[str, dt.datetime, int, str, float, Optional[str], str]]) -> None:
+        if rows:
+            await db_writer.submit("insert_metrics", rows)
 
-            if skipped:
-                obs_metrics.alerts_queue_backpressure_skipped_total.labels(kind=kind).inc(
-                    skipped
-                )
-                logger.warning(
-                    "[alerts] backpressure skipping {} pending {} events (queue {}/{})",
-                    skipped,
-                    kind,
-                    qsize,
-                    maxsize,
-                )
-                obs_metrics.alerts_queue_depth.labels(stream="all").set(
-                    source_queue.qsize()
-                )
-        elif ratio >= 0.5:
-            await asyncio.sleep(0.001)
+    async def enqueue_telemetry_flush() -> None:
+        await db_writer.submit("telemetry_flush", None)
 
     async def process_depth_event(
         ts: float,
@@ -1110,20 +1252,17 @@ async def run_pipeline(
         action: str,
         price: float,
         qty_delta: float,
-        *,
-        source_queue: Optional[asyncio.Queue[Any]] = None,
     ) -> None:
         t0 = time.perf_counter()
-        await _apply_queue_backpressure("depth", source_queue)
         engine.on_depth(ts, side, action, price, qty_delta)
 
         # slicing pasivo
         if action == "insert" and qty_delta > 0:
             evp = det_pass.on_depth(ts, side, price, qty_delta)
             if evp:
-                await insert_slice(evp)
+                await enqueue_slice(evp)
                 for rule in eval_rules(_evdict(evp), ctx):
-                    alert_id, ts_first_dt = await upsert_rule(rule, evp.ts)
+                    alert_id, ts_first_dt = await enqueue_rule(rule, evp.ts)
                     if alert_id is not None:
                         telemetry.bump(evp.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                         text = (
@@ -1139,7 +1278,7 @@ async def run_pipeline(
         ev_sp = det_spoof.on_depth(ts, side, action, price, spoof_qty, bb, ba)
         if ev_sp:
             for rule in eval_rules(_evdict(ev_sp), ctx):
-                aid, t0_dt = await upsert_rule(rule, ev_sp.ts)
+                aid, t0_dt = await enqueue_rule(rule, ev_sp.ts)
                 if aid is not None:
                     telemetry.bump(ev_sp.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                     text = (
@@ -1155,20 +1294,17 @@ async def run_pipeline(
         side: str,
         px: float,
         qty: float,
-        *,
-        source_queue: Optional[asyncio.Queue[Any]] = None,
     ) -> None:
         t0 = time.perf_counter()
-        await _apply_queue_backpressure("trade", source_queue)
         engine.on_trade(ts, side, px, qty)
         det_spoof.on_trade(ts, side, px, qty)
 
         ev1 = det_slice_eq.on_trade(ts, side, px, qty)
         ev2 = det_slice_hit.on_trade(ts, side, px, qty)
         for ev in filter(None, [ev1, ev2]):  # type: ignore
-            await insert_slice(ev)
+            await enqueue_slice(ev)
             for rule in eval_rules(_evdict(ev), ctx):
-                alert_id, ts_first_dt = await upsert_rule(rule, ev.ts)
+                alert_id, ts_first_dt = await enqueue_rule(rule, ev.ts)
                 if alert_id is not None:
                     telemetry.bump(ev.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                     label = "iceberg" if ev.fields.get("mode") == "iceberg" else "hitting"
@@ -1183,7 +1319,7 @@ async def run_pipeline(
         ev_abs = det_abs.on_trade(ts, side, px, qty)
         if ev_abs:
             for rule in eval_rules(_evdict(ev_abs), ctx):
-                alert_id, ts_first_dt = await upsert_rule(rule, ev_abs.ts)
+                alert_id, ts_first_dt = await enqueue_rule(rule, ev_abs.ts)
                 if alert_id is not None:
                     telemetry.bump(ev_abs.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                     text = (
@@ -1199,7 +1335,7 @@ async def run_pipeline(
             e2, gating_reason = det_bw.on_slicing(ev1 or ev2, snap)
             if e2:
                 for rule in eval_rules(_evdict(e2), ctx):
-                    alert_id, ts_first_dt = await upsert_rule(rule, e2.ts)
+                    alert_id, ts_first_dt = await enqueue_rule(rule, e2.ts)
                     if alert_id is not None:
                         telemetry.bump(e2.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                         text = (
@@ -1223,7 +1359,7 @@ async def run_pipeline(
         ev_tp = tape_det.on_trade(ts, side, px, qty)
         if ev_tp:
             for rule in eval_rules(_evdict(ev_tp), ctx):
-                aid, t0_dt = await upsert_rule(rule, ev_tp.ts)
+                aid, t0_dt = await enqueue_rule(rule, ev_tp.ts)
                 if aid is not None:
                     telemetry.bump(ev_tp.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                     text = (
@@ -1246,7 +1382,7 @@ async def run_pipeline(
             evd = det_dom.maybe_emit(now_ts, spread_usd=float(snap.spread_usd or 0.0))
             if evd:
                 for rule in eval_rules(_evdict(evd), ctx):
-                    aid, t0_dt = await upsert_rule(rule, evd.ts)
+                    aid, t0_dt = await enqueue_rule(rule, evd.ts)
                     if aid is not None:
                         telemetry.bump(evd.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                         text = (
@@ -1261,7 +1397,7 @@ async def run_pipeline(
         for evd in [ev_dep_bid, ev_dep_ask]:
             if evd:
                 for rule in eval_rules(_evdict(evd), ctx):
-                    aid, t0_dt = await upsert_rule(rule, evd.ts)
+                    aid, t0_dt = await enqueue_rule(rule, evd.ts)
                     if aid is not None:
                         telemetry.bump(evd.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                         text = f"#{rule['rule']} {evd.side.upper()} depletion {evd.intensity:.2f}"
@@ -1276,7 +1412,7 @@ async def run_pipeline(
             for evb in [ev_bpos, ev_bneg]:
                 if evb:
                     for rule in eval_rules(_evdict(evb), ctx):
-                        aid, t0_dt = await upsert_rule(rule, evb.ts)
+                        aid, t0_dt = await enqueue_rule(rule, evb.ts)
                         if aid is not None:
                             telemetry.bump(evb.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                             text = f"#{rule['rule']} basis_bps={evb.intensity:.1f}"
@@ -1289,7 +1425,7 @@ async def run_pipeline(
             ev_mr = basis_mr.on_snapshot(now_ts, snap.__dict__ if hasattr(snap, "__dict__") else dict())
             if ev_mr:
                 for rule in eval_rules(_evdict(ev_mr), ctx):
-                    aid, t0_dt = await upsert_rule(rule, ev_mr.ts)
+                    aid, t0_dt = await enqueue_rule(rule, ev_mr.ts)
                     if aid is not None:
                         telemetry.bump(ev_mr.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                         text = (
@@ -1319,55 +1455,115 @@ async def run_pipeline(
         add("refill_bid_3s", getattr(snap, "refill_bid_3s", None))
         add("refill_ask_3s", getattr(snap, "refill_ask_3s", None))
 
-        await insert_metrics(rows)
-        await telemetry.flush_if_needed()
+        await enqueue_metrics(rows)
+        await enqueue_telemetry_flush()
+
+    queue_stale_after = {"trade": 2.0, "depth": 2.0, "mark": 1.0}
+    batch_conf = {
+        "trade": {"size": 300, "wait": 0.02, "yield": 50},
+        "depth": {"size": 400, "wait": 0.02, "yield": 75},
+        "mark": {"size": 120, "wait": 0.01, "yield": 50},
+    }
+
+    def _queue_age_metrics(stream: str, enqueued_at: float) -> float:
+        age = max(0.0, time.perf_counter() - enqueued_at)
+        obs_metrics.alerts_queue_time_seconds.labels(stream=stream).observe(age)
+        obs_metrics.alerts_queue_time_latest_seconds.labels(stream=stream).set(age)
+        return age
+
+    async def _options_poller(stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            await poll_options()
+            await asyncio.sleep(0.5)
+
+    async def _snapshot_loop(stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            await process_snapshot_and_flush(time.time())
+            await asyncio.sleep(0.05)
+
+    async def _process_stream_batch(
+        reader: WsReader,
+        stream: str,
+        handler: Callable[[Any], Awaitable[None]],
+        stop_event: asyncio.Event,
+    ) -> None:
+        while not stop_event.is_set():
+            cfg = batch_conf.get(stream, {})
+            batch = await reader.get_batch(
+                stream,
+                max_items=int(cfg.get("size", 250)),
+                max_wait_s=float(cfg.get("wait", 0.02)),
+            )
+            if not batch:
+                await asyncio.sleep(0)
+                continue
+
+            t_batch = time.perf_counter()
+            stale_after = float(queue_stale_after.get(stream, 2.0))
+            for idx, qev in enumerate(batch):
+                age = _queue_age_metrics(stream, qev.enqueued_at)
+                if age > stale_after:
+                    obs_metrics.alerts_queue_discarded_total.labels(
+                        stream=stream, cause="stale_drop"
+                    ).inc()
+                    obs_metrics.alerts_queue_dropped_total.inc()
+                    continue
+                await handler(qev.event)
+                obs_metrics.alerts_stage_rows_total.labels(stage=stream if stream != "trade" else "trades").inc()
+                await _yield_if_needed(stream if stream != "trade" else "trades", idx, every=int(cfg.get("yield", 50)))
+            obs_metrics.alerts_batch_duration_seconds.labels(stream=stream).observe(
+                time.perf_counter() - t_batch
+            )
 
     async def _run_ws_pipeline(depth_levels: int, depth_ms: int, symbol: str) -> None:
-        ws_source = WsEventSource(depth_levels=depth_levels, depth_ms=depth_ms, symbol=symbol)
-        await ws_source.start()
-        logger.info(
-            f"[alerts] WS hot path enabled (depth_levels={depth_levels}, depth_ms={depth_ms}, symbol={symbol})"
-        )
-        last_snapshot = time.perf_counter()
-        last_opt_poll = time.perf_counter()
+        ws_reader = WsReader(depth_levels=depth_levels, depth_ms=depth_ms, symbol=symbol)
+        await ws_reader.start()
+        stop_event = asyncio.Event()
+
+        async def trade_handler(ev: TradeEvent) -> None:
+            await process_trade_event(ev.ts, ev.side, ev.price, ev.qty)
+
+        async def depth_handler(ev: DepthEvent) -> None:
+            await process_depth_event(ev.ts, ev.side, ev.action, ev.price, ev.qty)
+
+        async def mark_handler(ev: MarkEvent) -> None:
+            engine.on_mark(ev.ts, ev.mark_price, ev.index_price)
+
+        async def process_trades() -> None:
+            await _process_stream_batch(ws_reader, "trade", trade_handler, stop_event)
+
+        async def process_depth() -> None:
+            await _process_stream_batch(ws_reader, "depth", depth_handler, stop_event)
+
+        async def process_mark() -> None:
+            await _process_stream_batch(ws_reader, "mark", mark_handler, stop_event)
+
+        tasks = [
+            asyncio.create_task(
+                process_trades(),
+                name="alerts-trade-worker",
+            ),
+            asyncio.create_task(
+                process_depth(),
+                name="alerts-depth-worker",
+            ),
+            asyncio.create_task(
+                process_mark(),
+                name="alerts-mark-worker",
+            ),
+            asyncio.create_task(_options_poller(stop_event), name="alerts-options-poller"),
+            asyncio.create_task(_snapshot_loop(stop_event), name="alerts-snapshot-loop"),
+        ]
+
         try:
-            async for batch in ws_source.iter_batches(max_batch_ms=0.01):
-                for ev in batch:
-                    if isinstance(ev, DepthEvent):
-                        await process_depth_event(
-                            ev.ts,
-                            ev.side,
-                            ev.action,
-                            ev.price,
-                            ev.qty,
-                            source_queue=ws_source.queue,
-                        )
-                        obs_metrics.alerts_stage_rows_total.labels(stage="depth").inc()
-                    elif isinstance(ev, TradeEvent):
-                        await process_trade_event(
-                            ev.ts,
-                            ev.side,
-                            ev.price,
-                            ev.qty,
-                            source_queue=ws_source.queue,
-                        )
-                        obs_metrics.alerts_stage_rows_total.labels(stage="trades").inc()
-                    elif isinstance(ev, MarkEvent):
-                        engine.on_mark(ev.ts, ev.mark_price, ev.index_price)
-                        obs_metrics.alerts_stage_rows_total.labels(stage="mark").inc()
-
-                now = time.perf_counter()
-                if now - last_opt_poll >= 0.5:
-                    await poll_options()
-                    last_opt_poll = now
-
-                if now - last_snapshot >= 0.05:
-                    await process_snapshot_and_flush(time.time())
-                    last_snapshot = now
-
-                await asyncio.sleep(0)
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            pass
         finally:
-            await ws_source.stop()
+            stop_event.set()
+            for task in tasks:
+                task.cancel()
+            await ws_reader.stop()
 
     alerts_source = "ws"
     depth_levels = 20
@@ -1385,52 +1581,62 @@ async def run_pipeline(
         except Exception:
             pass
 
-    if alerts_source == "ws":
-        await _run_ws_pipeline(depth_levels, depth_ms, symbol)
-        return
+    await db_writer.start()
+    try:
+        if alerts_source == "ws":
+            await _run_ws_pipeline(depth_levels, depth_ms, symbol)
+            return
 
-    # ------------------- bucle principal -------------------
-    while True:
-        # 1) depth -> book & métricas + slicing pasivo + spoofing
-        # Paginación por ID (seq)
-        for idx, r in enumerate(await tail_depth.fetch_new(BINANCE_FUT_INST, limit=5000)):
-            await _cooperative_yield(idx)
-            await process_depth_event(
-                r["event_time"].timestamp(),
-                r["side"],
-                r["action"],
-                float(r["price"]),
-                float(r["qty"]),
-            )
-            obs_metrics.alerts_stage_rows_total.labels(stage="depth").inc()
+        # ------------------- bucle principal -------------------
+        stop_event = asyncio.Event()
+        options_task = asyncio.create_task(_options_poller(stop_event), name="alerts-options-poller")
+        snapshot_task = asyncio.create_task(_snapshot_loop(stop_event), name="alerts-snapshot-loop")
+        try:
+            while True:
+                # 1) depth -> book & métricas + slicing pasivo + spoofing
+                # Paginación por ID (seq)
+                for idx, r in enumerate(await tail_depth.fetch_new(BINANCE_FUT_INST, limit=5000)):
+                    await _yield_if_needed("depth", idx, every=50)
+                    await process_depth_event(
+                        r["event_time"].timestamp(),
+                        r["side"],
+                        r["action"],
+                        float(r["price"]),
+                        float(r["qty"]),
+                    )
+                    obs_metrics.alerts_stage_rows_total.labels(stage="depth").inc()
 
-        # 2) mark funding -> basis
-        # Paginación por Tiempo (legacy para mark)
-        for idx, r in enumerate(await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000)):
-            await _cooperative_yield(idx)
-            engine.on_mark(
-                r["event_time"].timestamp(),
-                float(r.get("mark_price") or 0) or None,
-                float(r.get("index_price") or 0) or None,
-            )
-            obs_metrics.alerts_stage_rows_total.labels(stage="mark").inc()
+                # 2) mark funding -> basis
+                # Paginación por Tiempo (legacy para mark)
+                for idx, r in enumerate(await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000)):
+                    await _yield_if_needed("mark", idx, every=50)
+                    engine.on_mark(
+                        r["event_time"].timestamp(),
+                        float(r.get("mark_price") or 0) or None,
+                        float(r.get("index_price") or 0) or None,
+                    )
+                    obs_metrics.alerts_stage_rows_total.labels(stage="mark").inc()
 
-        # 2b) Deribit opciones ticker -> IV spikes (R19/R20) + OI skew (R21/R22)
-        await poll_options()
+                # 3) trades -> slicing (iceberg/hitting) + absorción + break_wall + tape_pressure + spoofing_exec
+                # Paginación por ID (trade_id_ext)
+                for idx, r in enumerate(await tail_trades.fetch_new(BINANCE_FUT_INST, limit=5000)):
+                    await _yield_if_needed("trades", idx, every=50)
+                    await process_trade_event(
+                        r["event_time"].timestamp(),
+                        r["side"],
+                        float(r["price"]),
+                        float(r["qty"]),
+                    )
+                    obs_metrics.alerts_stage_rows_total.labels(stage="trades").inc()
 
-        # 3) trades -> slicing (iceberg/hitting) + absorción + break_wall + tape_pressure + spoofing_exec
-        # Paginación por ID (trade_id_ext)
-        for idx, r in enumerate(await tail_trades.fetch_new(BINANCE_FUT_INST, limit=5000)):
-            await _cooperative_yield(idx)
-            await process_trade_event(
-                r["event_time"].timestamp(),
-                r["side"],
-                float(r["price"]),
-                float(r["qty"]),
-            )
-            obs_metrics.alerts_stage_rows_total.labels(stage="trades").inc()
+                ts_now = dt.datetime.now(dt.timezone.utc).timestamp()
+                await process_snapshot_and_flush(ts_now)
 
-        ts_now = dt.datetime.now(dt.timezone.utc).timestamp()
-        await process_snapshot_and_flush(ts_now)
-
-        await asyncio.sleep(0.05)  # 50ms cadence
+                await asyncio.sleep(0.05)  # 50ms cadence
+        finally:
+            stop_event.set()
+            options_task.cancel()
+            snapshot_task.cancel()
+            await asyncio.gather(options_task, snapshot_task, return_exceptions=True)
+    finally:
+        await db_writer.stop()
