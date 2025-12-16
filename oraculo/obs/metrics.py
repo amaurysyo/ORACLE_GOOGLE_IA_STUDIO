@@ -71,6 +71,28 @@ alerts_queue_backpressure_skipped_total = Counter(
     "Events skipped due to backpressure in alerts hot path",
     ["kind"],
 )
+alerts_queue_time_seconds = Histogram(
+    "oraculo_alerts_queue_time_seconds",
+    "Time spent in alerts queues before being processed",
+    ["stream"],
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10),
+)
+alerts_queue_time_latest_seconds = Gauge(
+    "oraculo_alerts_queue_time_latest_seconds",
+    "Latest observed time in queue for alerts stream",
+    ["stream"],
+)
+alerts_batch_duration_seconds = Histogram(
+    "oraculo_alerts_batch_duration_seconds",
+    "Batch processing duration by alerts stream",
+    ["stream"],
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2),
+)
+alerts_queue_discarded_total = Counter(
+    "oraculo_alerts_queue_discarded_total",
+    "Events discarded in alerts pipeline by cause",
+    ["stream", "cause"],
+)
 alerts_stage_duration_ms = Histogram(
     "oraculo_alerts_stage_duration_ms",
     "Stage duration in milliseconds for alerts pipeline",
