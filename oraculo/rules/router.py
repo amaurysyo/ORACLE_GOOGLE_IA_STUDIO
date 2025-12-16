@@ -112,34 +112,36 @@ class TelegramRouter:
         obs_metrics.dispatch_attempts_total.labels(channel=channel).inc()
         obs_metrics.dispatch_last_attempt_ts.labels(channel=channel).set(time.time())
 
+        status = "sent=0"
+        err: Optional[str] = None
+
         if not token or chat_id == 0:
+            err = "missing credentials"
             logger.warning(f"[telegram] missing credentials for kind={kind}")
+            logger.info(f"[telegram] {kind}@{chat_id} (skipped): {text}")
             obs_metrics.dispatch_dropped_total.labels(
                 channel=channel, reason="disabled"
             ).inc()
-            return
-
-        status = "sent=0"
-        err: Optional[str] = None
-        try:
-            bot = Bot(token=token)
-            await bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
-            logger.info(f"[telegram] {kind}@{chat_id}: {text}")
-            status = "sent=1"
-            obs_metrics.dispatch_success_total.labels(channel=channel).inc()
-            obs_metrics.dispatch_last_success_ts.labels(channel=channel).set(time.time())
-        except TelegramError as e:
-            err = str(e)
-            logger.error(f"[telegram] error: {e!s}")
-            obs_metrics.dispatch_fail_total.labels(
-                channel=channel, kind=type(e).__name__
-            ).inc()
-        except Exception as e:
-            err = str(e)
-            logger.error(f"[telegram] unexpected error: {e!s}")
-            obs_metrics.dispatch_fail_total.labels(
-                channel=channel, kind=type(e).__name__
-            ).inc()
+        else:
+            try:
+                bot = Bot(token=token)
+                await bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
+                logger.info(f"[telegram] {kind}@{chat_id}: {text}")
+                status = "sent=1"
+                obs_metrics.dispatch_success_total.labels(channel=channel).inc()
+                obs_metrics.dispatch_last_success_ts.labels(channel=channel).set(time.time())
+            except TelegramError as e:
+                err = str(e)
+                logger.error(f"[telegram] error: {e!s}")
+                obs_metrics.dispatch_fail_total.labels(
+                    channel=channel, kind=type(e).__name__
+                ).inc()
+            except Exception as e:
+                err = str(e)
+                logger.error(f"[telegram] unexpected error: {e!s}")
+                obs_metrics.dispatch_fail_total.labels(
+                    channel=channel, kind=type(e).__name__
+                ).inc()
 
         # DB logging (FK-safe). Ignora si no hay DB o FK inválida.
         try:
