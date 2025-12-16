@@ -1332,7 +1332,7 @@ async def run_pipeline(
         if ev1 or ev2:
             if getattr(snap, "basis_vel_bps_s", None) is None:
                 telemetry.bump(ts, "R1/R2", (ev1 or ev2).side, disc_metrics_none=1)
-            e2, gating_reason = det_bw.on_slicing(ev1 or ev2, snap)
+            e2, gating_reason = det_bw.on_slicing(ts, ev1 or ev2, snap)
             if e2:
                 for rule in eval_rules(_evdict(e2), ctx):
                     alert_id, ts_first_dt = await enqueue_rule(rule, e2.ts)
