@@ -1167,12 +1167,13 @@ async def run_pipeline(
     try:
         timeout = aiohttp.ClientTimeout(total=6)
         async with aiohttp.ClientSession(timeout=timeout) as s:
-            bids, asks = await fetch_orderbook_snapshot(s, "BTCUSDT", depth=1000)
+            # Calentamos el book sólo hasta los mismos niveles que consumimos por WS
+            bids, asks = await fetch_orderbook_snapshot(s, "BTCUSDT", depth=depth_levels)
             for p, q in bids:
                 engine.book.apply("buy", "insert", p, q)
             for p, q in asks:
                 engine.book.apply("sell", "insert", p, q)
-            logger.info("Initialized OB snapshot via REST (depth=1000).")
+            logger.info(f"Initialized OB snapshot via REST (depth={depth_levels}).")
     except Exception as e:
         logger.warning(f"Failed to init OB snapshot: {e!s}")
 
