@@ -492,6 +492,11 @@ class DBWriter:
         return batch
 
     async def _process_batch(self, batch: list[DBRequest]) -> None:
+        start_batch_ts = time.perf_counter()
+        if batch:
+            obs_metrics.alerts_db_queue_time_seconds.observe(start_batch_ts - batch[0].enqueued_at)
+            obs_metrics.alerts_db_queue_depth.set(self.queue.qsize())
+        obs_metrics.alerts_db_inflight_batches.inc()
         slice_events: list[Event] = []
         metric_rows: List[Tuple[str, dt.datetime, int, str, float, Optional[str], str]] = []
         telemetry_flushes = 0
@@ -510,24 +515,43 @@ class DBWriter:
                 if req.future and not req.future.done():
                     req.future.set_result(None)
 
-        if slice_events:
-            await self._insert_slice_bulk(slice_events)
+        try:
+            if slice_events:
+                t0 = time.perf_counter()
+                await self._insert_slice_bulk(slice_events)
+                obs_metrics.alerts_db_batch_duration_seconds.labels(kind="slice").observe(
+                    time.perf_counter() - t0
+                )
 
-        if metric_rows:
-            await self._insert_metrics(metric_rows)
+            if metric_rows:
+                t0 = time.perf_counter()
+                await self._insert_metrics(metric_rows)
+                obs_metrics.alerts_db_batch_duration_seconds.labels(kind="metrics").observe(
+                    time.perf_counter() - t0
+                )
 
-        for _ in range(telemetry_flushes):
-            await self.telemetry.flush_if_needed()
+            for _ in range(telemetry_flushes):
+                t0 = time.perf_counter()
+                await self.telemetry.flush_if_needed()
+                obs_metrics.alerts_db_batch_duration_seconds.labels(kind="telemetry").observe(
+                    time.perf_counter() - t0
+                )
 
-        for req in upserts:
-            try:
-                res = await self._upsert_rule(req.payload)
-                if req.future and not req.future.done():
-                    req.future.set_result(res)
-            except Exception as e:
-                logger.error(f"[db-writer] upsert_rule failed: {e!s}")
-                if req.future and not req.future.done():
-                    req.future.set_exception(e)
+            for req in upserts:
+                try:
+                    t0 = time.perf_counter()
+                    res = await self._upsert_rule(req.payload)
+                    obs_metrics.alerts_db_batch_duration_seconds.labels(kind="upsert_rule").observe(
+                        time.perf_counter() - t0
+                    )
+                    if req.future and not req.future.done():
+                        req.future.set_result(res)
+                except Exception as e:
+                    logger.error(f"[db-writer] upsert_rule failed: {e!s}")
+                    if req.future and not req.future.done():
+                        req.future.set_exception(e)
+        finally:
+            obs_metrics.alerts_db_inflight_batches.dec()
 
     async def _insert_slice_bulk(self, events: list[Event]) -> None:
         sql = (
@@ -1143,12 +1167,13 @@ async def run_pipeline(
     try:
         timeout = aiohttp.ClientTimeout(total=6)
         async with aiohttp.ClientSession(timeout=timeout) as s:
-            bids, asks = await fetch_orderbook_snapshot(s, "BTCUSDT", depth=1000)
+            # Calentamos el book sólo hasta los mismos niveles que consumimos por WS
+            bids, asks = await fetch_orderbook_snapshot(s, "BTCUSDT", depth=depth_levels)
             for p, q in bids:
                 engine.book.apply("buy", "insert", p, q)
             for p, q in asks:
                 engine.book.apply("sell", "insert", p, q)
-            logger.info("Initialized OB snapshot via REST (depth=1000).")
+            logger.info(f"Initialized OB snapshot via REST (depth={depth_levels}).")
     except Exception as e:
         logger.warning(f"Failed to init OB snapshot: {e!s}")
 
@@ -1247,7 +1272,13 @@ async def run_pipeline(
 
     async def _yield_if_needed(stage: str, idx: int, every: int = 50) -> None:
         if idx and idx % every == 0:
+            now = time.perf_counter()
             obs_metrics.alerts_stage_yields_total.labels(stage=stage).inc()
+            last_attr = f"_last_yield_{stage}"
+            last_val = getattr(_yield_if_needed, last_attr, None)
+            if last_val is not None:
+                obs_metrics.alerts_stage_yield_gap_seconds.labels(stage=stage).observe(now - last_val)
+            setattr(_yield_if_needed, last_attr, now)
             await asyncio.sleep(0)
 
     async def enqueue_rule(rule: dict, event_ts: float):
@@ -1270,6 +1301,7 @@ async def run_pipeline(
         price: float,
         qty_delta: float,
     ) -> DepthProcessResult:
+        t0 = time.perf_counter()
         with engine_lock:
             engine.on_depth(ts, side, action, price, qty_delta)
 
@@ -1283,6 +1315,7 @@ async def run_pipeline(
             spoof_event = det_spoof.on_depth(ts, side, action, price, spoof_qty, bb, ba)
 
             return DepthProcessResult(passive_event=passive_event, spoof_event=spoof_event)
+        obs_metrics.alerts_engine_lock_seconds.labels(stage="depth").observe(time.perf_counter() - t0)
 
     def _process_trade_sync(
         ts: float,
@@ -1290,6 +1323,7 @@ async def run_pipeline(
         px: float,
         qty: float,
     ) -> TradeProcessResult:
+        t0 = time.perf_counter()
         with engine_lock:
             engine.on_trade(ts, side, px, qty)
             det_spoof.on_trade(ts, side, px, qty)
@@ -1311,14 +1345,20 @@ async def run_pipeline(
                 tape_pressure=ev_tp,
                 snapshot=snap,
             )
+        obs_metrics.alerts_engine_lock_seconds.labels(stage="trades").observe(time.perf_counter() - t0)
 
     def _process_mark_sync(ev: MarkEvent) -> None:
+        t0 = time.perf_counter()
         with engine_lock:
             engine.on_mark(ev.ts, ev.mark_price, ev.index_price)
+        obs_metrics.alerts_engine_lock_seconds.labels(stage="mark").observe(time.perf_counter() - t0)
 
     def _snapshot_sync():
+        t0 = time.perf_counter()
         with engine_lock:
-            return engine.get_snapshot()
+            snap = engine.get_snapshot()
+        obs_metrics.alerts_engine_lock_seconds.labels(stage="snapshot").observe(time.perf_counter() - t0)
+        return snap
 
     async def process_depth_event(
         ts: float,
@@ -1550,7 +1590,9 @@ async def run_pipeline(
 
     async def _snapshot_loop(stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
+            t0 = time.perf_counter()
             await process_snapshot_and_flush(time.time())
+            obs_metrics.alerts_snapshot_duration_seconds.observe(time.perf_counter() - t0)
             await asyncio.sleep(0.05)
 
     async def _process_stream_batch(
@@ -1572,6 +1614,7 @@ async def run_pipeline(
 
             t_batch = time.perf_counter()
             stale_after = float(queue_stale_after.get(stream, 2.0))
+            handler_t0 = time.perf_counter()
             for idx, qev in enumerate(batch):
                 age = _queue_age_metrics(stream, qev.enqueued_at)
                 if age > stale_after:
@@ -1583,6 +1626,9 @@ async def run_pipeline(
                 await handler(qev.event)
                 obs_metrics.alerts_stage_rows_total.labels(stage=stream if stream != "trade" else "trades").inc()
                 await _yield_if_needed(stream if stream != "trade" else "trades", idx, every=int(cfg.get("yield", 50)))
+            obs_metrics.alerts_handler_duration_seconds.labels(stream=stream).observe(
+                time.perf_counter() - handler_t0
+            )
             obs_metrics.alerts_batch_duration_seconds.labels(stream=stream).observe(
                 time.perf_counter() - t_batch
             )
