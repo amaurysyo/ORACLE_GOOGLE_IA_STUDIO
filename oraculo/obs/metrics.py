@@ -85,7 +85,7 @@ alerts_queue_time_latest_seconds = Gauge(
 alerts_batch_duration_seconds = Histogram(
     "oraculo_alerts_batch_duration_seconds",
     "Batch processing duration by alerts stream",
-    ["stream"],
+    ["stream", "worker"],
     buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2),
 )
 alerts_queue_discarded_total = Counter(
@@ -102,7 +102,7 @@ alerts_stage_duration_ms = Histogram(
 alerts_stage_rows_total = Counter(
     "oraculo_alerts_stage_rows_total",
     "Rows/events processed per stage in alerts pipeline",
-    ["stage"],
+    ["stage", "worker"],
 )
 alerts_stage_yields_total = Counter(
     "oraculo_alerts_stage_yields_total",
@@ -143,7 +143,7 @@ alerts_engine_lock_seconds = Histogram(
 alerts_handler_duration_seconds = Histogram(
     "oraculo_alerts_handler_duration_seconds",
     "Handler execution duration per stream (includes lock time)",
-    ["stream"],
+    ["stream", "worker"],
     buckets=(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1, 2),
 )
 alerts_stage_yield_gap_seconds = Histogram(
