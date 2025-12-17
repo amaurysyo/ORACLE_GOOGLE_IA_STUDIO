@@ -1270,12 +1270,20 @@ async def run_pipeline(
                         text = f"#{rule['rule']} OI skew {ev_oi.intensity:.2f} ({underlying})"
                         await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
 
-    async def _yield_if_needed(stage: str, idx: int, every: int = 50) -> None:
-        if idx and idx % every == 0:
-            now = time.perf_counter()
+    async def _yield_if_needed(stage: str, idx: int, every: int = 50, max_gap_s: Optional[float] = None) -> None:
+        now = time.perf_counter()
+        last_attr = f"_last_yield_{stage}"
+        last_val = getattr(_yield_if_needed, last_attr, None)
+        if last_val is None:
+            setattr(_yield_if_needed, last_attr, now)
+            last_val = now
+
+        should_yield = idx > 0 and idx % every == 0
+        if max_gap_s is not None and now - last_val >= max_gap_s:
+            should_yield = True
+
+        if should_yield:
             obs_metrics.alerts_stage_yields_total.labels(stage=stage).inc()
-            last_attr = f"_last_yield_{stage}"
-            last_val = getattr(_yield_if_needed, last_attr, None)
             if last_val is not None:
                 obs_metrics.alerts_stage_yield_gap_seconds.labels(stage=stage).observe(now - last_val)
             setattr(_yield_if_needed, last_attr, now)
@@ -1572,9 +1580,9 @@ async def run_pipeline(
 
     queue_stale_after = {"trade": 2.0, "depth": 2.0, "mark": 1.0}
     batch_conf = {
-        "trade": {"size": 300, "wait": 0.02, "yield": 50},
-        "depth": {"size": 400, "wait": 0.02, "yield": 75},
-        "mark": {"size": 120, "wait": 0.01, "yield": 50},
+        "trade": {"size": 200, "wait": 0.015, "yield": 40, "yield_gap": 0.025},
+        "depth": {"size": 250, "wait": 0.015, "yield": 50, "yield_gap": 0.025},
+        "mark": {"size": 90, "wait": 0.01, "yield": 40, "yield_gap": 0.025},
     }
 
     def _queue_age_metrics(stream: str, enqueued_at: float) -> float:
@@ -1615,6 +1623,7 @@ async def run_pipeline(
             t_batch = time.perf_counter()
             stale_after = float(queue_stale_after.get(stream, 2.0))
             handler_t0 = time.perf_counter()
+            yield_gap_s = float(cfg.get("yield_gap", 0.025))
             for idx, qev in enumerate(batch):
                 age = _queue_age_metrics(stream, qev.enqueued_at)
                 if age > stale_after:
@@ -1625,7 +1634,12 @@ async def run_pipeline(
                     continue
                 await handler(qev.event)
                 obs_metrics.alerts_stage_rows_total.labels(stage=stream if stream != "trade" else "trades").inc()
-                await _yield_if_needed(stream if stream != "trade" else "trades", idx, every=int(cfg.get("yield", 50)))
+                await _yield_if_needed(
+                    stream if stream != "trade" else "trades",
+                    idx,
+                    every=int(cfg.get("yield", 50)),
+                    max_gap_s=yield_gap_s,
+                )
             obs_metrics.alerts_handler_duration_seconds.labels(stream=stream).observe(
                 time.perf_counter() - handler_t0
             )
