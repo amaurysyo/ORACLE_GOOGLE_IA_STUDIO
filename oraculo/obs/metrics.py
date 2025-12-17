@@ -114,6 +114,50 @@ alerts_queue_dropped_total = Counter(
     "Dropped events in alerts hot path queue",
 )
 
+# Alertas: persistencia y lock/handler profiling
+alerts_db_queue_time_seconds = Histogram(
+    "oraculo_alerts_db_queue_time_seconds",
+    "Time DB requests spend waiting in alerts DB queue before processing",
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2),
+)
+alerts_db_queue_depth = Gauge(
+    "oraculo_alerts_db_queue_depth",
+    "Queue depth for alerts DB writer",
+)
+alerts_db_batch_duration_seconds = Histogram(
+    "oraculo_alerts_db_batch_duration_seconds",
+    "DB batch processing duration by kind in alerts pipeline",
+    ["kind"],
+    buckets=(0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000),
+)
+alerts_db_inflight_batches = Gauge(
+    "oraculo_alerts_db_inflight_batches",
+    "Inflight DB batches being processed concurrently",
+)
+alerts_engine_lock_seconds = Histogram(
+    "oraculo_alerts_engine_lock_seconds",
+    "Time spent holding engine_lock in alerts pipeline",
+    ["stage"],
+    buckets=(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1),
+)
+alerts_handler_duration_seconds = Histogram(
+    "oraculo_alerts_handler_duration_seconds",
+    "Handler execution duration per stream (includes lock time)",
+    ["stream"],
+    buckets=(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1, 2),
+)
+alerts_stage_yield_gap_seconds = Histogram(
+    "oraculo_alerts_stage_yield_gap_seconds",
+    "Elapsed time between cooperative yields within a stage",
+    ["stage"],
+    buckets=(0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25),
+)
+alerts_snapshot_duration_seconds = Histogram(
+    "oraculo_alerts_snapshot_duration_seconds",
+    "Duration of snapshot+flush cycle in alerts pipeline",
+    buckets=(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5),
+)
+
 #  Retardo en colas del batcher
 batch_queue_delay_ms = Summary(
     "oraculo_batch_queue_delay_ms",
