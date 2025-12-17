@@ -8,6 +8,7 @@ import datetime as dt
 import json
 import math
 import time
+import threading
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, Optional, Tuple, List, Sequence, Callable, Awaitable
 
@@ -76,6 +77,21 @@ class DBRequest:
     payload: Any
     future: Optional[asyncio.Future]
     enqueued_at: float
+
+
+@dataclass
+class DepthProcessResult:
+    passive_event: Optional[Event]
+    spoof_event: Optional[Event]
+
+
+@dataclass
+class TradeProcessResult:
+    slice_equal: Optional[Event]
+    slice_hit: Optional[Event]
+    absorption: Optional[Event]
+    tape_pressure: Optional[Event]
+    snapshot: Any
 
 
 class EventSource:
@@ -1026,6 +1042,7 @@ async def run_pipeline(
     cfg_mgr: Any | None = None,
 ) -> None:
     engine = MetricsEngine(top_n=1000)
+    engine_lock = threading.Lock()
 
     # Detectores
     det_slice_eq = SlicingAggDetector(SlicingAggConfig(require_equal=True, equal_tol_pct=0.0, equal_tol_abs=0.0))
@@ -1246,6 +1263,63 @@ async def run_pipeline(
     async def enqueue_telemetry_flush() -> None:
         await db_writer.submit("telemetry_flush", None)
 
+    def _process_depth_sync(
+        ts: float,
+        side: str,
+        action: str,
+        price: float,
+        qty_delta: float,
+    ) -> DepthProcessResult:
+        with engine_lock:
+            engine.on_depth(ts, side, action, price, qty_delta)
+
+            passive_event: Optional[Event] = None
+            if action == "insert" and qty_delta > 0:
+                passive_event = det_pass.on_depth(ts, side, price, qty_delta)
+
+            bb, ba = engine.book.best()
+            book_qty = engine.book.bids.get(price) if side == "buy" else engine.book.asks.get(price)
+            spoof_qty = book_qty if book_qty is not None else qty_delta
+            spoof_event = det_spoof.on_depth(ts, side, action, price, spoof_qty, bb, ba)
+
+            return DepthProcessResult(passive_event=passive_event, spoof_event=spoof_event)
+
+    def _process_trade_sync(
+        ts: float,
+        side: str,
+        px: float,
+        qty: float,
+    ) -> TradeProcessResult:
+        with engine_lock:
+            engine.on_trade(ts, side, px, qty)
+            det_spoof.on_trade(ts, side, px, qty)
+
+            ev1 = det_slice_eq.on_trade(ts, side, px, qty)
+            ev2 = det_slice_hit.on_trade(ts, side, px, qty)
+
+            bb, ba = engine.book.best()
+            det_abs.on_best(bb, ba)
+            ev_abs = det_abs.on_trade(ts, side, px, qty)
+
+            snap = engine.get_snapshot()
+            ev_tp = tape_det.on_trade(ts, side, px, qty)
+
+            return TradeProcessResult(
+                slice_equal=ev1,
+                slice_hit=ev2,
+                absorption=ev_abs,
+                tape_pressure=ev_tp,
+                snapshot=snap,
+            )
+
+    def _process_mark_sync(ev: MarkEvent) -> None:
+        with engine_lock:
+            engine.on_mark(ev.ts, ev.mark_price, ev.index_price)
+
+    def _snapshot_sync():
+        with engine_lock:
+            return engine.get_snapshot()
+
     async def process_depth_event(
         ts: float,
         side: str,
@@ -1254,36 +1328,35 @@ async def run_pipeline(
         qty_delta: float,
     ) -> None:
         t0 = time.perf_counter()
-        engine.on_depth(ts, side, action, price, qty_delta)
+        res = await asyncio.to_thread(
+            _process_depth_sync,
+            ts,
+            side,
+            action,
+            price,
+            qty_delta,
+        )
 
-        # slicing pasivo
-        if action == "insert" and qty_delta > 0:
-            evp = det_pass.on_depth(ts, side, price, qty_delta)
-            if evp:
-                await enqueue_slice(evp)
-                for rule in eval_rules(_evdict(evp), ctx):
-                    alert_id, ts_first_dt = await enqueue_rule(rule, evp.ts)
-                    if alert_id is not None:
-                        telemetry.bump(evp.ts, rule["rule"], rule.get("side", "na"), emitted=1)
-                        text = (
-                            f"#{rule['rule']} {evp.side.upper()} slicing_pass @ {evp.price} | "
-                            f"qty={evp.intensity:.2f} BTC"
-                        )
-                        await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
-
-        # spoofing detector (necesita bests)
-        bb, ba = engine.book.best()
-        book_qty = engine.book.bids.get(price) if side == "buy" else engine.book.asks.get(price)
-        spoof_qty = book_qty if book_qty is not None else qty_delta
-        ev_sp = det_spoof.on_depth(ts, side, action, price, spoof_qty, bb, ba)
-        if ev_sp:
-            for rule in eval_rules(_evdict(ev_sp), ctx):
-                aid, t0_dt = await enqueue_rule(rule, ev_sp.ts)
-                if aid is not None:
-                    telemetry.bump(ev_sp.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+        if res.passive_event:
+            await enqueue_slice(res.passive_event)
+            for rule in eval_rules(_evdict(res.passive_event), ctx):
+                alert_id, ts_first_dt = await enqueue_rule(rule, res.passive_event.ts)
+                if alert_id is not None:
+                    telemetry.bump(res.passive_event.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                     text = (
-                        f"#{rule['rule']} {ev_sp.side.upper()} spoofing {ev_sp.intensity:.2f} BTC @ "
-                        f"{ev_sp.price} | cancel={ev_sp.fields.get('cancel_rate'):.2f}"
+                        f"#{rule['rule']} {res.passive_event.side.upper()} slicing_pass @ {res.passive_event.price} | "
+                        f"qty={res.passive_event.intensity:.2f} BTC"
+                    )
+                    await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
+
+        if res.spoof_event:
+            for rule in eval_rules(_evdict(res.spoof_event), ctx):
+                aid, t0_dt = await enqueue_rule(rule, res.spoof_event.ts)
+                if aid is not None:
+                    telemetry.bump(res.spoof_event.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                    text = (
+                        f"#{rule['rule']} {res.spoof_event.side.upper()} spoofing {res.spoof_event.intensity:.2f} BTC @ "
+                        f"{res.spoof_event.price} | cancel={res.spoof_event.fields.get('cancel_rate'):.2f}"
                     )
                     await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
 
@@ -1296,12 +1369,15 @@ async def run_pipeline(
         qty: float,
     ) -> None:
         t0 = time.perf_counter()
-        engine.on_trade(ts, side, px, qty)
-        det_spoof.on_trade(ts, side, px, qty)
+        res = await asyncio.to_thread(
+            _process_trade_sync,
+            ts,
+            side,
+            px,
+            qty,
+        )
 
-        ev1 = det_slice_eq.on_trade(ts, side, px, qty)
-        ev2 = det_slice_hit.on_trade(ts, side, px, qty)
-        for ev in filter(None, [ev1, ev2]):  # type: ignore
+        for ev in filter(None, [res.slice_equal, res.slice_hit]):  # type: ignore
             await enqueue_slice(ev)
             for rule in eval_rules(_evdict(ev), ctx):
                 alert_id, ts_first_dt = await enqueue_rule(rule, ev.ts)
@@ -1309,30 +1385,27 @@ async def run_pipeline(
                     telemetry.bump(ev.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                     label = "iceberg" if ev.fields.get("mode") == "iceberg" else "hitting"
                     text = (
-                        f"#{rule['rule']} {side.upper()} slicing_{label} @ {px} | "
+                        f"#{rule['rule']} {ev.side.upper()} slicing_{label} @ {ev.price} | "
                         f"qty={ev.intensity:.2f} BTC"
                     )
                     await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
 
-        bb, ba = engine.book.best()
-        det_abs.on_best(bb, ba)
-        ev_abs = det_abs.on_trade(ts, side, px, qty)
-        if ev_abs:
-            for rule in eval_rules(_evdict(ev_abs), ctx):
-                alert_id, ts_first_dt = await enqueue_rule(rule, ev_abs.ts)
+        if res.absorption:
+            for rule in eval_rules(_evdict(res.absorption), ctx):
+                alert_id, ts_first_dt = await enqueue_rule(rule, res.absorption.ts)
                 if alert_id is not None:
-                    telemetry.bump(ev_abs.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                    telemetry.bump(res.absorption.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                     text = (
-                        f"#{rule['rule']} {ev_abs.side.upper()} absorption @ {ev_abs.price} | "
-                        f"vol={ev_abs.intensity:.2f} BTC"
+                        f"#{rule['rule']} {res.absorption.side.upper()} absorption @ {res.absorption.price} | "
+                        f"vol={res.absorption.intensity:.2f} BTC"
                     )
                     await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
 
-        snap = engine.get_snapshot()
-        if ev1 or ev2:
+        snap = res.snapshot
+        if res.slice_equal or res.slice_hit:
             if getattr(snap, "basis_vel_bps_s", None) is None:
-                telemetry.bump(ts, "R1/R2", (ev1 or ev2).side, disc_metrics_none=1)
-            e2, gating_reason = det_bw.on_slicing(ts, ev1 or ev2, snap)
+                telemetry.bump(ts, "R1/R2", (res.slice_equal or res.slice_hit).side, disc_metrics_none=1)
+            e2, gating_reason = det_bw.on_slicing(ts, res.slice_equal or res.slice_hit, snap)
             if e2:
                 for rule in eval_rules(_evdict(e2), ctx):
                     alert_id, ts_first_dt = await enqueue_rule(rule, e2.ts)
@@ -1353,25 +1426,24 @@ async def run_pipeline(
                 bump_kwargs = reason_map.get(gating_reason, {})
                 if bump_kwargs:
                     telemetry.bump(
-                        ts, "R1/R2", (ev1 or ev2).side, **bump_kwargs,
+                        ts, "R1/R2", (res.slice_equal or res.slice_hit).side, **bump_kwargs,
                     )
 
-        ev_tp = tape_det.on_trade(ts, side, px, qty)
-        if ev_tp:
-            for rule in eval_rules(_evdict(ev_tp), ctx):
-                aid, t0_dt = await enqueue_rule(rule, ev_tp.ts)
+        if res.tape_pressure:
+            for rule in eval_rules(_evdict(res.tape_pressure), ctx):
+                aid, t0_dt = await enqueue_rule(rule, res.tape_pressure.ts)
                 if aid is not None:
-                    telemetry.bump(ev_tp.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                    telemetry.bump(res.tape_pressure.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                     text = (
-                        f"#{rule['rule']} {ev_tp.side.upper()} tape_pressure "
-                        f"{ev_tp.intensity:.2f} @ {ev_tp.price}"
+                        f"#{rule['rule']} {res.tape_pressure.side.upper()} tape_pressure "
+                        f"{res.tape_pressure.intensity:.2f} @ {res.tape_pressure.price}"
                     )
                     await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
 
         obs_metrics.alerts_stage_duration_ms.labels(stage="trades").observe((time.perf_counter() - t0) * 1000)
 
     async def process_snapshot_and_flush(now_ts: float) -> None:
-        snap = engine.get_snapshot()
+        snap = await asyncio.to_thread(_snapshot_sync)
 
         # Dominance (timer-based) con telemetría de descartes por spread
         if getattr(snap, "spread_usd", None) is None:
@@ -1527,7 +1599,7 @@ async def run_pipeline(
             await process_depth_event(ev.ts, ev.side, ev.action, ev.price, ev.qty)
 
         async def mark_handler(ev: MarkEvent) -> None:
-            engine.on_mark(ev.ts, ev.mark_price, ev.index_price)
+            await asyncio.to_thread(_process_mark_sync, ev)
 
         async def process_trades() -> None:
             await _process_stream_batch(ws_reader, "trade", trade_handler, stop_event)
@@ -1610,10 +1682,13 @@ async def run_pipeline(
                 # Paginación por Tiempo (legacy para mark)
                 for idx, r in enumerate(await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000)):
                     await _yield_if_needed("mark", idx, every=50)
-                    engine.on_mark(
-                        r["event_time"].timestamp(),
-                        float(r.get("mark_price") or 0) or None,
-                        float(r.get("index_price") or 0) or None,
+                    await asyncio.to_thread(
+                        _process_mark_sync,
+                        MarkEvent(
+                            ts=r["event_time"].timestamp(),
+                            mark_price=float(r.get("mark_price") or 0) or None,
+                            index_price=float(r.get("index_price") or 0) or None,
+                        ),
                     )
                     obs_metrics.alerts_stage_rows_total.labels(stage="mark").inc()
 
