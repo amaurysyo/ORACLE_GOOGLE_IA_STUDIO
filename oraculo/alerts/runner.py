@@ -1202,7 +1202,7 @@ async def run_pipeline(
             last_deriv_opt_ts,
         )
         obs_metrics.alerts_stage_duration_ms.labels(stage="options_fetch").observe((time.perf_counter() - t0) * 1000)
-        obs_metrics.alerts_stage_rows_total.labels(stage="options").inc(len(rows_opt))
+        obs_metrics.alerts_stage_rows_total.labels(stage="options", worker="main").inc(len(rows_opt))
         if not rows_opt:
             return
 
@@ -1608,6 +1608,8 @@ async def run_pipeline(
         stream: str,
         handler: Callable[[Any], Awaitable[None]],
         stop_event: asyncio.Event,
+        *,
+        worker_name: str = "main",
     ) -> None:
         while not stop_event.is_set():
             cfg = batch_conf.get(stream, {})
@@ -1633,17 +1635,24 @@ async def run_pipeline(
                     obs_metrics.alerts_queue_dropped_total.inc()
                     continue
                 await handler(qev.event)
-                obs_metrics.alerts_stage_rows_total.labels(stage=stream if stream != "trade" else "trades").inc()
+                stage_label = stream if stream != "trade" else "trades"
+                obs_metrics.alerts_stage_rows_total.labels(
+                    stage=stage_label, worker=worker_name
+                ).inc()
                 await _yield_if_needed(
                     stream if stream != "trade" else "trades",
                     idx,
                     every=int(cfg.get("yield", 50)),
                     max_gap_s=yield_gap_s,
                 )
-            obs_metrics.alerts_handler_duration_seconds.labels(stream=stream).observe(
+            obs_metrics.alerts_handler_duration_seconds.labels(
+                stream=stream, worker=worker_name
+            ).observe(
                 time.perf_counter() - handler_t0
             )
-            obs_metrics.alerts_batch_duration_seconds.labels(stream=stream).observe(
+            obs_metrics.alerts_batch_duration_seconds.labels(
+                stream=stream, worker=worker_name
+            ).observe(
                 time.perf_counter() - t_batch
             )
 
@@ -1662,13 +1671,15 @@ async def run_pipeline(
             await asyncio.to_thread(_process_mark_sync, ev)
 
         async def process_trades() -> None:
-            await _process_stream_batch(ws_reader, "trade", trade_handler, stop_event)
+            await _process_stream_batch(ws_reader, "trade", trade_handler, stop_event, worker_name="trades")
 
-        async def process_depth() -> None:
-            await _process_stream_batch(ws_reader, "depth", depth_handler, stop_event)
+        async def process_depth(worker_name: str) -> None:
+            await _process_stream_batch(
+                ws_reader, "depth", depth_handler, stop_event, worker_name=worker_name
+            )
 
         async def process_mark() -> None:
-            await _process_stream_batch(ws_reader, "mark", mark_handler, stop_event)
+            await _process_stream_batch(ws_reader, "mark", mark_handler, stop_event, worker_name="mark")
 
         tasks = [
             asyncio.create_task(
@@ -1676,8 +1687,12 @@ async def run_pipeline(
                 name="alerts-trade-worker",
             ),
             asyncio.create_task(
-                process_depth(),
-                name="alerts-depth-worker",
+                process_depth("depth-0"),
+                name="alerts-depth-worker-0",
+            ),
+            asyncio.create_task(
+                process_depth("depth-1"),
+                name="alerts-depth-worker-1",
             ),
             asyncio.create_task(
                 process_mark(),
@@ -1736,7 +1751,7 @@ async def run_pipeline(
                         float(r["price"]),
                         float(r["qty"]),
                     )
-                    obs_metrics.alerts_stage_rows_total.labels(stage="depth").inc()
+                    obs_metrics.alerts_stage_rows_total.labels(stage="depth", worker="main").inc()
 
                 # 2) mark funding -> basis
                 # Paginación por Tiempo (legacy para mark)
@@ -1750,7 +1765,7 @@ async def run_pipeline(
                             index_price=float(r.get("index_price") or 0) or None,
                         ),
                     )
-                    obs_metrics.alerts_stage_rows_total.labels(stage="mark").inc()
+                    obs_metrics.alerts_stage_rows_total.labels(stage="mark", worker="main").inc()
 
                 # 3) trades -> slicing (iceberg/hitting) + absorción + break_wall + tape_pressure + spoofing_exec
                 # Paginación por ID (trade_id_ext)
@@ -1762,7 +1777,7 @@ async def run_pipeline(
                         float(r["price"]),
                         float(r["qty"]),
                     )
-                    obs_metrics.alerts_stage_rows_total.labels(stage="trades").inc()
+                    obs_metrics.alerts_stage_rows_total.labels(stage="trades", worker="main").inc()
 
                 ts_now = dt.datetime.now(dt.timezone.utc).timestamp()
                 await process_snapshot_and_flush(ts_now)
