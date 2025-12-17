@@ -19,7 +19,9 @@ import os
 from run_cli_from_spyder import main as run_cli
 
 # --- Configura aquí según tu entorno local ---
-TARGET_WS = "ws://localhost:8765/ws"  # Endpoint WS del servicio de alerts/ingest
+# Si no tienes el servicio real arriba, puedes levantar el mock:
+#   python scripts/mock_ws_server.py --host 127.0.0.1 --port 8765 --path /ws --echo
+TARGET_WS = "ws://localhost:8765/ws"  # Endpoint WS del servicio de alerts/ingest (o del mock)
 PROM_URL = "http://localhost:9001/metrics"  # Exporter Prometheus del servicio alerts
 
 LOADTEST_ARGS = (
