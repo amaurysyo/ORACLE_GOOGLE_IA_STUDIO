@@ -1065,6 +1065,22 @@ async def run_pipeline(
     rules_profile: str = "EU",
     cfg_mgr: Any | None = None,
 ) -> None:
+    alerts_source = "ws"
+    depth_levels = 20
+    depth_ms = 100
+    symbol = "BTCUSDT"
+    if cfg_mgr is not None and getattr(cfg_mgr, "cfg", None) is not None:
+        try:
+            cfg_obj = cfg_mgr.cfg
+            alerts_cfg = getattr(cfg_obj, "alerts", None) or getattr(cfg_obj, "model_extra", {}).get("alerts", {}) or {}
+            alerts_source = str(alerts_cfg.get("source", alerts_source)).lower()
+            binance_cfg = getattr(cfg_obj, "binance", {}) or {}
+            depth_levels = int(alerts_cfg.get("depth_levels", binance_cfg.get("futures_depth_levels", depth_levels)))
+            depth_ms = int(alerts_cfg.get("depth_ms", binance_cfg.get("futures_depth_ms", depth_ms)))
+            symbol = getattr(cfg_obj.app, "symbol", symbol)
+        except Exception:
+            pass
+
     engine = MetricsEngine(top_n=1000)
     engine_lock = threading.Lock()
 
@@ -1711,22 +1727,6 @@ async def run_pipeline(
             for task in tasks:
                 task.cancel()
             await ws_reader.stop()
-
-    alerts_source = "ws"
-    depth_levels = 20
-    depth_ms = 100
-    symbol = "BTCUSDT"
-    if cfg_mgr is not None and getattr(cfg_mgr, "cfg", None) is not None:
-        try:
-            cfg_obj = cfg_mgr.cfg
-            alerts_cfg = getattr(cfg_obj, "alerts", None) or getattr(cfg_obj, "model_extra", {}).get("alerts", {}) or {}
-            alerts_source = str(alerts_cfg.get("source", alerts_source)).lower()
-            binance_cfg = getattr(cfg_obj, "binance", {}) or {}
-            depth_levels = int(alerts_cfg.get("depth_levels", binance_cfg.get("futures_depth_levels", depth_levels)))
-            depth_ms = int(alerts_cfg.get("depth_ms", binance_cfg.get("futures_depth_ms", depth_ms)))
-            symbol = getattr(cfg_obj.app, "symbol", symbol)
-        except Exception:
-            pass
 
     await db_writer.start()
     try:
