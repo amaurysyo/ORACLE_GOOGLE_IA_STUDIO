@@ -185,40 +185,76 @@ http_latency_ms = Histogram(
 cpu_process_seconds_total = Counter(
     "oraculo_cpu_process_seconds_total",
     "Total process CPU time (seconds)",
-    ["service"],
+    ["service", "exported_service"],
 )
 cpu_main_thread_seconds_total = Counter(
     "oraculo_cpu_main_thread_seconds_total",
     "Total main-thread CPU time (seconds)",
-    ["service"],
+    ["service", "exported_service"],
+)
+cpu_available_cores = Gauge(
+    "oraculo_cpu_available_cores",
+    "Available CPU cores reported by the OS",
+    ["service", "exported_service"],
+)
+python_thread_count = Gauge(
+    "oraculo_python_thread_count",
+    "Active Python thread count",
+    ["service", "exported_service"],
 )
 threads_active = Gauge(
     "oraculo_threads_active",
     "Active thread count",
-    ["service"],
+    ["service", "exported_service"],
 )
 
+to_thread_submitted_total = Counter(
+    "oraculo_to_thread_submitted_total",
+    "asyncio.to_thread submissions by task",
+    ["service", "exported_service", "task"],
+)
+to_thread_started_total = Counter(
+    "oraculo_to_thread_started_total",
+    "asyncio.to_thread executions that reached a worker thread",
+    ["service", "exported_service", "task"],
+)
+to_thread_completed_total = Counter(
+    "oraculo_to_thread_completed_total",
+    "asyncio.to_thread executions completed (success or error)",
+    ["service", "exported_service", "task"],
+)
 to_thread_wall_seconds = Histogram(
     "oraculo_to_thread_wall_seconds",
     "Wall-clock duration of asyncio.to_thread tasks",
-    ["service", "task"],
+    ["service", "exported_service", "task"],
     buckets=(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5),
 )
 to_thread_thread_cpu_seconds = Histogram(
     "oraculo_to_thread_thread_cpu_seconds",
     "Thread CPU duration of asyncio.to_thread tasks",
-    ["service", "task"],
+    ["service", "exported_service", "task"],
+    buckets=(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5),
+)
+to_thread_no_cpu_seconds = Histogram(
+    "oraculo_to_thread_no_cpu_seconds",
+    "Non-CPU time (wall minus thread CPU) spent in asyncio.to_thread tasks",
+    ["service", "exported_service", "task"],
     buckets=(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5),
 )
 to_thread_inflight = Gauge(
     "oraculo_to_thread_inflight",
     "Inflight asyncio.to_thread tasks",
-    ["service", "task"],
+    ["service", "exported_service", "task"],
+)
+to_thread_queue_depth = Gauge(
+    "oraculo_to_thread_queue_depth",
+    "Queued asyncio.to_thread tasks pending worker execution",
+    ["service", "exported_service", "task"],
 )
 to_thread_exceptions_total = Counter(
     "oraculo_to_thread_exceptions_total",
     "Exceptions raised by asyncio.to_thread tasks",
-    ["service", "task"],
+    ["service", "exported_service", "task"],
 )
 
 # ---------- Rules ----------
@@ -316,15 +352,35 @@ def start_event_loop_lag_monitor(service: str, period: float = 1.0) -> None:
     )
 
 
-async def start_cpu_monitors(service: str, interval_s: float = 1.0) -> None:
+# PromQL de verificación (alerts):
+#   rate(oraculo_cpu_process_seconds_total{service="alerts"}[1m])
+#   rate(oraculo_cpu_main_thread_seconds_total{service="alerts"}[1m])
+#     / rate(oraculo_cpu_process_seconds_total{service="alerts"}[1m])
+#   oraculo_to_thread_queue_depth{service="alerts"}
+#   histogram_quantile(
+#       0.95,
+#       sum by (le, task) (rate(oraculo_to_thread_no_cpu_seconds_bucket{service="alerts"}[5m]))
+#   )
+#   rate(oraculo_to_thread_thread_cpu_seconds_sum{service="alerts"}[5m])
+#     / rate(oraculo_to_thread_wall_seconds_sum{service="alerts"}[5m])
+#   oraculo_event_loop_lag_seconds{service="alerts"}
+
+
+async def cpu_sampler_loop(
+    service: str, exported_service: str | None = None, interval_s: float = 1.0
+) -> None:
     """
-    Periodically exports:
-      - oraculo_cpu_process_seconds_total{service}
-      - oraculo_cpu_main_thread_seconds_total{service}
-      - oraculo_threads_active{service}
+    Periodically exports CPU/GIL contention signals:
+      - oraculo_cpu_process_seconds_total{service,exported_service}
+      - oraculo_cpu_main_thread_seconds_total{service,exported_service}
+      - oraculo_cpu_available_cores{service,exported_service}
+      - oraculo_python_thread_count{service,exported_service}
+      - oraculo_threads_active{service,exported_service}
+
     Must run in the main event-loop thread to make main-thread cpu meaningful.
     """
 
+    labels = {"service": service, "exported_service": exported_service or service}
     prev_proc = time.process_time()
     try:
         thread_time_fn = time.thread_time
@@ -334,20 +390,31 @@ async def start_cpu_monitors(service: str, interval_s: float = 1.0) -> None:
         thread_time_fn = time.process_time
         prev_thread = prev_proc
 
+    cores = os.cpu_count() or 1
+    cpu_available_cores.labels(**labels).set(float(cores))
+
     while True:
         await asyncio.sleep(interval_s)
 
         proc_now = time.process_time()
         proc_delta = max(0.0, proc_now - prev_proc)
-        cpu_process_seconds_total.labels(service=service).inc(proc_delta)
+        cpu_process_seconds_total.labels(**labels).inc(proc_delta)
         prev_proc = proc_now
 
         thread_now = thread_time_fn()
         thread_delta = max(0.0, thread_now - prev_thread)
-        cpu_main_thread_seconds_total.labels(service=service).inc(thread_delta)
+        cpu_main_thread_seconds_total.labels(**labels).inc(thread_delta)
         prev_thread = thread_now
 
-        threads_active.labels(service=service).set(threading.active_count())
+        active_threads = threading.active_count()
+        python_thread_count.labels(**labels).set(active_threads)
+        threads_active.labels(**labels).set(active_threads)
+
+
+async def start_cpu_monitors(service: str, interval_s: float = 1.0) -> None:
+    """Backward-compatible alias for cpu_sampler_loop."""
+
+    await cpu_sampler_loop(service=service, exported_service=service, interval_s=interval_s)
 
 
 # ---------- DB ----------
