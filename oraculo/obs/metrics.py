@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
+import time
 from typing import Dict
 
 from loguru import logger
@@ -179,6 +181,46 @@ http_latency_ms = Histogram(
     buckets=(5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000),
 )
 
+
+cpu_process_seconds_total = Counter(
+    "oraculo_cpu_process_seconds_total",
+    "Total process CPU time (seconds)",
+    ["service"],
+)
+cpu_main_thread_seconds_total = Counter(
+    "oraculo_cpu_main_thread_seconds_total",
+    "Total main-thread CPU time (seconds)",
+    ["service"],
+)
+threads_active = Gauge(
+    "oraculo_threads_active",
+    "Active thread count",
+    ["service"],
+)
+
+to_thread_wall_seconds = Histogram(
+    "oraculo_to_thread_wall_seconds",
+    "Wall-clock duration of asyncio.to_thread tasks",
+    ["service", "task"],
+    buckets=(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5),
+)
+to_thread_thread_cpu_seconds = Histogram(
+    "oraculo_to_thread_thread_cpu_seconds",
+    "Thread CPU duration of asyncio.to_thread tasks",
+    ["service", "task"],
+    buckets=(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5),
+)
+to_thread_inflight = Gauge(
+    "oraculo_to_thread_inflight",
+    "Inflight asyncio.to_thread tasks",
+    ["service", "task"],
+)
+to_thread_exceptions_total = Counter(
+    "oraculo_to_thread_exceptions_total",
+    "Exceptions raised by asyncio.to_thread tasks",
+    ["service", "task"],
+)
+
 # ---------- Rules ----------
 rule_eval_total = Counter("oraculo_rule_eval_total", "Rule evaluations", ["rule"])
 rule_eval_errors_total = Counter(
@@ -272,6 +314,40 @@ def start_event_loop_lag_monitor(service: str, period: float = 1.0) -> None:
         if t.cancelled() is False and t.exception() is not None
         else None
     )
+
+
+async def start_cpu_monitors(service: str, interval_s: float = 1.0) -> None:
+    """
+    Periodically exports:
+      - oraculo_cpu_process_seconds_total{service}
+      - oraculo_cpu_main_thread_seconds_total{service}
+      - oraculo_threads_active{service}
+    Must run in the main event-loop thread to make main-thread cpu meaningful.
+    """
+
+    prev_proc = time.process_time()
+    try:
+        thread_time_fn = time.thread_time
+        prev_thread = thread_time_fn()
+    except Exception:
+        # Fallback to process_time() if thread_time() is unavailable
+        thread_time_fn = time.process_time
+        prev_thread = prev_proc
+
+    while True:
+        await asyncio.sleep(interval_s)
+
+        proc_now = time.process_time()
+        proc_delta = max(0.0, proc_now - prev_proc)
+        cpu_process_seconds_total.labels(service=service).inc(proc_delta)
+        prev_proc = proc_now
+
+        thread_now = thread_time_fn()
+        thread_delta = max(0.0, thread_now - prev_thread)
+        cpu_main_thread_seconds_total.labels(service=service).inc(thread_delta)
+        prev_thread = thread_now
+
+        threads_active.labels(service=service).set(threading.active_count())
 
 
 # ---------- DB ----------
