@@ -7,6 +7,7 @@ import asyncio
 import datetime as dt
 import json
 import math
+import os
 import time
 import threading
 from dataclasses import dataclass
@@ -1069,6 +1070,9 @@ async def run_pipeline(
     depth_levels = 20
     depth_ms = 100
     symbol = "BTCUSDT"
+    service_name = "alerts"
+    exported_service = os.getenv("ORACULO_EXPORTED_SERVICE", service_name)
+    cpu_sampler_task: asyncio.Task | None = None
     if cfg_mgr is not None and getattr(cfg_mgr, "cfg", None) is not None:
         try:
             cfg_obj = cfg_mgr.cfg
@@ -1084,8 +1088,10 @@ async def run_pipeline(
     engine = MetricsEngine(top_n=1000)
     engine_lock = threading.Lock()
 
-    asyncio.create_task(
-        obs_metrics.start_cpu_monitors(service="alerts", interval_s=1.0),
+    cpu_sampler_task = asyncio.create_task(
+        obs_metrics.cpu_sampler_loop(
+            service=service_name, exported_service=exported_service, interval_s=1.0
+        ),
         name="alerts-cpu-monitor",
     )
 
@@ -1389,36 +1395,52 @@ async def run_pipeline(
         obs_metrics.alerts_engine_lock_seconds.labels(stage="snapshot").observe(time.perf_counter() - t0)
         return snap
 
-    def _timed_sync(service: str, task: str, fn):
-        def wrapped(*args, **kwargs):
-            import time
+    def _thread_task_labels(task: str) -> dict[str, str]:
+        return {"service": service_name, "exported_service": exported_service, "task": task}
 
-            t0 = time.perf_counter()
+    def _wrap_thread_task(task: str, fn: Callable[..., Any]):
+        labels = _thread_task_labels(task)
+
+        def wrapped(*args, **kwargs):
+            wall_t0 = time.perf_counter()
             try:
-                tt0 = time.thread_time()
+                cpu_t0 = time.thread_time()
             except Exception:
-                tt0 = None
+                cpu_t0 = None
+
+            obs_metrics.to_thread_started_total.labels(**labels).inc()
+            obs_metrics.to_thread_queue_depth.labels(**labels).dec()
+            obs_metrics.to_thread_inflight.labels(**labels).inc()
             try:
                 return fn(*args, **kwargs)
             except Exception:
-                obs_metrics.to_thread_exceptions_total.labels(service=service, task=task).inc()
+                obs_metrics.to_thread_exceptions_total.labels(**labels).inc()
                 raise
             finally:
-                obs_metrics.to_thread_wall_seconds.labels(service=service, task=task).observe(
-                    time.perf_counter() - t0
-                )
-                if tt0 is not None:
-                    obs_metrics.to_thread_thread_cpu_seconds.labels(service=service, task=task).observe(
-                        time.thread_time() - tt0
-                    )
+                wall = max(0.0, time.perf_counter() - wall_t0)
+                obs_metrics.to_thread_wall_seconds.labels(**labels).observe(wall)
+
+                cpu_dur: float | None = None
+                if cpu_t0 is not None:
+                    try:
+                        cpu_dur = max(0.0, time.thread_time() - cpu_t0)
+                        obs_metrics.to_thread_thread_cpu_seconds.labels(**labels).observe(cpu_dur)
+                    except Exception:
+                        cpu_dur = None
+
+                no_cpu = wall if cpu_dur is None else max(0.0, wall - cpu_dur)
+                obs_metrics.to_thread_no_cpu_seconds.labels(**labels).observe(no_cpu)
+
+                obs_metrics.to_thread_completed_total.labels(**labels).inc()
+                obs_metrics.to_thread_inflight.labels(**labels).dec()
 
         return wrapped
 
-    DEPTH_SYNC = _timed_sync("alerts", "depth", _process_depth_sync)
-    TRADE_SYNC = _timed_sync("alerts", "trade", _process_trade_sync)
-    SNAP_SYNC = _timed_sync("alerts", "snapshot", _snapshot_sync)
-    MARK_WS_SYNC = _timed_sync("alerts", "mark_ws", _process_mark_sync)
-    MARK_DB_SYNC = _timed_sync("alerts", "mark_db", _process_mark_sync)
+    async def _run_to_thread(task: str, fn: Callable[..., Any], *args, **kwargs):
+        labels = _thread_task_labels(task)
+        obs_metrics.to_thread_submitted_total.labels(**labels).inc()
+        obs_metrics.to_thread_queue_depth.labels(**labels).inc()
+        return await asyncio.to_thread(_wrap_thread_task(task, fn), *args, **kwargs)
 
     async def process_depth_event(
         ts: float,
@@ -1428,18 +1450,15 @@ async def run_pipeline(
         qty_delta: float,
     ) -> None:
         t0 = time.perf_counter()
-        obs_metrics.to_thread_inflight.labels(service="alerts", task="depth").inc()
-        try:
-            res = await asyncio.to_thread(
-                DEPTH_SYNC,
-                ts,
-                side,
-                action,
-                price,
-                qty_delta,
-            )
-        finally:
-            obs_metrics.to_thread_inflight.labels(service="alerts", task="depth").dec()
+        res = await _run_to_thread(
+            "depth",
+            _process_depth_sync,
+            ts,
+            side,
+            action,
+            price,
+            qty_delta,
+        )
 
         if res.passive_event:
             await enqueue_slice(res.passive_event)
@@ -1473,17 +1492,14 @@ async def run_pipeline(
         qty: float,
     ) -> None:
         t0 = time.perf_counter()
-        obs_metrics.to_thread_inflight.labels(service="alerts", task="trade").inc()
-        try:
-            res = await asyncio.to_thread(
-                TRADE_SYNC,
-                ts,
-                side,
-                px,
-                qty,
-            )
-        finally:
-            obs_metrics.to_thread_inflight.labels(service="alerts", task="trade").dec()
+        res = await _run_to_thread(
+            "trade",
+            _process_trade_sync,
+            ts,
+            side,
+            px,
+            qty,
+        )
 
         for ev in filter(None, [res.slice_equal, res.slice_hit]):  # type: ignore
             await enqueue_slice(ev)
@@ -1551,11 +1567,7 @@ async def run_pipeline(
         obs_metrics.alerts_stage_duration_ms.labels(stage="trades").observe((time.perf_counter() - t0) * 1000)
 
     async def process_snapshot_and_flush(now_ts: float) -> None:
-        obs_metrics.to_thread_inflight.labels(service="alerts", task="snapshot").inc()
-        try:
-            snap = await asyncio.to_thread(SNAP_SYNC)
-        finally:
-            obs_metrics.to_thread_inflight.labels(service="alerts", task="snapshot").dec()
+        snap = await _run_to_thread("snapshot", _snapshot_sync)
 
         # Dominance (timer-based) con telemetría de descartes por spread
         if getattr(snap, "spread_usd", None) is None:
@@ -1732,11 +1744,7 @@ async def run_pipeline(
             await process_depth_event(ev.ts, ev.side, ev.action, ev.price, ev.qty)
 
         async def mark_handler(ev: MarkEvent) -> None:
-            obs_metrics.to_thread_inflight.labels(service="alerts", task="mark_ws").inc()
-            try:
-                await asyncio.to_thread(MARK_WS_SYNC, ev)
-            finally:
-                obs_metrics.to_thread_inflight.labels(service="alerts", task="mark_ws").dec()
+            await _run_to_thread("mark_ws", _process_mark_sync, ev)
 
         async def process_trades() -> None:
             await _process_stream_batch(ws_reader, "trade", trade_handler, stop_event, worker_name="trades")
@@ -1809,18 +1817,15 @@ async def run_pipeline(
                 # Paginación por Tiempo (legacy para mark)
                 for idx, r in enumerate(await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000)):
                     await _yield_if_needed("mark", idx, every=50)
-                    obs_metrics.to_thread_inflight.labels(service="alerts", task="mark_db").inc()
-                    try:
-                        await asyncio.to_thread(
-                            MARK_DB_SYNC,
-                            MarkEvent(
-                                ts=r["event_time"].timestamp(),
-                                mark_price=float(r.get("mark_price") or 0) or None,
-                                index_price=float(r.get("index_price") or 0) or None,
-                            ),
-                        )
-                    finally:
-                        obs_metrics.to_thread_inflight.labels(service="alerts", task="mark_db").dec()
+                    await _run_to_thread(
+                        "mark_db",
+                        _process_mark_sync,
+                        MarkEvent(
+                            ts=r["event_time"].timestamp(),
+                            mark_price=float(r.get("mark_price") or 0) or None,
+                            index_price=float(r.get("index_price") or 0) or None,
+                        ),
+                    )
                     obs_metrics.alerts_stage_rows_total.labels(stage="mark", worker="main").inc()
 
                 # 3) trades -> slicing (iceberg/hitting) + absorción + break_wall + tape_pressure + spoofing_exec
@@ -1845,4 +1850,7 @@ async def run_pipeline(
             snapshot_task.cancel()
             await asyncio.gather(options_task, snapshot_task, return_exceptions=True)
     finally:
+        if cpu_sampler_task is not None:
+            cpu_sampler_task.cancel()
+            await asyncio.gather(cpu_sampler_task, return_exceptions=True)
         await db_writer.stop()
