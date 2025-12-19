@@ -19,20 +19,18 @@ import aiohttp
 from loguru import logger
 
 from oraculo.db import DB
-from oraculo.detect.metrics_engine import MetricsEngine
+from oraculo.alerts.cpu_worker import (
+    CPUWorkerClient,
+    DepthProcessResult,
+    SnapshotProcessResult,
+    TradeProcessResult,
+    WorkerResult,
+)
 from oraculo.detect.detectors import (
-    SlicingAggConfig, SlicingAggDetector,
-    AbsorptionCfg, AbsorptionDetector,
-    BreakWallCfg, BreakWallDetector,
-    DominanceCfg, DominanceDetector,
-    SlicingPassConfig, SlicingPassiveDetector,
-    SpoofingCfg, SpoofingDetector,
-    DepletionCfg, DepletionDetector,
-    MetricTrigCfg, MetricTriggerDetector,
-    BasisMRcfg, BasisMeanRevertDetector,
-    TapePressureCfg, TapePressureDetector,
-    IVSpikeCfg, IVSpikeDetector,
-    OISkewCfg, OISkewDetector,
+    IVSpikeCfg,
+    IVSpikeDetector,
+    OISkewCfg,
+    OISkewDetector,
     Event,
 )
 from oraculo.obs import metrics as obs_metrics
@@ -80,22 +78,6 @@ class DBRequest:
     payload: Any
     future: Optional[asyncio.Future]
     enqueued_at: float
-
-
-@dataclass
-class DepthProcessResult:
-    passive_event: Optional[Event]
-    spoof_event: Optional[Event]
-
-
-@dataclass
-class TradeProcessResult:
-    slice_equal: Optional[Event]
-    slice_hit: Optional[Event]
-    absorption: Optional[Event]
-    tape_pressure: Optional[Event]
-    snapshot: Any
-
 
 class EventSource:
     async def start(self) -> None:  # pragma: no cover - interfaz
@@ -852,236 +834,6 @@ class Telemetry:
             logger.warning(f"[telemetry] flush failed: {e!s}")
 
 
-def _apply_rules_to_detectors(
-    rules: Dict[str, Any],
-    det_slice_eq: SlicingAggDetector,
-    det_slice_hit: SlicingAggDetector,
-    det_abs: AbsorptionDetector,
-    det_bw: BreakWallDetector,
-    det_pass: SlicingPassiveDetector,
-    det_dom: DominanceDetector,
-    det_spoof: SpoofingDetector,
-    dep_bid_det: DepletionDetector,
-    dep_ask_det: DepletionDetector,
-    basis_pos_trig: MetricTriggerDetector,
-    basis_neg_trig: MetricTriggerDetector,
-    basis_mr: BasisMeanRevertDetector,
-    tape_det: TapePressureDetector,
-    iv_det: IVSpikeDetector,
-    oi_skew_det: OISkewDetector,
-) -> None:
-    det = (rules or {}).get("detectors", {}) or {}
-
-    # slicing iceberg (equal)
-    s = det.get("slicing_aggr") or {}
-    det_slice_eq.cfg.gap_ms = int(s.get("gap_ms", det_slice_eq.cfg.gap_ms))
-    det_slice_eq.cfg.k_min = int(s.get("k_min", det_slice_eq.cfg.k_min))
-    det_slice_eq.cfg.qty_min = float(s.get("qty_min", det_slice_eq.cfg.qty_min))
-    det_slice_eq.cfg.require_equal = bool(s.get("require_equal", det_slice_eq.cfg.require_equal))
-    det_slice_eq.cfg.equal_tol_pct = float(s.get("equal_tol_pct", det_slice_eq.cfg.equal_tol_pct))
-    det_slice_eq.cfg.equal_tol_abs = s.get("equal_tol_abs", det_slice_eq.cfg.equal_tol_abs)
-
-    # slicing hit (non-equal)
-    h = det.get("slicing_hit") or {}
-    det_slice_hit.cfg.gap_ms = int(h.get("gap_ms", det_slice_hit.cfg.gap_ms))
-    det_slice_hit.cfg.k_min = int(h.get("k_min", det_slice_hit.cfg.k_min))
-    det_slice_hit.cfg.qty_min = float(h.get("qty_min", det_slice_hit.cfg.qty_min))
-    det_slice_hit.cfg.require_equal = False  # fuerza modo "hitting"
-
-    # absorción
-    a = det.get("absorption") or {}
-    det_abs.cfg.dur_s = float(a.get("dur_s", det_abs.cfg.dur_s))
-    det_abs.cfg.vol_btc = float(a.get("vol_btc", det_abs.cfg.vol_btc))
-    det_abs.cfg.max_price_drift_ticks = int(a.get("max_price_drift_ticks", det_abs.cfg.max_price_drift_ticks))
-    det_abs.cfg.tick_size = float(a.get("tick_size", det_abs.cfg.tick_size))
-
-    # break wall (con gating por depleción/refill/basis_vel)
-    b = det.get("break_wall") or {}
-    det_bw.cfg.n_min = int(b.get("n_min", det_bw.cfg.n_min))
-    det_bw.cfg.dep_pct = float(b.get("dep_pct", det_bw.cfg.dep_pct))
-    det_bw.cfg.basis_vel_abs_bps_s = float(b.get("basis_vel_abs_bps_s", det_bw.cfg.basis_vel_abs_bps_s))
-    det_bw.cfg.require_depletion = bool(b.get("require_depletion", det_bw.cfg.require_depletion))
-    det_bw.cfg.forbid_refill_under_pct = float(b.get("forbid_refill_under_pct", det_bw.cfg.forbid_refill_under_pct))
-    det_bw.cfg.top_levels_gate = int(b.get("top_levels_gate", det_bw.cfg.top_levels_gate))
-    det_bw.cfg.tick_size = float(b.get("tick_size", det_bw.cfg.tick_size))
-    det_bw.cfg.refill_window_s = float(b.get("refill_window_s", det_bw.cfg.refill_window_s))
-    det_bw.cfg.refill_min_pct = float(b.get("refill_min_pct", det_bw.cfg.refill_min_pct))
-
-    # slicing pasivo
-    p = det.get("slicing_pass") or {}
-    det_pass.cfg.gap_ms = int(p.get("gap_ms", det_pass.cfg.gap_ms))
-    det_pass.cfg.k_min = int(p.get("k_min", det_pass.cfg.k_min))
-    det_pass.cfg.qty_min = float(p.get("qty_min", det_pass.cfg.qty_min))
-
-    # dominancia
-    d = det.get("dominance") or {}
-    det_dom.cfg.enabled = bool(d.get("enabled", det_dom.cfg.enabled))
-    det_dom.cfg.dom_pct = float(d.get("dom_pct", det_dom.cfg.dom_pct))
-    det_dom.cfg.max_spread_usd = float(d.get("max_spread_usd", det_dom.cfg.max_spread_usd))
-    det_dom.cfg.levels = int(d.get("levels", det_dom.cfg.levels))
-    det_dom.cfg.hold_ms = int(d.get("hold_ms", det_dom.cfg.hold_ms))
-    det_dom.cfg.retrigger_s = int(d.get("retrigger_s", det_dom.cfg.retrigger_s))
-
-    # --- R11–R12 Spoofing: mapear bien los campos del YAML actual ---
-    sp = det.get("spoofing") or {}
-    per_side = sp.get("per_side") or {}
-    wall_global = sp.get("wall_size_btc")
-    wall_bid = (per_side.get("bid") or {}).get("wall_size_btc")
-    wall_ask = (per_side.get("ask") or {}).get("wall_size_btc")
-    wall_candidate = wall_global if wall_global is not None else (wall_bid if wall_bid is not None else wall_ask)
-    if wall_candidate is not None:
-        det_spoof.cfg.wall_size_btc = float(wall_candidate)
-
-    # distance_ticks_min: aceptar distance_ticks o distance_ticks_min
-    if "distance_ticks_min" in sp:
-        det_spoof.cfg.distance_ticks_min = int(sp["distance_ticks_min"])
-    elif "distance_ticks" in sp:
-        det_spoof.cfg.distance_ticks_min = int(sp["distance_ticks"])
-
-    # ventana de evaluación: window_s explícito o derivado de cancel_within_ms
-    if "window_s" in sp:
-        det_spoof.cfg.window_s = float(sp["window_s"])
-    elif "cancel_within_ms" in sp:
-        det_spoof.cfg.window_s = float(sp["cancel_within_ms"]) / 1000.0
-
-    # ratio de cancelación: usamos max_cancel_ratio como umbral
-    if "cancel_rate_min" in sp:
-        det_spoof.cfg.cancel_rate_min = float(sp["cancel_rate_min"])
-    elif "max_cancel_ratio" in sp:
-        det_spoof.cfg.cancel_rate_min = float(sp["max_cancel_ratio"])
-
-    # tolerancia de ejecución: explícita o derivada de min_exec_ratio * wall_size
-    if "exec_tolerance_btc" in sp:
-        det_spoof.cfg.exec_tolerance_btc = float(sp["exec_tolerance_btc"])
-    elif "min_exec_ratio" in sp and det_spoof.cfg.wall_size_btc is not None:
-        det_spoof.cfg.exec_tolerance_btc = float(sp["min_exec_ratio"]) * float(det_spoof.cfg.wall_size_btc)
-
-    det_spoof.cfg.tick_size = float(sp.get("tick_size", det_spoof.cfg.tick_size))
-
-    # --- R13–R14 Depletion masivo (por lado) ---
-    dep = det.get("depletion") or {}
-    enabled = dep.get("enabled")
-    if enabled is not None:
-        dep_bid_det.cfg.enabled = bool(enabled)
-        dep_ask_det.cfg.enabled = bool(enabled)
-
-    base_p = dep.get("pct_drop")
-    if base_p is not None:
-        dep_bid_det.cfg.pct_drop = float(base_p)
-        dep_ask_det.cfg.pct_drop = float(base_p)
-    if "pct_drop_bid" in dep:
-        dep_bid_det.cfg.pct_drop = float(dep["pct_drop_bid"])
-    if "pct_drop_ask" in dep:
-        dep_ask_det.cfg.pct_drop = float(dep["pct_drop_ask"])
-
-    # hold_ms: usar hold_ms directo; si no, aproximar desde window_s (segundos)
-    if "hold_ms" in dep:
-        hold_ms_val = int(dep["hold_ms"])
-        dep_bid_det.cfg.hold_ms = hold_ms_val
-        dep_ask_det.cfg.hold_ms = hold_ms_val
-    elif "window_s" in dep:
-        hold_ms_val = int(float(dep["window_s"]) * 1000.0)
-        dep_bid_det.cfg.hold_ms = hold_ms_val
-        dep_ask_det.cfg.hold_ms = hold_ms_val
-
-    # retrigger
-    if "retrigger_s" in dep:
-        dep_bid_det.cfg.retrigger_s = int(dep["retrigger_s"])
-        dep_ask_det.cfg.retrigger_s = int(dep["retrigger_s"])
-
-    # --- Basis config común (R15–R18) ---
-    basis_cfg = det.get("basis") or {}
-
-    # --- R15–R16 Basis extremo ---
-    bx = det.get("basis_extreme") or {}
-    thr_pos = basis_pos_trig.cfg.threshold
-    thr_neg = basis_neg_trig.cfg.threshold
-
-    # Preferimos detectors.basis.extreme_pos_bps / extreme_neg_bps
-    if "extreme_pos_bps" in basis_cfg:
-        try:
-            thr_pos = float(basis_cfg["extreme_pos_bps"])
-        except (TypeError, ValueError):
-            pass
-    elif "thr_bps" in bx:
-        try:
-            thr_pos = float(bx["thr_bps"])
-        except (TypeError, ValueError):
-            pass
-
-    if "extreme_neg_bps" in basis_cfg:
-        try:
-            thr_neg = float(basis_cfg["extreme_neg_bps"])
-        except (TypeError, ValueError):
-            pass
-    else:
-        # si no se define explícito, simétrico
-        thr_neg = -abs(thr_pos)
-
-    basis_pos_trig.cfg.threshold = thr_pos
-    basis_neg_trig.cfg.threshold = thr_neg
-
-    # --- R17–R18 Basis mean-revert ---
-    # Dos formas: bloque legacy basis_mr o claves dentro de basis.*
-    bmr = det.get("basis_mr") or {}
-    if bmr:
-        basis_mr.cfg.gate_abs_bps = float(bmr.get("gate_abs_bps", basis_mr.cfg.gate_abs_bps))
-        basis_mr.cfg.vel_gate_abs = float(bmr.get("vel_gate_abs", basis_mr.cfg.vel_gate_abs))
-        basis_mr.cfg.retrigger_s = int(bmr.get("retrigger_s", basis_mr.cfg.retrigger_s))
-    elif basis_cfg:
-        if "mr_cross_eps_bps" in basis_cfg:
-            try:
-                basis_mr.cfg.gate_abs_bps = float(basis_cfg["mr_cross_eps_bps"])
-            except (TypeError, ValueError):
-                pass
-        if "mr_vel_gate_abs" in basis_cfg:
-            try:
-                basis_mr.cfg.vel_gate_abs = float(basis_cfg["mr_vel_gate_abs"])
-            except (TypeError, ValueError):
-                pass
-        if "mr_hold_ms" in basis_cfg:
-            try:
-                basis_mr.cfg.retrigger_s = float(basis_cfg["mr_hold_ms"]) / 1000.0
-            except (TypeError, ValueError):
-                pass
-
-    # tape pressure (R23/R24 – extras)
-    tp = det.get("tape_pressure") or {}
-    tape_det.cfg.window_s = float(tp.get("window_s", tape_det.cfg.window_s))
-    tape_det.cfg.buy_thr = float(tp.get("buy_thr", tape_det.cfg.buy_thr))
-    tape_det.cfg.sell_thr = float(tp.get("sell_thr", tape_det.cfg.sell_thr))
-    tape_det.cfg.retrigger_s = int(tp.get("retrigger_s", tape_det.cfg.retrigger_s))
-
-    # Opciones (Deribit): IV spikes (R19/R20) + OI skew (R21/R22)
-    opt = det.get("options") or {}
-    iv_cfg = opt.get("iv_spike") or {}
-    oi_cfg = opt.get("oi_skew") or {}
-
-    if iv_cfg:
-        iv_det.cfg.window_s = float(iv_cfg.get("window_s", iv_det.cfg.window_s))
-        iv_det.cfg.up_thresh_pct = float(iv_cfg.get("up_pct", iv_det.cfg.up_thresh_pct))
-        iv_det.cfg.down_thresh_pct = float(iv_cfg.get("down_pct", iv_det.cfg.down_thresh_pct))
-        if "retrigger_s" in iv_cfg:
-            iv_det.cfg.retrigger_s = float(iv_cfg["retrigger_s"])
-
-    if oi_cfg:
-        min_calls = float(oi_cfg.get("min_calls", 0.0) or 0.0)
-        min_puts = float(oi_cfg.get("min_puts", 0.0) or 0.0)
-        min_total_candidate = min_calls + min_puts if (min_calls > 0.0 and min_puts > 0.0) else 0.0
-        if min_total_candidate > 0.0:
-            oi_skew_det.cfg.min_total_oi = min_total_candidate
-        oi_skew_det.cfg.bull_ratio_min = float(oi_cfg.get("bull_ratio", oi_skew_det.cfg.bull_ratio_min))
-        oi_skew_det.cfg.bear_ratio_min = float(oi_cfg.get("bear_ratio", oi_skew_det.cfg.bear_ratio_min))
-        if "retrigger_s" in oi_cfg:
-            oi_skew_det.cfg.retrigger_s = float(oi_cfg["retrigger_s"])
-
-    logger.info(
-        f"Rules hot-applied: slicing={s} absorption={a} bw={b} pass={p} dominance={d} "
-        f"spoof={sp} dep={dep} basis={basis_cfg} basis_extreme={bx} "
-        f"tape={tp} options_iv={iv_cfg} options_oi={oi_cfg}"
-    )
-
-
 # ----------------- Runner principal -----------------
 async def run_pipeline(
     db: DB,
@@ -1109,9 +861,6 @@ async def run_pipeline(
             symbol = getattr(cfg_obj.app, "symbol", symbol)
         except Exception:
             pass
-
-    engine = MetricsEngine(top_n=1000)
-    engine_lock = threading.Lock()
 
     cpu_sampler_task = asyncio.create_task(
         obs_metrics.cpu_sampler_loop(
@@ -1258,64 +1007,48 @@ async def run_pipeline(
         task.add_done_callback(_on_done)
         return task
 
-    # Detectores
-    det_slice_eq = SlicingAggDetector(SlicingAggConfig(require_equal=True, equal_tol_pct=0.0, equal_tol_abs=0.0))
-    det_slice_hit = SlicingAggDetector(SlicingAggConfig(require_equal=False))
-    det_pass = SlicingPassiveDetector(SlicingPassConfig())
-    det_abs = AbsorptionDetector(AbsorptionCfg())
-    det_bw = BreakWallDetector(BreakWallCfg())
-    det_dom = DominanceDetector(DominanceCfg(), book=engine.book)
-    det_spoof = SpoofingDetector(SpoofingCfg())
-    dep_bid_det = DepletionDetector(DepletionCfg(side="buy"))
-    dep_ask_det = DepletionDetector(DepletionCfg(side="sell"))
-    basis_pos_trig = MetricTriggerDetector(MetricTrigCfg(metric="basis_bps", threshold=100.0, direction="above"))
-    basis_neg_trig = MetricTriggerDetector(MetricTrigCfg(metric="basis_bps", threshold=-100.0, direction="below"))
-    basis_mr = BasisMeanRevertDetector(BasisMRcfg())
-    tape_det = TapePressureDetector(TapePressureCfg())
-    # Detectores Deribit opciones (R19–R22)
+    worker_rules = cfg_mgr.rules if cfg_mgr is not None else {}
+    worker = CPUWorkerClient(
+        rules=worker_rules,
+        instrument_id=BINANCE_FUT_INST,
+        profile=rules_profile,
+        service_name=service_name,
+        exported_service=exported_service,
+    )
+    await worker.start()
+
+    # Detectores Deribit opciones (R19–R22) – permanecen en proceso principal
     iv_det = IVSpikeDetector(IVSpikeCfg())
     oi_skew_det = OISkewDetector(OISkewCfg())
 
-    # Hot rules apply (y suscripción a cambios)
+    def _apply_options_rules(rules: Dict[str, Any]) -> None:
+        det = (rules or {}).get("detectors", {}) or {}
+        opt = det.get("options") or {}
+        iv_cfg = opt.get("iv_spike") or {}
+        oi_cfg = opt.get("oi_skew") or {}
+        if iv_cfg:
+            iv_det.cfg.window_s = float(iv_cfg.get("window_s", iv_det.cfg.window_s))
+            iv_det.cfg.up_thresh_pct = float(iv_cfg.get("up_pct", iv_det.cfg.up_thresh_pct))
+            iv_det.cfg.down_thresh_pct = float(iv_cfg.get("down_pct", iv_det.cfg.down_thresh_pct))
+            if "retrigger_s" in iv_cfg:
+                iv_det.cfg.retrigger_s = float(iv_cfg["retrigger_s"])
+        if oi_cfg:
+            min_calls = float(oi_cfg.get("min_calls", 0.0) or 0.0)
+            min_puts = float(oi_cfg.get("min_puts", 0.0) or 0.0)
+            min_total_candidate = min_calls + min_puts if (min_calls > 0.0 and min_puts > 0.0) else 0.0
+            if min_total_candidate > 0.0:
+                oi_skew_det.cfg.min_total_oi = min_total_candidate
+            oi_skew_det.cfg.bull_ratio_min = float(oi_cfg.get("bull_ratio", oi_skew_det.cfg.bull_ratio_min))
+            oi_skew_det.cfg.bear_ratio_min = float(oi_cfg.get("bear_ratio", oi_skew_det.cfg.bear_ratio_min))
+            if "retrigger_s" in oi_cfg:
+                oi_skew_det.cfg.retrigger_s = float(oi_cfg["retrigger_s"])
+
     if cfg_mgr is not None:
-        _apply_rules_to_detectors(
-            cfg_mgr.rules,
-            det_slice_eq,
-            det_slice_hit,
-            det_abs,
-            det_bw,
-            det_pass,
-            det_dom,
-            det_spoof,
-            dep_bid_det,
-            dep_ask_det,
-            basis_pos_trig,
-            basis_neg_trig,
-            basis_mr,
-            tape_det,
-            iv_det,
-            oi_skew_det,
-        )
+        _apply_options_rules(cfg_mgr.rules)
 
         async def _on_rules_change(new_rules: Dict[str, Any]) -> None:
-            _apply_rules_to_detectors(
-                new_rules,
-                det_slice_eq,
-                det_slice_hit,
-                det_abs,
-                det_bw,
-                det_pass,
-                det_dom,
-                det_spoof,
-                dep_bid_det,
-                dep_ask_det,
-                basis_pos_trig,
-                basis_neg_trig,
-                basis_mr,
-                tape_det,
-                iv_det,
-                oi_skew_det,
-            )
+            _apply_options_rules(new_rules)
+            await worker.update_rules(new_rules)
 
         cfg_mgr.subscribe_rules(_on_rules_change)
 
@@ -1361,10 +1094,11 @@ async def run_pipeline(
         async with aiohttp.ClientSession(timeout=timeout) as s:
             # Calentamos el book sólo hasta los mismos niveles que consumimos por WS
             bids, asks = await fetch_orderbook_snapshot(s, "BTCUSDT", depth=depth_levels)
+            warm_ts = time.time()
             for p, q in bids:
-                engine.book.apply("buy", "insert", p, q)
+                await worker.enqueue_depth(warm_ts, "buy", "insert", p, q)
             for p, q in asks:
-                engine.book.apply("sell", "insert", p, q)
+                await worker.enqueue_depth(warm_ts, "sell", "insert", p, q)
             logger.info(f"Initialized OB snapshot via REST (depth={depth_levels}).")
     except Exception as e:
         logger.warning(f"Failed to init OB snapshot: {e!s}")
@@ -1494,142 +1228,8 @@ async def run_pipeline(
     async def enqueue_telemetry_flush() -> None:
         await db_writer.submit("telemetry_flush", None)
 
-    def _process_depth_sync(
-        ts: float,
-        side: str,
-        action: str,
-        price: float,
-        qty_delta: float,
-    ) -> DepthProcessResult:
+    async def _handle_depth_result(res: DepthProcessResult) -> None:
         t0 = time.perf_counter()
-        with engine_lock:
-            engine.on_depth(ts, side, action, price, qty_delta)
-
-            passive_event: Optional[Event] = None
-            if action == "insert" and qty_delta > 0:
-                passive_event = det_pass.on_depth(ts, side, price, qty_delta)
-
-            bb, ba = engine.book.best()
-            book_qty = engine.book.bids.get(price) if side == "buy" else engine.book.asks.get(price)
-            spoof_qty = book_qty if book_qty is not None else qty_delta
-            spoof_event = det_spoof.on_depth(ts, side, action, price, spoof_qty, bb, ba)
-
-            return DepthProcessResult(passive_event=passive_event, spoof_event=spoof_event)
-        obs_metrics.alerts_engine_lock_seconds.labels(stage="depth").observe(time.perf_counter() - t0)
-
-    def _process_trade_sync(
-        ts: float,
-        side: str,
-        px: float,
-        qty: float,
-    ) -> TradeProcessResult:
-        t0 = time.perf_counter()
-        with engine_lock:
-            engine.on_trade(ts, side, px, qty)
-            det_spoof.on_trade(ts, side, px, qty)
-
-            ev1 = det_slice_eq.on_trade(ts, side, px, qty)
-            ev2 = det_slice_hit.on_trade(ts, side, px, qty)
-
-            bb, ba = engine.book.best()
-            det_abs.on_best(bb, ba)
-            ev_abs = det_abs.on_trade(ts, side, px, qty)
-
-            snap = engine.get_snapshot()
-            ev_tp = tape_det.on_trade(ts, side, px, qty)
-
-            return TradeProcessResult(
-                slice_equal=ev1,
-                slice_hit=ev2,
-                absorption=ev_abs,
-                tape_pressure=ev_tp,
-                snapshot=snap,
-            )
-        obs_metrics.alerts_engine_lock_seconds.labels(stage="trades").observe(time.perf_counter() - t0)
-
-    def _process_mark_sync(ev: MarkEvent) -> None:
-        t0 = time.perf_counter()
-        with engine_lock:
-            engine.on_mark(ev.ts, ev.mark_price, ev.index_price)
-        obs_metrics.alerts_engine_lock_seconds.labels(stage="mark").observe(time.perf_counter() - t0)
-
-    def _snapshot_sync():
-        t0 = time.perf_counter()
-        with engine_lock:
-            snap = engine.get_snapshot()
-        obs_metrics.alerts_engine_lock_seconds.labels(stage="snapshot").observe(time.perf_counter() - t0)
-        return snap
-
-    def _thread_task_labels(task: str) -> dict[str, str]:
-        return {"service": service_name, "exported_service": exported_service, "task": task}
-
-    def _wrap_thread_task(task: str, fn: Callable[..., Any]):
-        labels = _thread_task_labels(task)
-
-        def wrapped(*args, **kwargs):
-            wall_t0 = time.perf_counter()
-            try:
-                cpu_t0 = time.thread_time()
-            except Exception:
-                cpu_t0 = None
-
-            obs_metrics.to_thread_started_total.labels(**labels).inc()
-            obs_metrics.to_thread_queue_depth.labels(**labels).dec()
-            obs_metrics.to_thread_pending.labels(**labels).dec()
-            obs_metrics.to_thread_inflight.labels(**labels).inc()
-            try:
-                return fn(*args, **kwargs)
-            except Exception:
-                obs_metrics.to_thread_exceptions_total.labels(**labels).inc()
-                obs_metrics.alerts_uncaught_errors_total.labels(
-                    service=service_name, exported_service=exported_service, where="to_thread"
-                ).inc()
-                raise
-            finally:
-                wall = max(0.0, time.perf_counter() - wall_t0)
-                obs_metrics.to_thread_wall_seconds.labels(**labels).observe(wall)
-
-                cpu_dur: float | None = None
-                if cpu_t0 is not None:
-                    try:
-                        cpu_dur = max(0.0, time.thread_time() - cpu_t0)
-                        obs_metrics.to_thread_thread_cpu_seconds.labels(**labels).observe(cpu_dur)
-                    except Exception:
-                        cpu_dur = None
-
-                no_cpu = wall if cpu_dur is None else max(0.0, wall - cpu_dur)
-                obs_metrics.to_thread_no_cpu_seconds.labels(**labels).observe(no_cpu)
-
-                obs_metrics.to_thread_completed_total.labels(**labels).inc()
-                obs_metrics.to_thread_inflight.labels(**labels).dec()
-
-        return wrapped
-
-    async def _run_to_thread(task: str, fn: Callable[..., Any], *args, **kwargs):
-        labels = _thread_task_labels(task)
-        obs_metrics.to_thread_submitted_total.labels(**labels).inc()
-        obs_metrics.to_thread_queue_depth.labels(**labels).inc()
-        obs_metrics.to_thread_pending.labels(**labels).inc()
-        return await asyncio.to_thread(_wrap_thread_task(task, fn), *args, **kwargs)
-
-    async def process_depth_event(
-        ts: float,
-        side: str,
-        action: str,
-        price: float,
-        qty_delta: float,
-    ) -> None:
-        t0 = time.perf_counter()
-        res = await _run_to_thread(
-            "depth",
-            _process_depth_sync,
-            ts,
-            side,
-            action,
-            price,
-            qty_delta,
-        )
-
         if res.passive_event:
             await enqueue_slice(res.passive_event)
             for rule in eval_rules(_evdict(res.passive_event), ctx):
@@ -1655,22 +1255,8 @@ async def run_pipeline(
 
         obs_metrics.alerts_stage_duration_ms.labels(stage="depth").observe((time.perf_counter() - t0) * 1000)
 
-    async def process_trade_event(
-        ts: float,
-        side: str,
-        px: float,
-        qty: float,
-    ) -> None:
+    async def _handle_trade_result(res: TradeProcessResult) -> None:
         t0 = time.perf_counter()
-        res = await _run_to_thread(
-            "trade",
-            _process_trade_sync,
-            ts,
-            side,
-            px,
-            qty,
-        )
-
         for ev in filter(None, [res.slice_equal, res.slice_hit]):  # type: ignore
             await enqueue_slice(ev)
             for rule in eval_rules(_evdict(ev), ctx):
@@ -1697,31 +1283,30 @@ async def run_pipeline(
 
         snap = res.snapshot
         if res.slice_equal or res.slice_hit:
+            slice_ts = res.slice_equal.ts if res.slice_equal else res.slice_hit.ts  # type: ignore
+            slice_side = (res.slice_equal or res.slice_hit).side  # type: ignore
             if getattr(snap, "basis_vel_bps_s", None) is None:
-                telemetry.bump(ts, "R1/R2", (res.slice_equal or res.slice_hit).side, disc_metrics_none=1)
-            e2, gating_reason = det_bw.on_slicing(ts, res.slice_equal or res.slice_hit, snap)
-            if e2:
-                for rule in eval_rules(_evdict(e2), ctx):
-                    alert_id, ts_first_dt = await enqueue_rule(rule, e2.ts)
+                telemetry.bump(slice_ts, "R1/R2", slice_side, disc_metrics_none=1)
+            if res.break_wall_event:
+                for rule in eval_rules(_evdict(res.break_wall_event), ctx):
+                    alert_id, ts_first_dt = await enqueue_rule(rule, res.break_wall_event.ts)
                     if alert_id is not None:
-                        telemetry.bump(e2.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                        telemetry.bump(res.break_wall_event.ts, rule["rule"], rule.get("side", "na"), emitted=1)
                         text = (
-                            f"#{rule['rule']} {e2.side.upper()} break_wall @ {e2.price} | "
-                            f"k={e2.fields.get('k')}"
+                            f"#{rule['rule']} {res.break_wall_event.side.upper()} break_wall @ {res.break_wall_event.price} | "
+                            f"k={res.break_wall_event.fields.get('k')}"
                         )
                         await router.send("rules", text, alert_id=alert_id, ts_first=ts_first_dt)
-            elif gating_reason:
+            elif res.break_wall_gating:
                 reason_map = {
                     "basis_vel_low": {"disc_basis_vel_low": 1},
                     "dep_low": {"disc_dep_low": 1},
                     "refill_high": {"disc_refill_high": 1},
                     "top_levels_gate": {"disc_top_levels_gate": 1},
                 }
-                bump_kwargs = reason_map.get(gating_reason, {})
+                bump_kwargs = reason_map.get(res.break_wall_gating, {})
                 if bump_kwargs:
-                    telemetry.bump(
-                        ts, "R1/R2", (res.slice_equal or res.slice_hit).side, **bump_kwargs,
-                    )
+                    telemetry.bump(slice_ts, "R1/R2", slice_side, **bump_kwargs)
 
         if res.tape_pressure:
             for rule in eval_rules(_evdict(res.tape_pressure), ctx):
@@ -1736,31 +1321,25 @@ async def run_pipeline(
 
         obs_metrics.alerts_stage_duration_ms.labels(stage="trades").observe((time.perf_counter() - t0) * 1000)
 
-    async def process_snapshot_and_flush(now_ts: float) -> None:
-        snap = await _run_to_thread("snapshot", _snapshot_sync)
-
-        # Dominance (timer-based) con telemetría de descartes por spread
+    async def _handle_snapshot_result(res: SnapshotProcessResult) -> None:
+        snap = res.snapshot
+        now_ts = res.ts
         if getattr(snap, "spread_usd", None) is None:
             telemetry.bump(now_ts, "R9/R10", "na", disc_metrics_none=1)
-        elif float(snap.spread_usd or 0.0) > det_dom.cfg.max_spread_usd:
-            telemetry.bump(now_ts, "R9/R10", "na", disc_dom_spread=1)
+        elif res.dominance_event:
+            for rule in eval_rules(_evdict(res.dominance_event), ctx):
+                aid, t0_dt = await enqueue_rule(rule, res.dominance_event.ts)
+                if aid is not None:
+                    telemetry.bump(res.dominance_event.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                    text = (
+                        f"#{rule['rule']} {res.dominance_event.side.upper()} dominance {res.dominance_event.intensity:.1f}% "
+                        f"@ {res.dominance_event.price}"
+                    )
+                    await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
         else:
-            evd = det_dom.maybe_emit(now_ts, spread_usd=float(snap.spread_usd or 0.0))
-            if evd:
-                for rule in eval_rules(_evdict(evd), ctx):
-                    aid, t0_dt = await enqueue_rule(rule, evd.ts)
-                    if aid is not None:
-                        telemetry.bump(evd.ts, rule["rule"], rule.get("side", "na"), emitted=1)
-                        text = (
-                            f"#{rule['rule']} {evd.side.upper()} dominance {evd.intensity:.1f}% "
-                            f"@ {evd.price}"
-                        )
-                        await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
+            telemetry.bump(now_ts, "R9/R10", "na", disc_dom_spread=1)
 
-        # Depletion masivo (R13/R14)
-        ev_dep_bid = dep_bid_det.on_snapshot(now_ts, snap.__dict__ if hasattr(snap, "__dict__") else dict())
-        ev_dep_ask = dep_ask_det.on_snapshot(now_ts, snap.__dict__ if hasattr(snap, "__dict__") else dict())
-        for evd in [ev_dep_bid, ev_dep_ask]:
+        for evd in [res.dep_bid_event, res.dep_ask_event]:
             if evd:
                 for rule in eval_rules(_evdict(evd), ctx):
                     aid, t0_dt = await enqueue_rule(rule, evd.ts)
@@ -1769,13 +1348,10 @@ async def run_pipeline(
                         text = f"#{rule['rule']} {evd.side.upper()} depletion {evd.intensity:.2f}"
                         await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
 
-        # Basis extremos (R15/R16) a través de MetricTrigger
         if getattr(snap, "basis_bps", None) is None:
             telemetry.bump(now_ts, "R15/R16", "na", disc_metrics_none=1)
         else:
-            ev_bpos = basis_pos_trig.on_snapshot(now_ts, snap.__dict__ if hasattr(snap, "__dict__") else dict())
-            ev_bneg = basis_neg_trig.on_snapshot(now_ts, snap.__dict__ if hasattr(snap, "__dict__") else dict())
-            for evb in [ev_bpos, ev_bneg]:
+            for evb in [res.basis_pos_event, res.basis_neg_event]:
                 if evb:
                     for rule in eval_rules(_evdict(evb), ctx):
                         aid, t0_dt = await enqueue_rule(rule, evb.ts)
@@ -1784,45 +1360,29 @@ async def run_pipeline(
                             text = f"#{rule['rule']} basis_bps={evb.intensity:.1f}"
                             await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
 
-        # Basis mean-revert (R17/R18)
         if getattr(snap, "basis_bps", None) is None or getattr(snap, "basis_vel_bps_s", None) is None:
             telemetry.bump(now_ts, "R17/R18", "na", disc_metrics_none=1)
-        else:
-            ev_mr = basis_mr.on_snapshot(now_ts, snap.__dict__ if hasattr(snap, "__dict__") else dict())
-            if ev_mr:
-                for rule in eval_rules(_evdict(ev_mr), ctx):
-                    aid, t0_dt = await enqueue_rule(rule, ev_mr.ts)
-                    if aid is not None:
-                        telemetry.bump(ev_mr.ts, rule["rule"], rule.get("side", "na"), emitted=1)
-                        text = (
-                            f"#{rule['rule']} basis_mean_revert {ev_mr.side.upper()} | "
-                            f"vel={ev_mr.intensity:.2f} bps/s"
-                        )
-                        await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
+        elif res.basis_mr_event:
+            for rule in eval_rules(_evdict(res.basis_mr_event), ctx):
+                aid, t0_dt = await enqueue_rule(rule, res.basis_mr_event.ts)
+                if aid is not None:
+                    telemetry.bump(res.basis_mr_event.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+                    text = (
+                        f"#{rule['rule']} basis_mean_revert {res.basis_mr_event.side.upper()} | "
+                        f"vel={res.basis_mr_event.intensity:.2f} bps/s"
+                    )
+                    await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
 
-        now_dt = dt.datetime.fromtimestamp(now_ts, tz=dt.timezone.utc)
-        rows: List[Tuple[str, dt.datetime, int, str, float, Optional[str], str]] = []
-
-        def add(name: str, val):
-            if val is None:
-                return
-            if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
-                return
-            rows.append((BINANCE_FUT_INST, now_dt, 1, name, float(val), ctx.profile, "{}"))
-
-        add("spread_usd", getattr(snap, "spread_usd", None))
-        add("basis_bps", getattr(snap, "basis_bps", None))
-        add("basis_vel_bps_s", getattr(snap, "basis_vel_bps_s", None))
-        add("dom_bid", getattr(snap, "dom_bid", None))
-        add("dom_ask", getattr(snap, "dom_ask", None))
-        add("imbalance", getattr(snap, "imbalance", None))
-        add("dep_bid", getattr(snap, "dep_bid", None))
-        add("dep_ask", getattr(snap, "dep_ask", None))
-        add("refill_bid_3s", getattr(snap, "refill_bid_3s", None))
-        add("refill_ask_3s", getattr(snap, "refill_ask_3s", None))
-
-        await enqueue_metrics(rows)
+        await enqueue_metrics(res.metric_rows)
         await enqueue_telemetry_flush()
+
+    async def _dispatch_worker_result(res: WorkerResult) -> None:
+        if res.kind == "depth" and isinstance(res.payload, DepthProcessResult):
+            await _handle_depth_result(res.payload)
+        elif res.kind == "trade" and isinstance(res.payload, TradeProcessResult):
+            await _handle_trade_result(res.payload)
+        elif res.kind == "snapshot" and isinstance(res.payload, SnapshotProcessResult):
+            await _handle_snapshot_result(res.payload)
 
     queue_stale_after = {"trade": 2.0, "depth": 2.0, "mark": 1.0}
     batch_conf = {
@@ -1845,9 +1405,14 @@ async def run_pipeline(
     async def _snapshot_loop(stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
             t0 = time.perf_counter()
-            await process_snapshot_and_flush(time.time())
+            await worker.enqueue_snapshot(time.time())
             obs_metrics.alerts_snapshot_duration_seconds.observe(time.perf_counter() - t0)
             await asyncio.sleep(0.05)
+
+    async def _worker_results_loop(stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            res = await worker.get_result()
+            await _dispatch_worker_result(res)
 
     async def _process_stream_batch(
         reader: WsReader,
@@ -1908,13 +1473,13 @@ async def run_pipeline(
         stop_event = asyncio.Event()
 
         async def trade_handler(ev: TradeEvent) -> None:
-            await process_trade_event(ev.ts, ev.side, ev.price, ev.qty)
+            await worker.enqueue_trade(ev.ts, ev.side, ev.price, ev.qty)
 
         async def depth_handler(ev: DepthEvent) -> None:
-            await process_depth_event(ev.ts, ev.side, ev.action, ev.price, ev.qty)
+            await worker.enqueue_depth(ev.ts, ev.side, ev.action, ev.price, ev.qty)
 
         async def mark_handler(ev: MarkEvent) -> None:
-            await _run_to_thread("mark_ws", _process_mark_sync, ev)
+            await worker.enqueue_mark(ev.ts, ev.mark_price, ev.index_price)
 
         async def process_trades() -> None:
             await _process_stream_batch(ws_reader, "trade", trade_handler, stop_event, worker_name="trades")
@@ -1964,6 +1529,10 @@ async def run_pipeline(
                 asyncio.create_task(_snapshot_loop(stop_event), name="alerts-snapshot-loop"),
                 label="snapshot_loop",
             ),
+            _attach_task_monitor(
+                asyncio.create_task(_worker_results_loop(stop_event), name="alerts-worker-results"),
+                label="worker_results",
+            ),
         ]
 
         try:
@@ -1998,13 +1567,17 @@ async def run_pipeline(
             asyncio.create_task(_snapshot_loop(stop_event), name="alerts-snapshot-loop"),
             label="snapshot_loop",
         )
+        worker_results_task = _attach_task_monitor(
+            asyncio.create_task(_worker_results_loop(stop_event), name="alerts-worker-results"),
+            label="worker_results",
+        )
         try:
             while True:
                 # 1) depth -> book & métricas + slicing pasivo + spoofing
                 # Paginación por ID (seq)
                 for idx, r in enumerate(await tail_depth.fetch_new(BINANCE_FUT_INST, limit=5000)):
                     await _yield_if_needed("depth", idx, every=50)
-                    await process_depth_event(
+                    await worker.enqueue_depth(
                         r["event_time"].timestamp(),
                         r["side"],
                         r["action"],
@@ -2017,14 +1590,10 @@ async def run_pipeline(
                 # Paginación por Tiempo (legacy para mark)
                 for idx, r in enumerate(await tail_mark.fetch_new(BINANCE_FUT_INST, limit=1000)):
                     await _yield_if_needed("mark", idx, every=50)
-                    await _run_to_thread(
-                        "mark_db",
-                        _process_mark_sync,
-                        MarkEvent(
-                            ts=r["event_time"].timestamp(),
-                            mark_price=float(r.get("mark_price") or 0) or None,
-                            index_price=float(r.get("index_price") or 0) or None,
-                        ),
+                    await worker.enqueue_mark(
+                        r["event_time"].timestamp(),
+                        float(r.get("mark_price") or 0) or None,
+                        float(r.get("index_price") or 0) or None,
                     )
                     obs_metrics.alerts_stage_rows_total.labels(stage="mark", worker="main").inc()
 
@@ -2032,7 +1601,7 @@ async def run_pipeline(
                 # Paginación por ID (trade_id_ext)
                 for idx, r in enumerate(await tail_trades.fetch_new(BINANCE_FUT_INST, limit=5000)):
                     await _yield_if_needed("trades", idx, every=50)
-                    await process_trade_event(
+                    await worker.enqueue_trade(
                         r["event_time"].timestamp(),
                         r["side"],
                         float(r["price"]),
@@ -2040,15 +1609,13 @@ async def run_pipeline(
                     )
                     obs_metrics.alerts_stage_rows_total.labels(stage="trades", worker="main").inc()
 
-                ts_now = dt.datetime.now(dt.timezone.utc).timestamp()
-                await process_snapshot_and_flush(ts_now)
-
                 await asyncio.sleep(0.05)  # 50ms cadence
         finally:
             stop_event.set()
             options_task.cancel()
             snapshot_task.cancel()
-            await asyncio.gather(options_task, snapshot_task, return_exceptions=True)
+            worker_results_task.cancel()
+            await asyncio.gather(options_task, snapshot_task, worker_results_task, return_exceptions=True)
     except Exception:
         obs_metrics.alerts_uncaught_errors_total.labels(
             service=service_name, exported_service=exported_service, where="main_loop"
@@ -2060,4 +1627,5 @@ async def run_pipeline(
             task.cancel()
         if background_tasks:
             await asyncio.gather(*background_tasks, return_exceptions=True)
+        await worker.stop()
         await db_writer.stop()
