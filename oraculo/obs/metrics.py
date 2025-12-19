@@ -207,6 +207,26 @@ threads_active = Gauge(
     "Active thread count",
     ["service", "exported_service"],
 )
+threads_alive = Gauge(
+    "oraculo_threads_alive",
+    "Number of alive Python threads (threading.active_count())",
+    ["service", "exported_service"],
+)
+cpu_process_cores = Gauge(
+    "oraculo_cpu_process_cores",
+    "Effective CPU cores used by the process (delta_cpu/delta_wall)",
+    ["service", "exported_service"],
+)
+cpu_main_thread_cores = Gauge(
+    "oraculo_cpu_main_thread_cores",
+    "Effective CPU cores used by the main thread (delta_thread_cpu/delta_wall)",
+    ["service", "exported_service"],
+)
+cpu_main_thread_share = Gauge(
+    "oraculo_cpu_main_thread_share",
+    "Main-thread CPU share over process CPU (delta_thread_cpu/delta_process_cpu)",
+    ["service", "exported_service"],
+)
 
 to_thread_submitted_total = Counter(
     "oraculo_to_thread_submitted_total",
@@ -249,6 +269,11 @@ to_thread_inflight = Gauge(
 to_thread_queue_depth = Gauge(
     "oraculo_to_thread_queue_depth",
     "Queued asyncio.to_thread tasks pending worker execution",
+    ["service", "exported_service", "task"],
+)
+to_thread_pending = Gauge(
+    "oraculo_to_thread_pending",
+    "asyncio.to_thread tasks submitted but not yet started",
     ["service", "exported_service", "task"],
 )
 to_thread_exceptions_total = Counter(
@@ -314,6 +339,11 @@ event_loop_lag_seconds = Gauge(
     "Asyncio event-loop lag in seconds (timer drift). Indicates event loop starvation/blocking.",
     ["service"],
 )
+alerts_uncaught_errors_total = Counter(
+    "oraculo_alerts_uncaught_errors_total",
+    "Uncaught errors in alerts service components",
+    ["service", "exported_service", "where"],
+)
 
 # Mantener una tarea por servicio para evitar monitores duplicados
 _loop_lag_tasks: Dict[str, asyncio.Task] = {}
@@ -376,11 +406,16 @@ async def cpu_sampler_loop(
       - oraculo_cpu_available_cores{service,exported_service}
       - oraculo_python_thread_count{service,exported_service}
       - oraculo_threads_active{service,exported_service}
+      - oraculo_cpu_process_cores{service,exported_service}
+      - oraculo_cpu_main_thread_cores{service,exported_service}
+      - oraculo_cpu_main_thread_share{service,exported_service}
+      - oraculo_threads_alive{service,exported_service}
 
     Must run in the main event-loop thread to make main-thread cpu meaningful.
     """
 
     labels = {"service": service, "exported_service": exported_service or service}
+    last_wall = time.perf_counter()
     prev_proc = time.process_time()
     try:
         thread_time_fn = time.thread_time
@@ -396,19 +431,36 @@ async def cpu_sampler_loop(
     while True:
         await asyncio.sleep(interval_s)
 
+        wall_now = time.perf_counter()
         proc_now = time.process_time()
-        proc_delta = max(0.0, proc_now - prev_proc)
-        cpu_process_seconds_total.labels(**labels).inc(proc_delta)
-        prev_proc = proc_now
-
         thread_now = thread_time_fn()
-        thread_delta = max(0.0, thread_now - prev_thread)
-        cpu_main_thread_seconds_total.labels(**labels).inc(thread_delta)
+
+        dt_wall = wall_now - last_wall
+        proc_delta = proc_now - prev_proc
+        thread_delta = thread_now - prev_thread
+
+        last_wall = wall_now
+        prev_proc = proc_now
         prev_thread = thread_now
+
+        if dt_wall <= 0 or proc_delta < 0 or thread_delta < 0:
+            continue
+
+        cpu_process_seconds_total.labels(**labels).inc(proc_delta)
+        cpu_main_thread_seconds_total.labels(**labels).inc(thread_delta)
+
+        proc_cores = proc_delta / dt_wall
+        thread_cores = thread_delta / dt_wall
+        share = (thread_delta / proc_delta) if proc_delta > 0 else 0.0
+
+        cpu_process_cores.labels(**labels).set(proc_cores)
+        cpu_main_thread_cores.labels(**labels).set(thread_cores)
+        cpu_main_thread_share.labels(**labels).set(share)
 
         active_threads = threading.active_count()
         python_thread_count.labels(**labels).set(active_threads)
         threads_active.labels(**labels).set(active_threads)
+        threads_alive.labels(**labels).set(active_threads)
 
 
 async def start_cpu_monitors(service: str, interval_s: float = 1.0) -> None:

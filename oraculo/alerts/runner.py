@@ -421,6 +421,8 @@ class DBWriter:
         flush_interval: float = 0.05,
         max_batch: int = 200,
         max_queue: int = 10_000,
+        service_name: str = "alerts",
+        exported_service: str | None = None,
     ) -> None:
         self.db = db
         self.telemetry = telemetry
@@ -431,6 +433,12 @@ class DBWriter:
         self.queue: asyncio.Queue[DBRequest] = asyncio.Queue(maxsize=max_queue)
         self._task: Optional[asyncio.Task] = None
         self._running = False
+        self.service_name = service_name
+        self.exported_service = exported_service or service_name
+        self._metric_labels: dict[str, str] = {
+            "service": self.service_name,
+            "exported_service": self.exported_service,
+        }
 
     async def start(self) -> None:
         if self._running:
@@ -471,6 +479,11 @@ class DBWriter:
                 await self._process_batch(batch)
         except asyncio.CancelledError:
             pass
+        except Exception:
+            obs_metrics.alerts_uncaught_errors_total.labels(
+                **self._error_labels("db_writer_loop")
+            ).inc()
+            logger.exception("[db-writer] loop crashed")
 
     async def _drain_batch(self) -> list[DBRequest]:
         batch: list[DBRequest] = []
@@ -551,6 +564,11 @@ class DBWriter:
                     logger.error(f"[db-writer] upsert_rule failed: {e!s}")
                     if req.future and not req.future.done():
                         req.future.set_exception(e)
+        except Exception:
+            obs_metrics.alerts_uncaught_errors_total.labels(
+                **self._error_labels("db_flush")
+            ).inc()
+            logger.exception("[db-writer] batch processing failed")
         finally:
             obs_metrics.alerts_db_inflight_batches.dec()
 
@@ -645,6 +663,9 @@ class DBWriter:
             return None, None
         finally:
             obs_metrics.db_upsert_rule_alert_ms.observe((time.perf_counter() - t0) * 1000)
+
+    def _error_labels(self, where: str) -> dict[str, str]:
+        return {**self._metric_labels, "where": where}
 
 
 async def fetch_orderbook_snapshot(
@@ -1171,6 +1192,8 @@ async def run_pipeline(
         flush_interval=0.05,
         max_batch=200,
         max_queue=20_000,
+        service_name=service_name,
+        exported_service=exported_service,
     )
 
     # --- DB Tails configurados por ID ---
@@ -1410,11 +1433,15 @@ async def run_pipeline(
 
             obs_metrics.to_thread_started_total.labels(**labels).inc()
             obs_metrics.to_thread_queue_depth.labels(**labels).dec()
+            obs_metrics.to_thread_pending.labels(**labels).dec()
             obs_metrics.to_thread_inflight.labels(**labels).inc()
             try:
                 return fn(*args, **kwargs)
             except Exception:
                 obs_metrics.to_thread_exceptions_total.labels(**labels).inc()
+                obs_metrics.alerts_uncaught_errors_total.labels(
+                    service=service_name, exported_service=exported_service, where="to_thread"
+                ).inc()
                 raise
             finally:
                 wall = max(0.0, time.perf_counter() - wall_t0)
@@ -1440,6 +1467,7 @@ async def run_pipeline(
         labels = _thread_task_labels(task)
         obs_metrics.to_thread_submitted_total.labels(**labels).inc()
         obs_metrics.to_thread_queue_depth.labels(**labels).inc()
+        obs_metrics.to_thread_pending.labels(**labels).inc()
         return await asyncio.to_thread(_wrap_thread_task(task, fn), *args, **kwargs)
 
     async def process_depth_event(
@@ -1782,6 +1810,12 @@ async def run_pipeline(
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             pass
+        except Exception:
+            obs_metrics.alerts_uncaught_errors_total.labels(
+                service=service_name, exported_service=exported_service, where="ws_pipeline"
+            ).inc()
+            logger.exception("[alerts] ws pipeline crashed")
+            raise
         finally:
             stop_event.set()
             for task in tasks:
@@ -1849,6 +1883,12 @@ async def run_pipeline(
             options_task.cancel()
             snapshot_task.cancel()
             await asyncio.gather(options_task, snapshot_task, return_exceptions=True)
+    except Exception:
+        obs_metrics.alerts_uncaught_errors_total.labels(
+            service=service_name, exported_service=exported_service, where="main_loop"
+        ).inc()
+        logger.exception("[alerts] pipeline crashed")
+        raise
     finally:
         if cpu_sampler_task is not None:
             cpu_sampler_task.cancel()
