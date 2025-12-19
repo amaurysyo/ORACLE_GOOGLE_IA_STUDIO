@@ -69,3 +69,23 @@ Este plan prioriza cambios en código y pruebas de carga para reducir el **event
 - Dashboard/alerta nueva en Grafana: event-loop lag, queue depth, stale drops, p95 de colas.
 
 Este plan es incremental: después de cada fase, correr el load test y validar KPIs antes de avanzar.
+
+## 5. PromQL para confirmar CPU-bound/GIL y correlación con lag
+
+- **Confirmar saturación single-core:**
+  - `avg_over_time(oraculo_cpu_process_cores{service="alerts"}[5m])`
+  - Esperado: >0.9 si el proceso está al 100 % de 1 core.
+- **Detectar contención de GIL con varios hilos:**
+  - `oraculo_threads_total{service="alerts"}` (debe ser >=5 para sospechar GIL).
+  - `sum(rate(oraculo_thread_cpu_seconds{service="alerts"}[1m]))` ≈ 1.0 cores indica contención.
+  - `topk(10, rate(oraculo_thread_cpu_seconds{service="alerts"}[1m]))` para ver reparto por hilo (thread_name/native_id).
+- **Diferenciar single-thread vs GIL contention:**
+  - Si un solo hilo tiene ~1.0 core y el resto ~0: diseño single-thread/hotspot único.
+  - Si 3–10 hilos aportan CPU>0 pero la suma no pasa de ~1.0: contención del GIL muy probable.
+- **Correlacionar con lag y ejecutor:**
+  - `oraculo_event_loop_lag_seconds{service="alerts"}` frente a `oraculo_to_thread_executor_queue_depth{service="alerts"}`.
+  - `oraculo_to_thread_executor_threads{service="alerts"}` vs `oraculo_to_thread_executor_max_workers{service="alerts"}` para ver saturación.
+  - `increase(oraculo_event_loop_lag_spikes_total{service="alerts",threshold=~"0.5|2.0|10.0"}[15m])` para ver frecuencia de spikes.
+- **Errores y dumps automáticos:**
+  - `increase(oraculo_task_exceptions_total{service="alerts"}[15m])` y `oraculo_last_exception_timestamp_seconds{service="alerts"}` para ubicar fallos.
+  - `increase(oraculo_dumps_total{service="alerts",reason="event_loop_lag"}[1h])` para confirmar que se emitieron stacks durante lag alto.

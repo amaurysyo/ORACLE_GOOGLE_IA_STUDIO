@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import faulthandler
+import io
 import json
 import math
 import os
@@ -1093,6 +1095,8 @@ async def run_pipeline(
     symbol = "BTCUSDT"
     service_name = "alerts"
     exported_service = os.getenv("ORACULO_EXPORTED_SERVICE", service_name)
+    background_tasks: list[asyncio.Task] = []
+    loop = asyncio.get_running_loop()
     cpu_sampler_task: asyncio.Task | None = None
     if cfg_mgr is not None and getattr(cfg_mgr, "cfg", None) is not None:
         try:
@@ -1115,6 +1119,144 @@ async def run_pipeline(
         ),
         name="alerts-cpu-monitor",
     )
+    background_tasks.append(cpu_sampler_task)
+
+    background_tasks.append(
+        asyncio.create_task(
+            obs_metrics.thread_metrics_sampler(
+                service=service_name, exported_service=exported_service, interval_s=2.5
+            ),
+            name="alerts-thread-metrics",
+        )
+    )
+    background_tasks.append(
+        asyncio.create_task(
+            obs_metrics.executor_sampler_loop(
+                service=service_name, exported_service=exported_service, interval_s=1.0
+            ),
+            name="alerts-executor-metrics",
+        )
+    )
+
+    def _default_executor_queue_depth() -> int:
+        executor = getattr(loop, "_default_executor", None)
+        if executor is None:
+            return 0
+        queue = getattr(executor, "_work_queue", None)
+        if queue is None:
+            return 0
+        try:
+            return int(queue.qsize())
+        except Exception:
+            return 0
+
+    lag_spike_thresholds = (0.5, 2.0, 10.0)
+    lag_dump_threshold = 2.0
+    lag_consecutive_required = 3
+    executor_queue_dump_threshold = 50
+    dump_cooldown_s = 30.0
+    consecutive_high_lag = 0
+    last_dump_ts = 0.0
+    last_wall = time.perf_counter()
+    prev_proc_cpu = time.process_time()
+    try:
+        prev_thread_cpu = time.thread_time()
+    except Exception:
+        prev_thread_cpu = prev_proc_cpu
+
+    def _emit_watchdog_dump(reason: str, lag: float, queue_depth: int, proc_cores: float, main_share: float, threads_total: int) -> None:
+        buf = io.StringIO()
+        try:
+            faulthandler.dump_traceback(file=buf, all_threads=True)
+            dump_txt = buf.getvalue()
+        except Exception as exc:  # pragma: no cover - best effort
+            dump_txt = f"failed to capture dump: {exc!s}"
+        finally:
+            try:
+                buf.close()
+            except Exception:
+                pass
+
+        obs_metrics.dumps_total.labels(service=service_name, reason=reason).inc()
+        logger.warning(
+            "[alerts][watchdog] dump reason=%s lag=%.3f queue_depth=%s proc_cores=%.3f main_thread_share=%.3f threads_total=%s\n%s",
+            reason,
+            lag,
+            queue_depth,
+            proc_cores,
+            main_share,
+            threads_total,
+            dump_txt,
+        )
+
+    def _on_lag_sample(lag: float) -> None:
+        nonlocal consecutive_high_lag, last_dump_ts, last_wall, prev_proc_cpu, prev_thread_cpu
+
+        wall_now = time.perf_counter()
+        proc_now = time.process_time()
+        try:
+            thread_now = time.thread_time()
+        except Exception:
+            thread_now = proc_now
+
+        dt_wall = wall_now - last_wall
+        proc_delta = proc_now - prev_proc_cpu
+        thread_delta = thread_now - prev_thread_cpu
+
+        last_wall = wall_now
+        prev_proc_cpu = proc_now
+        prev_thread_cpu = thread_now
+
+        proc_cores = proc_delta / dt_wall if dt_wall > 0 else 0.0
+        main_share = (thread_delta / proc_delta) if proc_delta > 0 else 0.0
+        queue_depth = _default_executor_queue_depth()
+        threads_total = threading.active_count()
+
+        reason: str | None = None
+        if lag >= lag_dump_threshold:
+            consecutive_high_lag += 1
+            if consecutive_high_lag >= lag_consecutive_required:
+                reason = "event_loop_lag"
+        else:
+            consecutive_high_lag = 0
+
+        if queue_depth >= executor_queue_dump_threshold:
+            reason = reason or "executor_queue"
+
+        if reason is None:
+            return
+
+        now_ts = time.time()
+        if now_ts - last_dump_ts < dump_cooldown_s:
+            return
+
+        last_dump_ts = now_ts
+        _emit_watchdog_dump(
+            reason=reason,
+            lag=lag,
+            queue_depth=queue_depth,
+            proc_cores=proc_cores,
+            main_share=main_share,
+            threads_total=threads_total,
+        )
+
+    lag_monitor_task = obs_metrics.start_event_loop_lag_monitor(
+        service=service_name, period=1.0, thresholds=lag_spike_thresholds, on_lag=_on_lag_sample
+    )
+    if lag_monitor_task is not None:
+        background_tasks.append(lag_monitor_task)
+
+    def _attach_task_monitor(task: asyncio.Task, label: str) -> asyncio.Task:
+        def _on_done(t: asyncio.Task) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                obs_metrics.record_task_exception(service_name, exported_service, label, exc)
+                logger.exception("[alerts] task %s crashed", label, exc_info=exc)
+
+        task.add_done_callback(_on_done)
+        return task
 
     # Detectores
     det_slice_eq = SlicingAggDetector(SlicingAggConfig(require_equal=True, equal_tol_pct=0.0, equal_tol_abs=0.0))
@@ -1786,24 +1928,42 @@ async def run_pipeline(
             await _process_stream_batch(ws_reader, "mark", mark_handler, stop_event, worker_name="mark")
 
         tasks = [
-            asyncio.create_task(
-                process_trades(),
-                name="alerts-trade-worker",
+            _attach_task_monitor(
+                asyncio.create_task(
+                    process_trades(),
+                    name="alerts-trade-worker",
+                ),
+                label="ws_trade_worker",
             ),
-            asyncio.create_task(
-                process_depth("depth-0"),
-                name="alerts-depth-worker-0",
+            _attach_task_monitor(
+                asyncio.create_task(
+                    process_depth("depth-0"),
+                    name="alerts-depth-worker-0",
+                ),
+                label="ws_depth_worker_0",
             ),
-            asyncio.create_task(
-                process_depth("depth-1"),
-                name="alerts-depth-worker-1",
+            _attach_task_monitor(
+                asyncio.create_task(
+                    process_depth("depth-1"),
+                    name="alerts-depth-worker-1",
+                ),
+                label="ws_depth_worker_1",
             ),
-            asyncio.create_task(
-                process_mark(),
-                name="alerts-mark-worker",
+            _attach_task_monitor(
+                asyncio.create_task(
+                    process_mark(),
+                    name="alerts-mark-worker",
+                ),
+                label="ws_mark_worker",
             ),
-            asyncio.create_task(_options_poller(stop_event), name="alerts-options-poller"),
-            asyncio.create_task(_snapshot_loop(stop_event), name="alerts-snapshot-loop"),
+            _attach_task_monitor(
+                asyncio.create_task(_options_poller(stop_event), name="alerts-options-poller"),
+                label="options_poller",
+            ),
+            _attach_task_monitor(
+                asyncio.create_task(_snapshot_loop(stop_event), name="alerts-snapshot-loop"),
+                label="snapshot_loop",
+            ),
         ]
 
         try:
@@ -1830,8 +1990,14 @@ async def run_pipeline(
 
         # ------------------- bucle principal -------------------
         stop_event = asyncio.Event()
-        options_task = asyncio.create_task(_options_poller(stop_event), name="alerts-options-poller")
-        snapshot_task = asyncio.create_task(_snapshot_loop(stop_event), name="alerts-snapshot-loop")
+        options_task = _attach_task_monitor(
+            asyncio.create_task(_options_poller(stop_event), name="alerts-options-poller"),
+            label="options_poller",
+        )
+        snapshot_task = _attach_task_monitor(
+            asyncio.create_task(_snapshot_loop(stop_event), name="alerts-snapshot-loop"),
+            label="snapshot_loop",
+        )
         try:
             while True:
                 # 1) depth -> book & métricas + slicing pasivo + spoofing
@@ -1890,7 +2056,8 @@ async def run_pipeline(
         logger.exception("[alerts] pipeline crashed")
         raise
     finally:
-        if cpu_sampler_task is not None:
-            cpu_sampler_task.cancel()
-            await asyncio.gather(cpu_sampler_task, return_exceptions=True)
+        for task in background_tasks:
+            task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
         await db_writer.stop()

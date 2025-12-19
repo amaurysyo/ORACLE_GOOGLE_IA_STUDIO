@@ -14,7 +14,12 @@ import asyncio
 import os
 import threading
 import time
-from typing import Dict
+from typing import Callable, Dict, Optional, Sequence
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover - dependencia opcional en runtime
+    psutil = None
 
 from loguru import logger
 from prometheus_client import Counter, Gauge, Summary, start_http_server, Histogram
@@ -212,6 +217,16 @@ threads_alive = Gauge(
     "Number of alive Python threads (threading.active_count())",
     ["service", "exported_service"],
 )
+threads_total = Gauge(
+    "oraculo_threads_total",
+    "Total threads in the process (threading.enumerate)",
+    ["service", "exported_service"],
+)
+thread_cpu_seconds = Gauge(
+    "oraculo_thread_cpu_seconds",
+    "Cumulative CPU time per thread (user+system, seconds)",
+    ["service", "exported_service", "thread_name", "native_id"],
+)
 cpu_process_cores = Gauge(
     "oraculo_cpu_process_cores",
     "Effective CPU cores used by the process (delta_cpu/delta_wall)",
@@ -281,6 +296,21 @@ to_thread_exceptions_total = Counter(
     "Exceptions raised by asyncio.to_thread tasks",
     ["service", "exported_service", "task"],
 )
+to_thread_executor_max_workers = Gauge(
+    "oraculo_to_thread_executor_max_workers",
+    "Max workers configured for asyncio default ThreadPoolExecutor",
+    ["service", "exported_service"],
+)
+to_thread_executor_threads = Gauge(
+    "oraculo_to_thread_executor_threads",
+    "Threads created by asyncio default ThreadPoolExecutor",
+    ["service", "exported_service"],
+)
+to_thread_executor_queue_depth = Gauge(
+    "oraculo_to_thread_executor_queue_depth",
+    "Pending items in asyncio default ThreadPoolExecutor work queue",
+    ["service", "exported_service"],
+)
 
 # ---------- Rules ----------
 rule_eval_total = Counter("oraculo_rule_eval_total", "Rule evaluations", ["rule"])
@@ -339,19 +369,51 @@ event_loop_lag_seconds = Gauge(
     "Asyncio event-loop lag in seconds (timer drift). Indicates event loop starvation/blocking.",
     ["service"],
 )
+event_loop_lag_spikes_total = Counter(
+    "oraculo_event_loop_lag_spikes_total",
+    "Event-loop lag spikes over configured thresholds",
+    ["service", "threshold"],
+)
 alerts_uncaught_errors_total = Counter(
     "oraculo_alerts_uncaught_errors_total",
     "Uncaught errors in alerts service components",
     ["service", "exported_service", "where"],
+)
+task_exceptions_total = Counter(
+    "oraculo_task_exceptions_total",
+    "Asyncio task exceptions by task label and exception type",
+    ["service", "exported_service", "task", "exc"],
+)
+last_exception_timestamp_seconds = Gauge(
+    "oraculo_last_exception_timestamp_seconds",
+    "Wall-clock timestamp of the last observed exception per task/exception type",
+    ["service", "exported_service", "task", "exc"],
+)
+dumps_total = Counter(
+    "oraculo_dumps_total",
+    "Thread dumps triggered by watchdogs",
+    ["service", "reason"],
 )
 
 # Mantener una tarea por servicio para evitar monitores duplicados
 _loop_lag_tasks: Dict[str, asyncio.Task] = {}
 
 
-async def _monitor_event_loop_lag(service: str, period: float = 1.0) -> None:
+async def _monitor_event_loop_lag(
+    service: str,
+    period: float = 1.0,
+    *,
+    thresholds: Optional[Sequence[float]] = None,
+    on_lag: Optional[Callable[[float], None]] = None,
+) -> None:
     loop = asyncio.get_running_loop()
     expected = loop.time() + period
+    thr_tuple: tuple[float, ...] = ()
+    if thresholds:
+        try:
+            thr_tuple = tuple(sorted({float(x) for x in thresholds}))
+        except Exception:
+            thr_tuple = ()
     while True:
         await asyncio.sleep(period)
         now = loop.time()
@@ -359,18 +421,32 @@ async def _monitor_event_loop_lag(service: str, period: float = 1.0) -> None:
         if lag < 0:
             lag = 0.0
         event_loop_lag_seconds.labels(service=service).set(lag)
+        for thr in thr_tuple:
+            if lag >= thr:
+                event_loop_lag_spikes_total.labels(service=service, threshold=str(thr)).inc()
+        if on_lag is not None:
+            try:
+                on_lag(lag)
+            except Exception as exc:  # pragma: no cover - handler defensivo
+                logger.warning("event loop lag handler failed for %s: %s", service, exc)
         expected += period
 
 
-def start_event_loop_lag_monitor(service: str, period: float = 1.0) -> None:
+def start_event_loop_lag_monitor(
+    service: str,
+    period: float = 1.0,
+    *,
+    thresholds: Optional[Sequence[float]] = None,
+    on_lag: Optional[Callable[[float], None]] = None,
+) -> Optional[asyncio.Task]:
     """Arranca monitor de lag del event loop. Idempotente por servicio."""
 
     task = _loop_lag_tasks.get(service)
     if task is not None and not task.done():
-        return
+        return task
     loop = asyncio.get_running_loop()
     _loop_lag_tasks[service] = loop.create_task(
-        _monitor_event_loop_lag(service, period),
+        _monitor_event_loop_lag(service, period, thresholds=thresholds, on_lag=on_lag),
         name=f"loop-lag:{service}",
     )
     _loop_lag_tasks[service].add_done_callback(
@@ -380,6 +456,7 @@ def start_event_loop_lag_monitor(service: str, period: float = 1.0) -> None:
         if t.cancelled() is False and t.exception() is not None
         else None
     )
+    return _loop_lag_tasks[service]
 
 
 # PromQL de verificación (alerts):
@@ -467,6 +544,121 @@ async def start_cpu_monitors(service: str, interval_s: float = 1.0) -> None:
     """Backward-compatible alias for cpu_sampler_loop."""
 
     await cpu_sampler_loop(service=service, exported_service=service, interval_s=interval_s)
+
+
+_psutil_missing_warned = False
+
+
+async def thread_metrics_sampler(
+    service: str, exported_service: str | None = None, interval_s: float = 5.0
+) -> None:
+    """
+    Exporta métricas de hilos y CPU por hilo usando psutil.
+    Si psutil no está disponible, sólo exporta threads_total.
+    """
+
+    global _psutil_missing_warned
+    labels = {"service": service, "exported_service": exported_service or service}
+    last_seen: set[tuple[str, str]] = set()
+
+    if psutil is None:
+        if not _psutil_missing_warned:
+            logger.warning("psutil no disponible: métricas de CPU por hilo deshabilitadas")
+            _psutil_missing_warned = True
+        while True:
+            threads_total.labels(**labels).set(float(threading.active_count()))
+            await asyncio.sleep(interval_s)
+
+    proc = psutil.Process()
+    while True:
+        threads_total.labels(**labels).set(float(len(threading.enumerate())))
+        try:
+            proc_threads = proc.threads()
+        except Exception:
+            proc_threads = []
+
+        thread_name_by_id = {
+            t.native_id: t.name or getattr(t, "ident", None) or f"thread-{idx}"
+            for idx, t in enumerate(threading.enumerate())
+        }
+
+        current: set[tuple[str, str]] = set()
+        for tinfo in proc_threads:
+            name = thread_name_by_id.get(tinfo.id, f"tid-{tinfo.id}")
+            labels_thread = {
+                **labels,
+                "thread_name": name,
+                "native_id": str(tinfo.id),
+            }
+            thread_cpu_seconds.labels(**labels_thread).set(float(tinfo.user_time + tinfo.system_time))
+            current.add((name, str(tinfo.id)))
+
+        for name, tid in last_seen - current:
+            try:
+                thread_cpu_seconds.remove(
+                    labels["service"], labels["exported_service"], name, tid
+                )
+            except KeyError:
+                pass
+
+        last_seen = current
+        await asyncio.sleep(interval_s)
+
+
+async def executor_sampler_loop(
+    service: str, exported_service: str | None = None, interval_s: float = 2.0
+) -> None:
+    """Exporta estado del executor por defecto usado por asyncio/to_thread."""
+
+    labels = {"service": service, "exported_service": exported_service or service}
+    loop = asyncio.get_running_loop()
+    while True:
+        executor = getattr(loop, "_default_executor", None)
+        if executor is None:
+            to_thread_executor_max_workers.labels(**labels).set(0)
+            to_thread_executor_threads.labels(**labels).set(0)
+            to_thread_executor_queue_depth.labels(**labels).set(0)
+        else:
+            max_workers = getattr(executor, "_max_workers", 0) or 0
+            try:
+                to_thread_executor_max_workers.labels(**labels).set(float(max_workers))
+            except Exception:
+                to_thread_executor_max_workers.labels(**labels).set(0)
+            threads = getattr(executor, "_threads", None)
+            alive = 0
+            if threads is not None:
+                try:
+                    alive = len([t for t in threads if t.is_alive()])
+                except Exception:
+                    alive = len(threads)
+            to_thread_executor_threads.labels(**labels).set(float(alive))
+            queue = getattr(executor, "_work_queue", None)
+            queue_depth = 0
+            if queue is not None:
+                try:
+                    queue_depth = int(queue.qsize())
+                except Exception:
+                    queue_depth = 0
+            to_thread_executor_queue_depth.labels(**labels).set(float(queue_depth))
+        await asyncio.sleep(interval_s)
+
+
+def record_task_exception(
+    service: str,
+    exported_service: str | None,
+    task: str,
+    exc: BaseException,
+) -> None:
+    """Incrementa contadores/gauges para excepciones en tasks asyncio."""
+
+    labels = {
+        "service": service,
+        "exported_service": exported_service or service,
+        "task": task,
+        "exc": exc.__class__.__name__,
+    }
+    task_exceptions_total.labels(**labels).inc()
+    last_exception_timestamp_seconds.labels(**labels).set(time.time())
 
 
 # ---------- DB ----------
