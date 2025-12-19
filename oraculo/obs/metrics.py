@@ -121,6 +121,34 @@ alerts_queue_dropped_total = Counter(
     "Dropped events in alerts hot path queue",
 )
 
+# CPU worker (multiprocessing) metrics
+worker_queue_in_depth = Gauge(
+    "oraculo_worker_queue_in_depth",
+    "Input queue depth for CPU worker",
+    ["queue", "service", "exported_service"],
+)
+worker_queue_out_depth = Gauge(
+    "oraculo_worker_queue_out_depth",
+    "Output queue depth for CPU worker",
+    ["queue", "service", "exported_service"],
+)
+worker_events_total = Counter(
+    "oraculo_worker_events_total",
+    "Events enqueued towards CPU worker",
+    ["kind", "service", "exported_service"],
+)
+worker_processing_seconds = Histogram(
+    "oraculo_worker_processing_seconds",
+    "Processing duration inside CPU worker",
+    ["kind", "service", "exported_service"],
+    buckets=(0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0),
+)
+worker_drops_total = Counter(
+    "oraculo_worker_drops_total",
+    "Dropped events for CPU worker queues",
+    ["reason", "service", "exported_service"],
+)
+
 # Alertas: persistencia y lock/handler profiling
 alerts_db_queue_time_seconds = Histogram(
     "oraculo_alerts_db_queue_time_seconds",
