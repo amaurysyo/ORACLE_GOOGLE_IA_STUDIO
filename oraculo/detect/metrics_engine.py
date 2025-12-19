@@ -6,12 +6,14 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 import math
 import time
+import threading
 
 # ------- OrderBook mínimo (price->qty) -------
 class OrderBook:
     def __init__(self):
         self.bids: Dict[float, float] = {}
         self.asks: Dict[float, float] = {}
+        self._lock = threading.RLock()
 
     def apply(self, side: str, action: str, price: float, qty: float, *, qty_is_delta: bool = False) -> None:
         """Aplica cambios al libro manteniendo cantidades absolutas.
@@ -20,53 +22,58 @@ class OrderBook:
         necesitamos reconstruir el tamaño absoluto del nivel antes de almacenarlo.
         """
         book = self.bids if side == "buy" else self.asks
-        prev = book.get(price, 0.0)
+        with self._lock:
+            prev = book.get(price, 0.0)
 
-        if qty_is_delta:
-            if action == "delete":
-                qty_abs = max(prev - qty, 0.0)
-            else:
-                qty_abs = max(prev + qty, 0.0)
+            if qty_is_delta:
+                if action == "delete":
+                    qty_abs = max(prev - qty, 0.0)
+                else:
+                    qty_abs = max(prev + qty, 0.0)
 
-            if qty_abs <= 0:
-                action = "delete"
-            elif prev == 0:
-                action = "insert"
-            else:
-                action = "update"
-            qty = qty_abs
+                if qty_abs <= 0:
+                    action = "delete"
+                elif prev == 0:
+                    action = "insert"
+                else:
+                    action = "update"
+                qty = qty_abs
 
-        if action == "insert":
-            book[price] = qty
-            if book[price] <= 0:
-                book.pop(price, None)
-        elif action == "update":
-            book[price] = qty
-            if book[price] <= 0:
-                book.pop(price, None)
-        elif action == "delete":
-            # qty = cantidad retirada (no la dejamos negativa)
-            left = max(prev - qty, 0.0) if not qty_is_delta else 0.0
-            if left <= 0:
-                book.pop(price, None)
-            else:
-                book[price] = left
+            if action == "insert":
+                book[price] = qty
+                if book[price] <= 0:
+                    book.pop(price, None)
+            elif action == "update":
+                book[price] = qty
+                if book[price] <= 0:
+                    book.pop(price, None)
+            elif action == "delete":
+                # qty = cantidad retirada (no la dejamos negativa)
+                left = max(prev - qty, 0.0) if not qty_is_delta else 0.0
+                if left <= 0:
+                    book.pop(price, None)
+                else:
+                    book[price] = left
 
     def _sorted_bids(self) -> List[Tuple[float, float]]:
-        return sorted(self.bids.items(), key=lambda x: x[0], reverse=True)
+        with self._lock:
+            return sorted(self.bids.items(), key=lambda x: x[0], reverse=True)
 
     def _sorted_asks(self) -> List[Tuple[float, float]]:
-        return sorted(self.asks.items(), key=lambda x: x[0])
+        with self._lock:
+            return sorted(self.asks.items(), key=lambda x: x[0])
 
     def best(self) -> Tuple[Optional[float], Optional[float]]:
-        bids = self._sorted_bids()
-        asks = self._sorted_asks()
-        return (bids[0][0] if bids else None, asks[0][0] if asks else None)
+        with self._lock:
+            bids = self._sorted_bids()
+            asks = self._sorted_asks()
+            return (bids[0][0] if bids else None, asks[0][0] if asks else None)
 
     def get_head(self, levels: int = 1000):
-        bids = self._sorted_bids()[:levels]
-        asks = self._sorted_asks()[:levels]
-        return bids, asks
+        with self._lock:
+            bids = self._sorted_bids()[:levels]
+            asks = self._sorted_asks()[:levels]
+            return bids, asks
 
 # ------- Snapshot -------
 @dataclass
