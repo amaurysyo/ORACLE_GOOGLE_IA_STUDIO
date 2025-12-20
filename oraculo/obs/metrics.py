@@ -356,6 +356,16 @@ rule_alerts_upsert_total = Counter(
     "Upserts into rule_alerts by rule and severity",
     ["rule", "severity"],
 )
+rule_alerts_no_id_total = Counter(
+    "oraculo_rule_alerts_no_id_total",
+    "Rule alerts that did not return an ID (suppressed/dedupe/RLS?)",
+    ["rule", "reason"],
+)
+rule_alerts_unreadable_total = Counter(
+    "oraculo_rule_alerts_unreadable_total",
+    "Rule alerts with unreadable/hidden canonical rows after upsert",
+    ["rule", "reason"],
+)
 rule_alert_lag_seconds = Histogram(
     "oraculo_rule_alert_lag_seconds",
     "Lag between event_time and alert insertion (seconds)",

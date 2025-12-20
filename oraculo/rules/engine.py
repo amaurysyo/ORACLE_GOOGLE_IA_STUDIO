@@ -2,6 +2,8 @@
 # oraculo/rules/engine.py  (R1–R22 + extras ya usados)
 # ===============================================
 from __future__ import annotations
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -15,11 +17,44 @@ class RuleContext:
     profile: str = "EU"
     suppress_window_s: int = 90
 
-def _mk(rule: str, side: str, ev: Dict[str, Any], severity: str = "MEDIUM") -> Dict[str, Any]:
+def _mk(rule: str, side: str, ev: Dict[str, Any], ctx: RuleContext, severity: str = "MEDIUM") -> Dict[str, Any]:
     price = ev.get("price")
-    dedup_key = f"{rule}|{side}|{int(price or 0)}"
+    fields = ev.get("fields") or {}
+    context_type = ev.get("type") or fields.get("type")
+
+    price_component = "p=na"
+    try:
+        if price not in (None, 0):
+            price_component = f"p={round(float(price), 2)}"
+    except Exception:
+        price_component = "p=err"
+
+    try:
+        intensity_component = f"i={round(float(ev.get('intensity')), 4)}"
+    except Exception:
+        intensity_component = "i=na"
+
+    try:
+        fields_sig = hashlib.sha1(
+            json.dumps(fields, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:8]
+    except Exception:
+        fields_sig = "fields=err"
+
+    dedup_key = "|".join(
+        [
+            ctx.instrument_id or "na",
+            rule,
+            side or "na",
+            str(context_type or "na"),
+            price_component,
+            intensity_component,
+            fields_sig,
+        ]
+    )
+
     return {
-        "instrument_id": None,  # lo setea el caller antes de upsert
+        "instrument_id": ctx.instrument_id,
         "rule": rule,
         "side": side,
         "severity": severity,
@@ -29,6 +64,7 @@ def _mk(rule: str, side: str, ev: Dict[str, Any], severity: str = "MEDIUM") -> D
             "intensity": ev.get("intensity"),
             "fields": ev.get("fields") or {},
         },
+        "suppress_window_s": ctx.suppress_window_s,
         "dedup_key": dedup_key,
     }
 
@@ -57,7 +93,7 @@ def eval_rules(ev: Dict[str, Any], ctx: RuleContext) -> List[Dict[str, Any]]:
 
     def _append(rule: str, side_: str, ev_: Dict[str, Any], severity_: str = "MEDIUM") -> None:
         obs_metrics.rule_eval_total.labels(rule=rule).inc()
-        out.append(_mk(rule, side_, ev_, severity_))
+        out.append(_mk(rule, side_, ev_, ctx, severity_))
 
     try:
         et = ev.get("type")

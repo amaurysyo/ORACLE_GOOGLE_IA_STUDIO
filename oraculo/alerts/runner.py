@@ -616,16 +616,11 @@ class DBWriter:
         t0 = time.perf_counter()
         try:
             sev_db = _sev_norm(rule["severity"])
-            rows = await self.db.fetch(
+            alert_id = await self.db.fetchval(
                 """
-                WITH up AS (
-                  SELECT oraculo.upsert_rule_alert(
-                    $1, $2, $3, $4::severity_t, $5, $6::jsonb, $7, $8
-                  ) AS id
-                )
-                SELECT r.id, r.ts_first
-                FROM up
-                JOIN oraculo.rule_alerts r ON r.id = up.id
+                SELECT oraculo.upsert_rule_alert(
+                  $1, $2, $3, $4::severity_t, $5, $6::jsonb, $7, $8
+                ) AS id
             """,
                 self.instrument_id,
                 dt.datetime.fromtimestamp(event_ts, tz=dt.timezone.utc),
@@ -633,16 +628,41 @@ class DBWriter:
                 sev_db,
                 rule["dedup_key"],
                 json.dumps(rule["context"] or {}),
-                None,
+                rule.get("suppress_window_s"),
                 self.profile,
             )
-            row = rows[0] if rows else None
-            if row:
-                obs_metrics.rule_alerts_upsert_total.labels(
-                    rule=rule["rule"], severity=sev_db
+            if alert_id is None:
+                obs_metrics.rule_alerts_no_id_total.labels(
+                    rule=rule.get("rule", "unknown"), reason="null_from_db"
                 ).inc()
-                return int(row["id"]), row["ts_first"]
-            return None, None
+                logger.warning(
+                    "[db-writer] upsert_rule_alert returned NULL (rule=%s side=%s dedup_key=%s severity=%s profile=%s)",
+                    rule.get("rule"),
+                    rule.get("side"),
+                    rule.get("dedup_key"),
+                    sev_db,
+                    self.profile,
+                )
+                return None, None
+
+            ts_first = await self.db.fetchval(
+                "SELECT ts_first FROM oraculo.rule_alerts WHERE id=$1", alert_id
+            )
+            if ts_first is None:
+                obs_metrics.rule_alerts_unreadable_total.labels(
+                    rule=rule.get("rule", "unknown"), reason="ts_first_missing"
+                ).inc()
+                logger.warning(
+                    "[db-writer] ts_first not readable for alert_id=%s (rule=%s dedup_key=%s profile=%s)",
+                    alert_id,
+                    rule.get("rule"),
+                    rule.get("dedup_key"),
+                    self.profile,
+                )
+            obs_metrics.rule_alerts_upsert_total.labels(
+                rule=rule["rule"], severity=sev_db
+            ).inc()
+            return int(alert_id), ts_first
         except Exception as e:
             logger.error(f"upsert_rule_alert failed: {e!s}")
             return None, None
@@ -1256,7 +1276,22 @@ async def run_pipeline(
             await asyncio.sleep(0)
 
     async def enqueue_rule(rule: dict, event_ts: float):
-        return await db_writer.submit("upsert_rule", (rule, event_ts), expect_result=True)
+        alert_id, ts_first_dt = await db_writer.submit("upsert_rule", (rule, event_ts), expect_result=True)
+        if alert_id is None:
+            ctx_type = (rule.get("context") or {}).get("type")
+            obs_metrics.rule_alerts_no_id_total.labels(
+                rule=rule.get("rule", "unknown"), reason="enqueue_none"
+            ).inc()
+            logger.warning(
+                "[alerts] enqueue_rule returned None (rule=%s side=%s severity=%s dedup_key=%s type=%s profile=%s)",
+                rule.get("rule"),
+                rule.get("side"),
+                rule.get("severity"),
+                rule.get("dedup_key"),
+                ctx_type,
+                ctx.profile,
+            )
+        return alert_id, ts_first_dt
 
     async def enqueue_slice(ev: Event) -> None:
         await db_writer.submit("insert_slice", ev)
