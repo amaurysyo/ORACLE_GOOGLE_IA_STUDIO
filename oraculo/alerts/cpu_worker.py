@@ -99,6 +99,31 @@ def _apply_rules_to_detectors(
     basis_mr: BasisMeanRevertDetector,
     tape_det: TapePressureDetector,
 ) -> None:
+    rules = rules or {}
+
+    def _apply_dep_cfg(detector: DepletionDetector, side: str, dep_cfg: Dict[str, Any]) -> None:
+        pct_candidates = [
+            dep_cfg.get("pct_drop"),
+            dep_cfg.get("pct"),
+            rules.get("depletion", {}).get(f"pct_drop_{side}"),
+            rules.get("depletion", {}).get(f"pct_{side}"),
+        ]
+        pct_val = next((v for v in pct_candidates if v is not None), None)
+        if pct_val is not None:
+            detector.cfg.pct_drop = float(pct_val)
+
+        hold_val = dep_cfg.get("hold_ms", rules.get("depletion", {}).get("hold_ms"))
+        if hold_val is not None:
+            detector.cfg.hold_ms = int(hold_val)
+
+        retrigger_val = dep_cfg.get("retrigger_s", rules.get("depletion", {}).get("retrigger_s"))
+        if retrigger_val is not None:
+            detector.cfg.retrigger_s = float(retrigger_val)
+
+        enabled_val = dep_cfg.get("enabled", rules.get("depletion", {}).get("enabled"))
+        if enabled_val is not None:
+            detector.cfg.enabled = bool(enabled_val)
+
     det = (rules or {}).get("detectors", {}) or {}
 
     # slicing iceberg (equal)
@@ -186,12 +211,8 @@ def _apply_rules_to_detectors(
     dep = det.get("depletion") or {}
     dep_bid = dep.get("bid") or {}
     dep_ask = dep.get("ask") or {}
-    dep_bid_det.cfg.dep_pct = float(dep_bid.get("pct", dep_bid_det.cfg.dep_pct))
-    dep_bid_det.cfg.top_levels = int(dep_bid.get("levels", dep_bid_det.cfg.top_levels))
-    dep_bid_det.cfg.retrigger_s = float(dep_bid.get("retrigger_s", dep_bid_det.cfg.retrigger_s))
-    dep_ask_det.cfg.dep_pct = float(dep_ask.get("pct", dep_ask_det.cfg.dep_pct))
-    dep_ask_det.cfg.top_levels = int(dep_ask.get("levels", dep_ask_det.cfg.top_levels))
-    dep_ask_det.cfg.retrigger_s = float(dep_ask.get("retrigger_s", dep_ask_det.cfg.retrigger_s))
+    _apply_dep_cfg(dep_bid_det, "bid", dep_bid)
+    _apply_dep_cfg(dep_ask_det, "ask", dep_ask)
 
     basis_cfg = det.get("basis") or {}
     bx = basis_cfg.get("extreme") or {}
