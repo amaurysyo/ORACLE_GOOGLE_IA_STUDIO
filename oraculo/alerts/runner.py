@@ -12,6 +12,7 @@ import math
 import os
 import time
 import threading
+from distutils.util import strtobool
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, Optional, Tuple, List, Sequence, Callable, Awaitable
 
@@ -899,11 +900,22 @@ async def run_pipeline(
         except Exception:
             return 0
 
+    def _env_bool(name: str, default: bool) -> bool:
+        val = os.getenv(name)
+        if val is None:
+            return default
+        try:
+            return bool(strtobool(val))
+        except Exception:
+            return default
+
     lag_spike_thresholds = (0.5, 2.0, 10.0)
-    lag_dump_threshold = 2.0
-    lag_consecutive_required = 3
-    executor_queue_dump_threshold = 50
-    dump_cooldown_s = 30.0
+    lag_dump_threshold = float(os.getenv("ORACULO_WATCHDOG_LAG_THRESHOLD", "2.0"))
+    lag_immediate_threshold = float(os.getenv("ORACULO_WATCHDOG_LAG_IMMEDIATE_THRESHOLD", "10.0"))
+    lag_consecutive_required = int(os.getenv("ORACULO_WATCHDOG_CONSECUTIVE", "3"))
+    executor_queue_dump_threshold = int(os.getenv("ORACULO_WATCHDOG_QUEUE_THRESHOLD", "50"))
+    dump_cooldown_s = float(os.getenv("ORACULO_WATCHDOG_COOLDOWN_S", "30.0"))
+    watchdog_enabled = _env_bool("ORACULO_WATCHDOG_ENABLED", True)
     consecutive_high_lag = 0
     last_dump_ts = 0.0
     last_wall = time.perf_counter()
@@ -913,7 +925,27 @@ async def run_pipeline(
     except Exception:
         prev_thread_cpu = prev_proc_cpu
 
+    logger.warning(
+        "[alerts][watchdog] enabled=%s lag>=%.3fs lag_immediate>=%.3fs consecutive=%s queue>=%s cooldown=%.1fs",
+        watchdog_enabled,
+        lag_dump_threshold,
+        lag_immediate_threshold,
+        lag_consecutive_required,
+        executor_queue_dump_threshold,
+        dump_cooldown_s,
+    )
+
     def _emit_watchdog_dump(reason: str, lag: float, queue_depth: int, proc_cores: float, main_share: float, threads_total: int) -> None:
+        logger.warning(
+            "[alerts][watchdog] DUMP_TRIGGERED reason=%s lag=%.3f queue_depth=%s cooldown=%.1fs proc_cores=%.3f main_thread_share=%.3f threads_total=%s",
+            reason,
+            lag,
+            queue_depth,
+            dump_cooldown_s,
+            proc_cores,
+            main_share,
+            threads_total,
+        )
         buf = io.StringIO()
         try:
             faulthandler.dump_traceback(file=buf, all_threads=True)
@@ -927,6 +959,8 @@ async def run_pipeline(
                 pass
 
         obs_metrics.dumps_total.labels(service=service_name, reason=reason).inc()
+        obs_metrics.last_dump_timestamp_seconds.labels(service=service_name).set(time.time())
+        obs_metrics.last_dump_lag_seconds.labels(service=service_name, reason=reason).set(lag)
         logger.warning(
             "[alerts][watchdog] dump reason=%s lag=%.3f queue_depth=%s proc_cores=%.3f main_thread_share=%.3f threads_total=%s\n%s",
             reason,
@@ -940,6 +974,9 @@ async def run_pipeline(
 
     def _on_lag_sample(lag: float) -> None:
         nonlocal consecutive_high_lag, last_dump_ts, last_wall, prev_proc_cpu, prev_thread_cpu
+
+        if not watchdog_enabled:
+            return
 
         wall_now = time.perf_counter()
         proc_now = time.process_time()
@@ -962,7 +999,9 @@ async def run_pipeline(
         threads_total = threading.active_count()
 
         reason: str | None = None
-        if lag >= lag_dump_threshold:
+        if lag >= lag_immediate_threshold:
+            reason = "event_loop_lag_immediate"
+        elif lag >= lag_dump_threshold:
             consecutive_high_lag += 1
             if consecutive_high_lag >= lag_consecutive_required:
                 reason = "event_loop_lag"
@@ -1016,6 +1055,7 @@ async def run_pipeline(
         exported_service=exported_service,
     )
     await worker.start()
+    engine_lock = asyncio.Lock()
 
     # Detectores Deribit opciones (R19–R22) – permanecen en proceso principal
     iv_det = IVSpikeDetector(IVSpikeCfg())
@@ -1377,12 +1417,28 @@ async def run_pipeline(
         await enqueue_telemetry_flush()
 
     async def _dispatch_worker_result(res: WorkerResult) -> None:
-        if res.kind == "depth" and isinstance(res.payload, DepthProcessResult):
-            await _handle_depth_result(res.payload)
-        elif res.kind == "trade" and isinstance(res.payload, TradeProcessResult):
-            await _handle_trade_result(res.payload)
-        elif res.kind == "snapshot" and isinstance(res.payload, SnapshotProcessResult):
-            await _handle_snapshot_result(res.payload)
+        stage = res.kind or "unknown"
+        if stage == "trade":
+            stage = "trades"
+        wait_t0 = time.perf_counter()
+        await engine_lock.acquire()
+        wait_duration = time.perf_counter() - wait_t0
+        hold_t0 = time.perf_counter()
+        try:
+            if res.kind == "depth" and isinstance(res.payload, DepthProcessResult):
+                await _handle_depth_result(res.payload)
+            elif res.kind == "trade" and isinstance(res.payload, TradeProcessResult):
+                await _handle_trade_result(res.payload)
+            elif res.kind == "snapshot" and isinstance(res.payload, SnapshotProcessResult):
+                await _handle_snapshot_result(res.payload)
+            elif res.kind == "mark":
+                # no-op: mark results carry no payload beyond timing
+                pass
+        finally:
+            hold_duration = time.perf_counter() - hold_t0
+            engine_lock.release()
+            obs_metrics.alerts_engine_lock_wait_seconds.labels(service=service_name, stage=stage).observe(wait_duration)
+            obs_metrics.alerts_engine_lock_seconds.labels(service=service_name, stage=stage).observe(hold_duration)
 
     queue_stale_after = {"trade": 2.0, "depth": 2.0, "mark": 1.0}
     batch_conf = {
