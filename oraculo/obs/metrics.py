@@ -172,8 +172,14 @@ alerts_db_inflight_batches = Gauge(
 alerts_engine_lock_seconds = Histogram(
     "oraculo_alerts_engine_lock_seconds",
     "Time spent holding engine_lock in alerts pipeline",
-    ["stage"],
+    ["service", "stage"],
     buckets=(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1),
+)
+alerts_engine_lock_wait_seconds = Histogram(
+    "oraculo_alerts_engine_lock_wait_seconds",
+    "Time spent waiting to acquire engine_lock in alerts pipeline",
+    ["service", "stage"],
+    buckets=(0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1),
 )
 alerts_handler_duration_seconds = Histogram(
     "oraculo_alerts_handler_duration_seconds",
@@ -422,6 +428,16 @@ dumps_total = Counter(
     "Thread dumps triggered by watchdogs",
     ["service", "reason"],
 )
+last_dump_timestamp_seconds = Gauge(
+    "oraculo_last_dump_timestamp_seconds",
+    "Wall-clock timestamp (epoch seconds) of the last watchdog dump",
+    ["service"],
+)
+last_dump_lag_seconds = Gauge(
+    "oraculo_last_dump_lag_seconds",
+    "Lag sample associated with the last watchdog dump",
+    ["service", "reason"],
+)
 
 # Mantener una tarea por servicio para evitar monitores duplicados
 _loop_lag_tasks: Dict[str, asyncio.Task] = {}
@@ -457,7 +473,7 @@ async def _monitor_event_loop_lag(
                 on_lag(lag)
             except Exception as exc:  # pragma: no cover - handler defensivo
                 logger.warning("event loop lag handler failed for %s: %s", service, exc)
-        expected += period
+        expected = loop.time() + period
 
 
 def start_event_loop_lag_monitor(

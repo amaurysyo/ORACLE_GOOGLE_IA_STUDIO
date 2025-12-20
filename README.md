@@ -30,3 +30,22 @@ Created on Fri Oct 31 19:27:26 2025
   ```
   Luego ajusta `TARGET_WS = "ws://127.0.0.1:8765/ws"` en `scripts/spyder_loadtest_runner.py` y vuelve a ejecutar (F5).
 - Si usas el servicio real, asegúrate de haberlo iniciado antes de correr el load test (por ejemplo `python scripts/cli.py alerts run` o el proceso que exponga tu WS).
+
+## Runbook rápido: validación de watchdog y lag (PromQL)
+
+- **Lag sano / recuperación**  
+  - `max_over_time(oraculo_event_loop_lag_seconds{service="alerts"}[5m])`  
+  - `avg_over_time(oraculo_event_loop_lag_seconds{service="alerts"}[5m])`
+- **Spikes visibles**  
+  - `max_over_time(oraculo_event_loop_lag_seconds{service="alerts"}[1m])`  
+  - `increase(oraculo_event_loop_lag_spikes_total{service="alerts"}[15m])`
+- **Dumps emitidos por watchdog**  
+  - `increase(oraculo_dumps_total{service="alerts"}[30m])`  
+  - `oraculo_last_dump_timestamp_seconds{service="alerts"}`  
+  - `oraculo_last_dump_lag_seconds{service="alerts"}`
+- **Lock del motor (espera y retención)**  
+  - `histogram_quantile(0.95, sum by (le,stage) (rate(oraculo_alerts_engine_lock_seconds_bucket{service="alerts"}[5m])))`  
+  - `histogram_quantile(0.95, sum by (le,stage) (rate(oraculo_alerts_engine_lock_wait_seconds_bucket{service="alerts"}[5m])))`  
+  - `rate(oraculo_alerts_engine_lock_seconds_sum{service="alerts"}[5m])`
+
+En los logs, busca entradas con prefijo `[alerts][watchdog] DUMP_TRIGGERED` para confirmar la emisión del stack.
