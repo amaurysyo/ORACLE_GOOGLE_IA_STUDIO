@@ -274,8 +274,10 @@ class BreakWallDetector:
         self._k_sell = 0
 
     def on_slicing(
-        self, ts: float, ev: Event, snapshot: Dict[str, Any]
+        self, ts: float, ev: Event, snapshot: Any
     ) -> Tuple[Optional[Event], Optional[str]]:
+        # Permitir tanto diccionarios como dataclasses Snapshot
+        snap_get = snapshot.get if hasattr(snapshot, "get") else lambda k, d=None: getattr(snapshot, k, d)
         if ev.kind != "slicing_aggr":
             return None, None
         side = ev.side
@@ -290,7 +292,7 @@ class BreakWallDetector:
         if k < self.cfg.n_min:
             return None, None
 
-        bv_raw = snapshot.get("basis_vel_bps_s")
+        bv_raw = snap_get("basis_vel_bps_s")
         if bv_raw is None:
             return None, None
 
@@ -299,7 +301,7 @@ class BreakWallDetector:
             return None, "basis_vel_low"
 
         if self.cfg.top_levels_gate and self.cfg.tick_size > 0:
-            ref_px = snapshot.get("best_ask") if side == "buy" else snapshot.get("best_bid")
+            ref_px = snap_get("best_ask") if side == "buy" else snap_get("best_bid")
             if ref_px is not None:
                 ticks_diff = abs(ev.price - ref_px) / self.cfg.tick_size
                 if ticks_diff > float(self.cfg.top_levels_gate):
@@ -309,11 +311,11 @@ class BreakWallDetector:
         refill_ok = True
         if self.cfg.require_depletion:
             if side == "buy":
-                dep_ok = float(snapshot.get("dep_ask", 0.0)) >= self.cfg.dep_pct
-                refill_ok = float(snapshot.get("refill_ask_3s", 0.0)) < self.cfg.forbid_refill_under_pct
+                dep_ok = float(snap_get("dep_ask", 0.0)) >= self.cfg.dep_pct
+                refill_ok = float(snap_get("refill_ask_3s", 0.0)) < self.cfg.forbid_refill_under_pct
             else:
-                dep_ok = float(snapshot.get("dep_bid", 0.0)) >= self.cfg.dep_pct
-                refill_ok = float(snapshot.get("refill_bid_3s", 0.0)) < self.cfg.forbid_refill_under_pct
+                dep_ok = float(snap_get("dep_bid", 0.0)) >= self.cfg.dep_pct
+                refill_ok = float(snap_get("refill_bid_3s", 0.0)) < self.cfg.forbid_refill_under_pct
         if not (dep_ok and refill_ok):
             if not dep_ok:
                 return None, "dep_low"
