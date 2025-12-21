@@ -181,6 +181,17 @@ def _apply_rules_to_detectors(
     det_bw.cfg.n_min = int(b.get("n_min", det_bw.cfg.n_min))
     det_bw.cfg.dep_pct = float(b.get("dep_pct", det_bw.cfg.dep_pct))
     det_bw.cfg.basis_vel_abs_bps_s = float(b.get("basis_vel_abs_bps_s", det_bw.cfg.basis_vel_abs_bps_s))
+    det_bw.cfg.metric_source = str(b.get("metric_source", det_bw.cfg.metric_source))
+    doc_bw = b.get("doc") or {}
+    det_bw.cfg.doc_window_s = float(doc_bw.get("window_s", metrics_doc_cfg.get("depletion_doc_window_s", det_bw.cfg.doc_window_s)))
+    if "dv_dep_warn" in doc_bw:
+        det_bw.cfg.dv_dep_warn = float(doc_bw["dv_dep_warn"])
+    if "dv_refill_max" in doc_bw:
+        det_bw.cfg.dv_refill_max = float(doc_bw["dv_refill_max"])
+    if "clamp_abs_dv" in doc_bw:
+        det_bw.cfg.clamp_abs_dv = float(doc_bw["clamp_abs_dv"])
+    if "require_negative" in doc_bw:
+        det_bw.cfg.require_negative = bool(doc_bw["require_negative"])
     det_bw.cfg.require_depletion = bool(b.get("require_depletion", det_bw.cfg.require_depletion))
     det_bw.cfg.forbid_refill_under_pct = float(b.get("forbid_refill_under_pct", det_bw.cfg.forbid_refill_under_pct))
     det_bw.cfg.top_levels_gate = int(b.get("top_levels_gate", det_bw.cfg.top_levels_gate))

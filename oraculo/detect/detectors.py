@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Tuple, List
 import math
 
+from oraculo.metrics.resolve import resolve
+
 # --------- DTO de evento ----------
 @dataclass
 class Event:
@@ -252,6 +254,12 @@ class BreakWallCfg:
     n_min: int = 3
     dep_pct: float = 0.40
     basis_vel_abs_bps_s: float = 1.5
+    metric_source: str = "legacy"
+    doc_window_s: float = 3.0
+    dv_dep_warn: float = 20.0
+    dv_refill_max: float = 10.0
+    clamp_abs_dv: float = 300.0
+    require_negative: bool = True
     require_depletion: bool = True
     forbid_refill_under_pct: float = 0.60
     top_levels_gate: int = 20
@@ -265,8 +273,10 @@ class BreakWallDetector:
     Espera snapshot con claves:
       {
         "basis_vel_bps_s": float,
+        "basis_vel_bps_s_doc": float,
         "dep_bid": float, "dep_ask": float,
         "refill_bid_3s": float, "refill_ask_3s": float,
+        "depletion_bid_doc": float, "depletion_ask_doc": float,
       }
     """
     def __init__(self, cfg: BreakWallCfg):
@@ -293,13 +303,15 @@ class BreakWallDetector:
         if k < self.cfg.n_min:
             return None, None
 
-        bv_raw = snap_get("basis_vel_bps_s")
-        if bv_raw is None:
+        bv_res = resolve(snapshot, "basis_vel_bps_s_doc", fallback_key="basis_vel_bps_s", source=self.cfg.metric_source)
+        if bv_res.value is None:
             return None, None
 
-        bv = float(bv_raw or 0.0)
+        bv = float(bv_res.value or 0.0)
         if abs(bv) < self.cfg.basis_vel_abs_bps_s:
             return None, "basis_vel_low"
+
+        source = (bv_res.used_source or self.cfg.metric_source or "legacy").lower()
 
         if self.cfg.top_levels_gate and self.cfg.tick_size > 0:
             ref_px = snap_get("best_ask") if side == "buy" else snap_get("best_bid")
@@ -308,15 +320,75 @@ class BreakWallDetector:
                 if ticks_diff > float(self.cfg.top_levels_gate):
                     return None, "top_levels_gate"
 
+        if source == "legacy":
+            dep_ok = True
+            refill_ok = True
+            if self.cfg.require_depletion:
+                if side == "buy":
+                    dep_ok = float(snap_get("dep_ask", 0.0)) >= self.cfg.dep_pct
+                    refill_ok = float(snap_get("refill_ask_3s", 0.0)) < self.cfg.forbid_refill_under_pct
+                else:
+                    dep_ok = float(snap_get("dep_bid", 0.0)) >= self.cfg.dep_pct
+                    refill_ok = float(snap_get("refill_bid_3s", 0.0)) < self.cfg.forbid_refill_under_pct
+            if not (dep_ok and refill_ok):
+                if not dep_ok:
+                    return None, "dep_low"
+                if not refill_ok:
+                    return None, "refill_high"
+                return None, None
+
+            return Event(
+                "break_wall",
+                side,
+                ts,
+                ev.price,
+                ev.intensity,
+                {"k": k, "basis_vel_bps_s": bv},
+            ), None
+
+        dv_key = "depletion_ask_doc" if side == "buy" else "depletion_bid_doc"
+        dv_res = resolve(snapshot, dv_key, fallback_key=None, source="doc")
+        if dv_res.value is None:
+            if (self.cfg.metric_source or "").lower() == "auto":
+                # fallback a lógica legacy
+                dep_ok = True
+                refill_ok = True
+                if self.cfg.require_depletion:
+                    if side == "buy":
+                        dep_ok = float(snap_get("dep_ask", 0.0)) >= self.cfg.dep_pct
+                        refill_ok = float(snap_get("refill_ask_3s", 0.0)) < self.cfg.forbid_refill_under_pct
+                    else:
+                        dep_ok = float(snap_get("dep_bid", 0.0)) >= self.cfg.dep_pct
+                        refill_ok = float(snap_get("refill_bid_3s", 0.0)) < self.cfg.forbid_refill_under_pct
+                if not (dep_ok and refill_ok):
+                    if not dep_ok:
+                        return None, "dep_low"
+                    if not refill_ok:
+                        return None, "refill_high"
+                    return None, None
+                return Event(
+                    "break_wall",
+                    side,
+                    ts,
+                    ev.price,
+                    ev.intensity,
+                    {"k": k, "basis_vel_bps_s": bv},
+                ), None
+            return None, None
+
+        dv = float(dv_res.value)
+        if self.cfg.require_negative and dv >= 0:
+            return None, "no_depletion"
+
+        dep_amt = min(max(0.0, -dv), self.cfg.clamp_abs_dv)
+        refill_amt = min(max(0.0, dv), self.cfg.clamp_abs_dv)
+
         dep_ok = True
         refill_ok = True
         if self.cfg.require_depletion:
-            if side == "buy":
-                dep_ok = float(snap_get("dep_ask", 0.0)) >= self.cfg.dep_pct
-                refill_ok = float(snap_get("refill_ask_3s", 0.0)) < self.cfg.forbid_refill_under_pct
-            else:
-                dep_ok = float(snap_get("dep_bid", 0.0)) >= self.cfg.dep_pct
-                refill_ok = float(snap_get("refill_bid_3s", 0.0)) < self.cfg.forbid_refill_under_pct
+            dep_ok = dep_amt >= self.cfg.dv_dep_warn
+            refill_ok = refill_amt <= self.cfg.dv_refill_max
+
         if not (dep_ok and refill_ok):
             if not dep_ok:
                 return None, "dep_low"
@@ -330,7 +402,19 @@ class BreakWallDetector:
             ts,
             ev.price,
             ev.intensity,
-            {"k": k, "basis_vel_bps_s": bv},
+            {
+                "k": k,
+                "basis_vel_bps_s": bv,
+                "metric_source": "doc",
+                "metric_used_basis_vel": bv_res.used_key,
+                "metric_used_dv": dv_key,
+                "dv": dv,
+                "depletion_amount": dep_amt,
+                "refill_amount": refill_amt,
+                "dv_dep_warn": self.cfg.dv_dep_warn,
+                "dv_refill_max": self.cfg.dv_refill_max,
+                "window_s": self.cfg.doc_window_s,
+            },
         ), None
 
 # --------- Dominance ---------
