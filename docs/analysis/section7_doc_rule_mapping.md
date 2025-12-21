@@ -44,7 +44,7 @@ Reglas copiadas de `📘 Proyecto — Oráculo Btcusdt  V1 — ACTUALIZADO.docx`
 | R10 | Dominancia ASK + spread | R10 | dominance (sell) | DIVERGED | Misma divergencia que R9.|【F:oraculo/rules/engine.py†L152-L165】【F:oraculo/detect/detectors.py†L347-L384】 |
 | R11 | Spoofing BID | R11 | spoofing (buy) | DIVERGED | Heurística basada en pared lejana y cancel_rate; no usa bucket_mean ni matched_pct DOC.|【F:oraculo/rules/engine.py†L167-L179】【F:oraculo/detect/detectors.py†L386-L454】 |
 | R12 | Spoofing ASK | R12 | spoofing (sell) | DIVERGED | Igual que R11 lado ask.|【F:oraculo/rules/engine.py†L167-L179】【F:oraculo/detect/detectors.py†L386-L454】 |
-| R13 | OI Spike + precio | N/A (R13 usado para depletion) | — | NOT_IMPLEMENTED | R13 del proyecto es depleción; no existe evento oi_spike con momentum precio.|【F:oraculo/rules/engine.py†L181-L196】 |
+| R13 | OI Spike + precio | R28 (BUY), R29 (SELL) | oi_spike (buy/sell) | MATCH | Implementado como R28/R29 con `event_type=oi_spike`, lado buy/sell, inputs `oi_delta_pct_doc` (fallback `open_interest`) + momentum `wmid`; feature flag `detectors.oi_spike.enabled` (default false).【F:oraculo/rules/engine.py†L16-L33】【F:oraculo/rules/engine.py†L218-L241】【F:oraculo/alerts/cpu_worker.py†L395-L493】【F:config/rules.yaml†L130-L149】 |
 | R14 | Basis dislocation | R15/R16 | metric_trigger(basis_bps) | PARTIAL | Se dispara por umbral estático ±basis_extreme; no gating por velocidad ni funding_trend.|【F:oraculo/rules/engine.py†L198-L217】【F:config/rules.yaml†L70-L95】 |
 | R15 | Top Traders LONG | N/A | — | NOT_IMPLEMENTED | Ratios top trader sólo se ingestan; no se generan eventos/reglas.|【F:oraculo/ingest/binance_rest.py†L193-L250】 |
 | R16 | Top Traders SHORT | N/A | — | NOT_IMPLEMENTED | Igual que R15 lado short.|【F:oraculo/ingest/binance_rest.py†L193-L250】 |
@@ -57,20 +57,20 @@ Reglas copiadas de `📘 Proyecto — Oráculo Btcusdt  V1 — ACTUALIZADO.docx`
 
 ## Tabla 2 — Plan de completitud (Opción A)
 
-| DOC_Rule faltante | Nuevo Proyecto_Rule | Evento propuesto (et/side) | Datos ya existentes | Dependencias | Prioridad |
-| --- | --- | --- | --- | --- | --- |
-| R13 OI Spike + precio | R28 (BUY), R29 (SELL) | `oi_spike` + momentum_price, side buy/sell | `open_interest`, `oi_delta_pct_doc`, trades/price ya persistidos | Reutilizar poller OI, derivar ΔOI% y momentum spot; gatillar por lado | P0 |
-| R14 Basis dislocation | R34 | `basis_dislocation` (side na) | `basis_bps_doc`, `basis_vel_bps_s_doc`, funding (mark/index) | Calcular funding_trend o ingestar funding rate; compuertas por vel| P1 |
-| R15 Top Traders LONG | R30 | `top_traders` (bias=long) | Tablas `top_trader_account_ratio`, `top_trader_position_ratio` | Detector para ratios ≥θL/θA y timestamp consolidado | P1 |
-| R16 Top Traders SHORT | R31 | `top_traders` (bias=short) | Mismas tablas top_trader_* | Detector espejo lado short | P1 |
-| R17 Liquidation cluster SELL | R32 | `liq_cluster` (sell) | Streams/tables de liquidations y trades | Agregador 60s con condición de no_rebound | P0 |
-| R18 Liquidation cluster BUY | R33 | `liq_cluster` (buy) | Streams/tables de liquidations y trades | Agregador 60s con condición de no_pullback | P0 |
-| R20 Skew shock 25Δ | R35 | `skew_shock` (na) | OI/IV de opciones (skew 25Δ) en ingesta Deribit | Derivar RR25d y Δbps; thresholds κ | P2 |
-| R21 Gamma flip (GEX) | R36 | `gamma_flip` (na) | Greeks (gamma) ya presentes en tabla de options | Calcular GEX agregado, detectar cambio de signo con spot~ATM | P2 |
-| R22 Term structure invertida | R37 | `term_structure_inverted` (na) | IV surface (front/back) si se expone en ingesta | Derivar term structure y tendencia de vol | P2 |
+| DOC_Rule faltante | Nuevo Proyecto_Rule | Evento propuesto (et/side) | Datos ya existentes | Dependencias | Prioridad | Estado / notas |
+| --- | --- | --- | --- | --- | --- | --- |
+| R13 OI Spike + precio | R28 (BUY), R29 (SELL) | `oi_spike` + momentum_price, side buy/sell | `open_interest`, `oi_delta_pct_doc`, trades/price ya persistidos | Reutilizar poller OI, derivar ΔOI% y momentum spot; gatillar por lado | P0 | **IMPLEMENTED** — usa `event_type=oi_spike`, `side=buy/sell`, inputs `oi_delta_pct_doc` (fallback `open_interest`) + momentum `wmid`; feature flag `detectors.oi_spike.enabled` (default false). |
+| R14 Basis dislocation | R34 | `basis_dislocation` (side na) | `basis_bps_doc`, `basis_vel_bps_s_doc`, funding (mark/index) | Calcular funding_trend o ingestar funding rate; compuertas por vel| P1 | Stub reservado |
+| R15 Top Traders LONG | R30 | `top_traders` (bias=long) | Tablas `top_trader_account_ratio`, `top_trader_position_ratio` | Detector para ratios ≥θL/θA y timestamp consolidado | P1 | Stub reservado |
+| R16 Top Traders SHORT | R31 | `top_traders` (bias=short) | Mismas tablas top_trader_* | Detector espejo lado short | P1 | Stub reservado |
+| R17 Liquidation cluster SELL | R32 | `liq_cluster` (sell) | Streams/tables de liquidations y trades | Agregador 60s con condición de no_rebound | P0 | Stub reservado |
+| R18 Liquidation cluster BUY | R33 | `liq_cluster` (buy) | Streams/tables de liquidations y trades | Agregador 60s con condición de no_pullback | P0 | Stub reservado |
+| R20 Skew shock 25Δ | R35 | `skew_shock` (na) | OI/IV de opciones (skew 25Δ) en ingesta Deribit | Derivar RR25d y Δbps; thresholds κ | P2 | Stub reservado |
+| R21 Gamma flip (GEX) | R36 | `gamma_flip` (na) | Greeks (gamma) ya presentes en tabla de options | Calcular GEX agregado, detectar cambio de signo con spot~ATM | P2 | Stub reservado |
+| R22 Term structure invertida | R37 | `term_structure_inverted` (na) | IV surface (front/back) si se expone en ingesta | Derivar term structure y tendencia de vol | P2 | Stub reservado |
 
 ## Decisiones de diseño
 - Se elige la **Opción A**: mantener numeración existente (R1–R27) y añadir reglas nuevas R28+ para cubrir las brechas del DOC, evitando renumerar o alterar semántica actual.
 - Convención de eventos: `event_type` en snake_case (`oi_spike`, `top_traders`, `liq_cluster`, `basis_dislocation`, `skew_shock`, `gamma_flip`, `term_structure_inverted`) con `side` explícito (`buy`/`sell`/`na`/`bias`).
 - Campos de auditoría recomendados: `metric_source` (legacy/doc/auto), `window_s`, `thresholds` usados, `metric_used_*` cuando se combine DOC/legacy, y `profile` del `RuleContext` para mantener compatibilidad de telemetría.
-- Los stubs R28–R37 quedan sin lógica en el engine; el encolado de alertas no cambia hasta conectar detectores específicos.
+- Las reglas R28/R29 están implementadas y gobernadas por `detectors.oi_spike.enabled` (default false) para no alterar producción hasta habilitación explícita; R30–R37 permanecen reservadas como stubs sin lógica en el engine.

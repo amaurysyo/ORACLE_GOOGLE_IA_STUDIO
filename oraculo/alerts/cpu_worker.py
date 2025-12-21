@@ -425,6 +425,41 @@ class CPUWorkerProcess(mp.Process):
         last_snapshot: Optional[Snapshot] = None
         last_oi_poll_ts = 0.0
 
+        def _close_db_resources() -> None:
+            nonlocal db_pool, db_loop, db_adapter
+            if db_loop is None:
+                return
+            try:
+                if db_pool is not None:
+                    try:
+                        db_loop.run_until_complete(db_pool.close())
+                    except Exception:
+                        logger.warning("[cpu-worker] failed to close db pool cleanly", exc_info=True)
+                pending = []
+                try:
+                    pending = [t for t in asyncio.all_tasks(loop=db_loop) if not t.done()]
+                except Exception:
+                    pending = []
+                if pending:
+                    for task in pending:
+                        task.cancel()
+                    try:
+                        db_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    except Exception:
+                        logger.debug("[cpu-worker] pending db tasks cleanup failed", exc_info=True)
+                try:
+                    db_loop.stop()
+                except Exception:
+                    logger.debug("[cpu-worker] failed to stop db loop", exc_info=True)
+                try:
+                    db_loop.close()
+                except Exception:
+                    logger.warning("[cpu-worker] failed to close db loop", exc_info=True)
+            finally:
+                db_pool = None
+                db_loop = None
+                db_adapter = None
+
         if oi_cfg.enabled and self.db_dsn and asyncpg is not None:
             try:
                 db_loop = asyncio.new_event_loop()
@@ -433,9 +468,7 @@ class CPUWorkerProcess(mp.Process):
                 logger.info("[cpu-worker] OI spike detector enabled with DB adapter.")
             except Exception as e:
                 logger.warning(f"[cpu-worker] Failed to init DB pool for OI spike detector: {e!s}")
-                db_pool = None
-                db_loop = None
-                db_adapter = None
+                _close_db_resources()
         elif oi_cfg.enabled and not self.db_dsn:
             logger.warning("[cpu-worker] OI spike detector enabled but db_dsn not provided; skipping polls.")
         elif oi_cfg.enabled and asyncpg is None:
@@ -539,6 +572,7 @@ class CPUWorkerProcess(mp.Process):
                                 db_adapter = _AsyncpgAdapter(db_pool, db_loop)
                             except Exception:
                                 logger.warning("[cpu-worker] failed to init db adapter after rules update")
+                                _close_db_resources()
                         self._emit_result("rules", None, t0, req.enqueued_at)
                     else:
                         logger.warning(f"[cpu-worker] Unknown request type: {req.kind}")
@@ -549,15 +583,7 @@ class CPUWorkerProcess(mp.Process):
                     except Exception:
                         pass
         finally:
-            if db_pool and db_loop:
-                try:
-                    db_loop.run_until_complete(db_pool.close())
-                except Exception:
-                    pass
-                try:
-                    db_loop.close()
-                except Exception:
-                    pass
+            _close_db_resources()
 
     def _emit_result(self, kind: str, payload: Any, t0: float, enqueued_at: float) -> None:
         processing_seconds = max(0.0, time.perf_counter() - t0)
