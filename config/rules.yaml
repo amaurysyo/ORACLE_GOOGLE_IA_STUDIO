@@ -127,6 +127,18 @@ detectors:
     hold_ms: 500            # evitar flicker, mantener la condición
     retrigger_s: 20         # cooldown para no spamear
 
+  oi_spike:
+    enabled: false
+    poll_s: 5
+    retrigger_s: 60
+    oi_window_s: 120
+    momentum_window_s: 60
+    oi_warn_pct: 0.80
+    oi_strong_pct: 1.50
+    mom_warn_usd: 8.0
+    mom_strong_usd: 20.0
+    require_same_dir: true
+
   spread_squeeze:
     enabled: true
     max_spread_usd: 0.5     # compresión del spread

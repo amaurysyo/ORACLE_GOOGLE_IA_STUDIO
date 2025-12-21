@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import queue
 import multiprocessing as mp
 import time
 from dataclasses import dataclass
@@ -10,6 +11,11 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import threading
 
 from loguru import logger
+
+try:
+    import asyncpg  # type: ignore
+except Exception:  # pragma: no cover - dependencia opcional
+    asyncpg = None
 
 from oraculo.detect.metrics_engine import MetricsEngine, Snapshot
 from oraculo.detect.detectors import (
@@ -35,6 +41,7 @@ from oraculo.detect.detectors import (
     TapePressureDetector,
     Event,
 )
+from oraculo.detect.macro_detectors import OISpikeCfg, OISpikeDetector
 from oraculo.obs import metrics as obs_metrics
 
 
@@ -81,6 +88,49 @@ class SnapshotProcessResult:
     basis_neg_event: Optional[Event]
     basis_mr_event: Optional[Event]
     metric_rows: Sequence[Tuple[str, float, int, str, float, Optional[str], str]]
+
+
+class _AsyncpgAdapter:
+    def __init__(self, pool: Any, loop: asyncio.AbstractEventLoop):
+        self.pool = pool
+        self.loop = loop
+
+    def fetchrow(self, sql: str, *args: Any):
+        async def _run():
+            async with self.pool.acquire() as con:
+                return await con.fetchrow(sql, *args)
+
+        try:
+            return self.loop.run_until_complete(_run())
+        except Exception:
+            return None
+
+    def fetch(self, sql: str, *args: Any):
+        async def _run():
+            async with self.pool.acquire() as con:
+                return await con.fetch(sql, *args)
+
+        try:
+            return self.loop.run_until_complete(_run())
+        except Exception:
+            return None
+
+
+def _build_oi_cfg(rules: Dict[str, Any]) -> OISpikeCfg:
+    det = (rules or {}).get("detectors", {}) or {}
+    oi_cfg_raw = det.get("oi_spike") or {}
+    cfg = OISpikeCfg()
+    cfg.enabled = bool(oi_cfg_raw.get("enabled", cfg.enabled))
+    cfg.poll_s = float(oi_cfg_raw.get("poll_s", cfg.poll_s))
+    cfg.retrigger_s = float(oi_cfg_raw.get("retrigger_s", cfg.retrigger_s))
+    cfg.oi_window_s = float(oi_cfg_raw.get("oi_window_s", cfg.oi_window_s))
+    cfg.momentum_window_s = float(oi_cfg_raw.get("momentum_window_s", cfg.momentum_window_s))
+    cfg.oi_warn_pct = float(oi_cfg_raw.get("oi_warn_pct", cfg.oi_warn_pct))
+    cfg.oi_strong_pct = float(oi_cfg_raw.get("oi_strong_pct", cfg.oi_strong_pct))
+    cfg.mom_warn_usd = float(oi_cfg_raw.get("mom_warn_usd", cfg.mom_warn_usd))
+    cfg.mom_strong_usd = float(oi_cfg_raw.get("mom_strong_usd", cfg.mom_strong_usd))
+    cfg.require_same_dir = bool(oi_cfg_raw.get("require_same_dir", cfg.require_same_dir))
+    return cfg
 
 
 def _apply_rules_to_detectors(
@@ -309,6 +359,7 @@ class CPUWorkerProcess(mp.Process):
         rules: Optional[Dict[str, Any]],
         instrument_id: str,
         profile: str,
+        db_dsn: Optional[str] = None,
     ):
         super().__init__(daemon=True)
         self.in_queue = in_queue
@@ -316,6 +367,7 @@ class CPUWorkerProcess(mp.Process):
         self.rules = rules or {}
         self.instrument_id = instrument_id
         self.profile = profile
+        self.db_dsn = db_dsn
 
     def run(self) -> None:  # type: ignore[override]
         faulthandler = __import__("faulthandler")
@@ -365,66 +417,145 @@ class CPUWorkerProcess(mp.Process):
             tape_det,
         )
 
-        while True:
-            req: WorkerRequest = self.in_queue.get()
-            if req is None:
-                break
-            t0 = time.perf_counter()
+        oi_cfg = _build_oi_cfg(self.rules)
+        oi_detector = OISpikeDetector(oi_cfg, self.instrument_id)
+        db_loop: Optional[asyncio.AbstractEventLoop] = None
+        db_pool = None
+        db_adapter: Optional[_AsyncpgAdapter] = None
+        last_snapshot: Optional[Snapshot] = None
+        last_oi_poll_ts = 0.0
+
+        if oi_cfg.enabled and self.db_dsn and asyncpg is not None:
             try:
-                if req.kind == "depth":
-                    res = self._process_depth(det_pass, det_spoof, engine, req.payload)
-                    self._emit_result("depth", res, t0, req.enqueued_at)
-                elif req.kind == "trade":
-                    res = self._process_trade(
-                        det_slice_eq,
-                        det_slice_hit,
-                        det_abs,
-                        det_spoof,
-                        det_bw,
-                        tape_det,
-                        engine,
-                        req.payload,
-                    )
-                    self._emit_result("trade", res, t0, req.enqueued_at)
-                elif req.kind == "mark":
-                    self._process_mark(engine, req.payload)
-                    self._emit_result("mark", None, t0, req.enqueued_at)
-                elif req.kind == "snapshot":
-                    res = self._process_snapshot(
-                        det_dom,
-                        dep_bid_det,
-                        dep_ask_det,
-                        basis_pos_trig,
-                        basis_neg_trig,
-                        basis_mr,
-                        engine,
-                        req.payload,
-                    )
-                    self._emit_result("snapshot", res, t0, req.enqueued_at)
-                elif req.kind == "rules":
-                    _apply_rules_to_detectors(
-                        req.payload or {},
-                        det_slice_eq,
-                        det_slice_hit,
-                        det_abs,
-                        det_bw,
-                        det_pass,
-                        det_dom,
-                        det_spoof,
-                        dep_bid_det,
-                        dep_ask_det,
-                        basis_pos_trig,
-                        basis_neg_trig,
-                        basis_mr,
-                        tape_det,
-                    )
-                    self._emit_result("rules", None, t0, req.enqueued_at)
-                else:
-                    logger.warning(f"[cpu-worker] Unknown request type: {req.kind}")
-            except Exception:
-                logger.exception("[cpu-worker] failed processing request %s", req.kind)
+                db_loop = asyncio.new_event_loop()
+                db_pool = db_loop.run_until_complete(asyncpg.create_pool(dsn=self.db_dsn, min_size=1, max_size=2))
+                db_adapter = _AsyncpgAdapter(db_pool, db_loop)
+                logger.info("[cpu-worker] OI spike detector enabled with DB adapter.")
+            except Exception as e:
+                logger.warning(f"[cpu-worker] Failed to init DB pool for OI spike detector: {e!s}")
+                db_pool = None
+                db_loop = None
+                db_adapter = None
+        elif oi_cfg.enabled and not self.db_dsn:
+            logger.warning("[cpu-worker] OI spike detector enabled but db_dsn not provided; skipping polls.")
+        elif oi_cfg.enabled and asyncpg is None:
+            logger.warning("[cpu-worker] OI spike detector enabled but asyncpg not available; skipping polls.")
+
+        try:
+            while True:
+                now_poll = time.time()
+                if (
+                    oi_detector
+                    and oi_detector.cfg.enabled
+                    and db_adapter is not None
+                    and (now_poll - last_oi_poll_ts) >= float(oi_detector.cfg.poll_s)
+                ):
+                    poll_t0 = time.perf_counter()
+                    try:
+                        ev_macro = oi_detector.poll(now_poll, db_adapter, last_snapshot)
+                    except Exception:
+                        ev_macro = None
+                        logger.exception("[cpu-worker] oi_spike poll failed")
+                    if ev_macro is not None:
+                        self._emit_result("macro", ev_macro, poll_t0, poll_t0)
+                    last_oi_poll_ts = now_poll
+
                 try:
-                    self._emit_result(req.kind, None, t0, req.enqueued_at)
+                    req: WorkerRequest = self.in_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                if req is None:
+                    break
+                t0 = time.perf_counter()
+                try:
+                    if req.kind == "depth":
+                        res = self._process_depth(det_pass, det_spoof, engine, req.payload)
+                        self._emit_result("depth", res, t0, req.enqueued_at)
+                    elif req.kind == "trade":
+                        res = self._process_trade(
+                            det_slice_eq,
+                            det_slice_hit,
+                            det_abs,
+                            det_spoof,
+                            det_bw,
+                            tape_det,
+                            engine,
+                            req.payload,
+                        )
+                        self._emit_result("trade", res, t0, req.enqueued_at)
+                    elif req.kind == "mark":
+                        self._process_mark(engine, req.payload)
+                        self._emit_result("mark", None, t0, req.enqueued_at)
+                    elif req.kind == "snapshot":
+                        res = self._process_snapshot(
+                            det_dom,
+                            dep_bid_det,
+                            dep_ask_det,
+                            basis_pos_trig,
+                            basis_neg_trig,
+                            basis_mr,
+                            engine,
+                            req.payload,
+                        )
+                        last_snapshot = res.snapshot
+                        try:
+                            oi_detector.update_wmid(res.ts, getattr(res.snapshot, "wmid", None))
+                        except Exception:
+                            pass
+                        self._emit_result("snapshot", res, t0, req.enqueued_at)
+                    elif req.kind == "rules":
+                        _apply_rules_to_detectors(
+                            req.payload or {},
+                            det_slice_eq,
+                            det_slice_hit,
+                            det_abs,
+                            det_bw,
+                            det_pass,
+                            det_dom,
+                            det_spoof,
+                            dep_bid_det,
+                            dep_ask_det,
+                            basis_pos_trig,
+                            basis_neg_trig,
+                            basis_mr,
+                            tape_det,
+                        )
+                        oi_cfg = _build_oi_cfg(req.payload or {})
+                        oi_detector.cfg = oi_cfg
+                        oi_detector.wmid_window.max_age_s = max(
+                            oi_detector.cfg.momentum_window_s * 3.0, oi_detector.cfg.oi_window_s * 1.5
+                        )
+                        try:
+                            oi_detector.wmid_window._trim(time.time())
+                        except Exception:
+                            pass
+                        if oi_cfg.enabled and db_adapter is None and self.db_dsn and asyncpg is not None:
+                            try:
+                                db_loop = asyncio.new_event_loop()
+                                db_pool = db_loop.run_until_complete(
+                                    asyncpg.create_pool(dsn=self.db_dsn, min_size=1, max_size=2)
+                                )
+                                db_adapter = _AsyncpgAdapter(db_pool, db_loop)
+                            except Exception:
+                                logger.warning("[cpu-worker] failed to init db adapter after rules update")
+                        self._emit_result("rules", None, t0, req.enqueued_at)
+                    else:
+                        logger.warning(f"[cpu-worker] Unknown request type: {req.kind}")
+                except Exception:
+                    logger.exception("[cpu-worker] failed processing request %s", req.kind)
+                    try:
+                        self._emit_result(req.kind, None, t0, req.enqueued_at)
+                    except Exception:
+                        pass
+        finally:
+            if db_pool and db_loop:
+                try:
+                    db_loop.run_until_complete(db_pool.close())
+                except Exception:
+                    pass
+                try:
+                    db_loop.close()
                 except Exception:
                     pass
 
@@ -631,6 +762,7 @@ class CPUWorkerClient:
         max_queue: int = 50_000,
         service_name: str,
         exported_service: str,
+        db_dsn: Optional[str] = None,
     ):
         ctx = mp.get_context("spawn")
         self.in_queue: mp.Queue = ctx.Queue(maxsize=max_queue)
@@ -641,6 +773,7 @@ class CPUWorkerClient:
             rules=rules,
             instrument_id=instrument_id,
             profile=profile,
+            db_dsn=db_dsn,
         )
         self.rules = rules or {}
         self.loop = None

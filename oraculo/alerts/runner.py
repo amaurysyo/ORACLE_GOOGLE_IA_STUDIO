@@ -1066,6 +1066,7 @@ async def run_pipeline(
         task.add_done_callback(_on_done)
         return task
 
+    db_dsn = getattr(db, "_dsn", None)
     worker_rules = cfg_mgr.rules if cfg_mgr is not None else {}
     worker = CPUWorkerClient(
         rules=worker_rules,
@@ -1073,6 +1074,7 @@ async def run_pipeline(
         profile=rules_profile,
         service_name=service_name,
         exported_service=exported_service,
+        db_dsn=db_dsn,
     )
     await worker.start()
     engine_lock = asyncio.Lock()
@@ -1451,6 +1453,41 @@ async def run_pipeline(
         await enqueue_metrics(res.metric_rows)
         await enqueue_telemetry_flush()
 
+    async def _handle_macro_event(ev: Event) -> None:
+        for rule in eval_rules(_evdict(ev), ctx):
+            aid, t0_dt = await enqueue_rule(rule, ev.ts)
+            if aid is None:
+                continue
+            telemetry.bump(ev.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+            fields = ev.fields or {}
+            oi_val = fields.get("oi_delta_pct")
+            mom_val = fields.get("momentum_usd")
+            try:
+                oi_str = f"{float(oi_val):.2f}%"
+            except Exception:
+                oi_str = "na"
+            try:
+                mom_str = f"{float(mom_val):.2f} USD"
+            except Exception:
+                mom_str = "na"
+            try:
+                obs_metrics.oi_spike_events_total.labels(
+                    side=rule.get("side", "na"), source_oi=str(fields.get("metric_used_oi") or "na")
+                ).inc()
+                if oi_val is not None:
+                    obs_metrics.oi_spike_last_oi_delta_pct.labels(instrument_id=ctx.instrument_id).set(float(oi_val))
+                if mom_val is not None:
+                    obs_metrics.oi_spike_last_momentum_usd.labels(instrument_id=ctx.instrument_id).set(float(mom_val))
+            except Exception:
+                logger.debug("[metrics] failed to observe oi_spike metrics", exc_info=True)
+            text = (
+                f"#{rule['rule']} OI spike {rule.get('side', 'na').upper()} | "
+                f"oi={oi_str} "
+                f"mom={mom_str} "
+                f"i={ev.intensity:.2f}"
+            )
+            await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
+
     async def _dispatch_worker_result(res: WorkerResult) -> None:
         stage = res.kind or "unknown"
         if stage == "trade":
@@ -1469,6 +1506,8 @@ async def run_pipeline(
             elif res.kind == "mark":
                 # no-op: mark results carry no payload beyond timing
                 pass
+            elif res.kind == "macro" and isinstance(res.payload, Event):
+                await _handle_macro_event(res.payload)
         finally:
             hold_duration = time.perf_counter() - hold_t0
             engine_lock.release()
