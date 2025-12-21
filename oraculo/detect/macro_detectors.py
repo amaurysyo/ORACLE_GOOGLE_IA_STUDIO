@@ -41,6 +41,19 @@ class LiqClusterCfg:
     clamp_usd: float = 50_000_000.0
 
 
+@dataclass
+class TopTradersCfg:
+    enabled: bool = False
+    poll_s: float = 15.0
+    retrigger_s: float = 300.0
+    acc_warn: float = 0.60
+    acc_strong: float = 0.70
+    pos_warn: float = 0.60
+    pos_strong: float = 0.70
+    require_both: bool = False
+    choose_by: str = "max_score"
+
+
 def _clamp01(x: float) -> float:
     try:
         return max(0.0, min(1.0, float(x)))
@@ -511,7 +524,221 @@ class LiqClusterDetector:
                 "strong_usd": self.cfg.strong_usd,
                 "wmid": wmid_now,
                 "momentum_usd": momentum_usd,
-                "armed_anchor_wmid": anchor,
-                "armed_ts": armed_ts,
+            "armed_anchor_wmid": anchor,
+            "armed_ts": armed_ts,
+        },
+    )
+
+
+class TopTradersDetector:
+    """
+    Detector macro: bias de Top Traders (account vs position ratios).
+    - Usa tablas binance_futures.top_trader_account_ratio y top_trader_position_ratio.
+    - Puede combinar o forzar métrica (account_only/position_only) vía choose_by.
+    """
+
+    def __init__(self, cfg: TopTradersCfg, instrument_id: str):
+        self.cfg = cfg
+        self.instrument_id = instrument_id
+        self.last_fire_ts: Optional[float] = None
+
+    def _await_if_needed(self, maybe_coro: Any) -> Any:
+        if inspect.isawaitable(maybe_coro):
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(maybe_coro)
+            finally:
+                loop.close()
+        return maybe_coro
+
+    def _fetch_one(self, db: Any, sql: str, *args: Any) -> Optional[Dict[str, Any]]:
+        if db is None:
+            return None
+        row = None
+        if hasattr(db, "fetchrow"):
+            try:
+                row = self._await_if_needed(db.fetchrow(sql, *args))
+            except Exception:
+                row = None
+        if row is None and hasattr(db, "fetch"):
+            try:
+                rows = self._await_if_needed(db.fetch(sql, *args))
+                row = rows[0] if rows else None
+            except Exception:
+                row = None
+        if row is None:
+            return None
+        try:
+            return dict(row)
+        except Exception:
+            return row  # type: ignore[return-value]
+
+    @staticmethod
+    def _norm(x: Optional[float], warn: float, strong: float) -> float:
+        if x is None:
+            return 0.0
+        return _clamp01((float(x) - float(warn)) / max(float(strong - warn), 1e-9))
+
+    @staticmethod
+    def _to_float(x: Any) -> Optional[float]:
+        if x is None:
+            return None
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    def _ratios_from_row(self, row: Optional[Dict[str, Any]]) -> Tuple[Optional[float], Optional[float], Optional[float], Any]:
+        if row is None:
+            return None, None, None, None
+        lr = self._to_float(row.get("long_ratio"))
+        sr = self._to_float(row.get("short_ratio"))
+        ts = _ts_to_epoch(row.get("event_time"))
+        meta = row.get("meta")
+        return lr, sr, ts, meta
+
+    def poll(self, ts_now: float, db: Any, instrument_id: str) -> Optional[Event]:
+        if not self.cfg.enabled:
+            return None
+        _ = instrument_id
+
+        if self.last_fire_ts is not None and (ts_now - self.last_fire_ts) < float(self.cfg.retrigger_s):
+            return None
+
+        sql_acc = """
+            SELECT event_time, long_ratio, short_ratio, meta
+            FROM binance_futures.top_trader_account_ratio
+            WHERE instrument_id=$1
+            ORDER BY event_time DESC
+            LIMIT 1;
+        """
+        sql_pos = """
+            SELECT event_time, long_ratio, short_ratio, meta
+            FROM binance_futures.top_trader_position_ratio
+            WHERE instrument_id=$1
+            ORDER BY event_time DESC
+            LIMIT 1;
+        """
+        row_acc = self._fetch_one(db, sql_acc, self.instrument_id)
+        row_pos = self._fetch_one(db, sql_pos, self.instrument_id)
+
+        choose_mode = (self.cfg.choose_by or "max_score").lower()
+        if choose_mode == "max_score" and (row_acc is None or row_pos is None):
+            return None
+        if choose_mode == "account_only" and row_acc is None:
+            return None
+        if choose_mode == "position_only" and row_pos is None:
+            return None
+
+        acc_long_ratio, acc_short_ratio, acc_ts, acc_meta = self._ratios_from_row(row_acc)
+        pos_long_ratio, pos_short_ratio, pos_ts, pos_meta = self._ratios_from_row(row_pos)
+
+        score_acc_long = self._norm(acc_long_ratio, self.cfg.acc_warn, self.cfg.acc_strong)
+        score_acc_short = self._norm(acc_short_ratio, self.cfg.acc_warn, self.cfg.acc_strong)
+        score_pos_long = self._norm(pos_long_ratio, self.cfg.pos_warn, self.cfg.pos_strong)
+        score_pos_short = self._norm(pos_short_ratio, self.cfg.pos_warn, self.cfg.pos_strong)
+
+        if self.cfg.require_both:
+            long_ok = (acc_long_ratio is not None and acc_long_ratio >= self.cfg.acc_warn) and (
+                pos_long_ratio is not None and pos_long_ratio >= self.cfg.pos_warn
+            )
+            short_ok = (acc_short_ratio is not None and acc_short_ratio >= self.cfg.acc_warn) and (
+                pos_short_ratio is not None and pos_short_ratio >= self.cfg.pos_warn
+            )
+        else:
+            long_ok = (acc_long_ratio is not None and acc_long_ratio >= self.cfg.acc_warn) or (
+                pos_long_ratio is not None and pos_long_ratio >= self.cfg.pos_warn
+            )
+            short_ok = (acc_short_ratio is not None and acc_short_ratio >= self.cfg.acc_warn) or (
+                pos_short_ratio is not None and pos_short_ratio >= self.cfg.pos_warn
+            )
+
+        if not long_ok and not short_ok:
+            return None
+
+        side: Optional[str] = None
+        metric_used = "account+position"
+        side_scores: Dict[str, float] = {}
+        if choose_mode == "account_only":
+            metric_used = "account_only"
+            if long_ok:
+                side_scores["long"] = score_acc_long
+            if short_ok:
+                side_scores["short"] = score_acc_short
+        elif choose_mode == "position_only":
+            metric_used = "position_only"
+            if long_ok:
+                side_scores["long"] = score_pos_long
+            if short_ok:
+                side_scores["short"] = score_pos_short
+        else:
+            # max_score
+            if long_ok:
+                side_scores["long_acc"] = score_acc_long
+                side_scores["long_pos"] = score_pos_long
+            if short_ok:
+                side_scores["short_acc"] = score_acc_short
+                side_scores["short_pos"] = score_pos_short
+            if side_scores:
+                best_key = max(side_scores.items(), key=lambda kv: kv[1])[0]
+                side = "long" if best_key.startswith("long") else "short"
+            if side is None:
+                # fallback to max per-side if keys stripped
+                long_max = max(score_acc_long, score_pos_long) if long_ok else -math.inf
+                short_max = max(score_acc_short, score_pos_short) if short_ok else -math.inf
+                if long_max > short_max and long_ok:
+                    side = "long"
+                elif short_ok:
+                    side = "short"
+            if side is not None:
+                if side == "long":
+                    intensity = max(score_acc_long, score_pos_long)
+                else:
+                    intensity = max(score_acc_short, score_pos_short)
+            else:
+                intensity = 0.0
+        if side is None:
+            if side_scores:
+                best_side, intensity = max(side_scores.items(), key=lambda kv: kv[1])
+                side = "long" if best_side.startswith("long") else "short"
+            else:
+                return None
+        elif choose_mode in ("account_only", "position_only"):
+            if not side_scores:
+                return None
+            best_side, intensity = max(side_scores.items(), key=lambda kv: kv[1])
+            side = "long" if best_side.startswith("long") else "short"
+
+        if self.last_fire_ts is not None and (ts_now - self.last_fire_ts) < float(self.cfg.retrigger_s):
+            return None
+
+        self.last_fire_ts = ts_now
+
+        return Event(
+            kind="top_traders",
+            side=side,
+            ts=ts_now,
+            price=0.0,
+            intensity=_clamp01(float(intensity)),
+            fields={
+                "acc_event_time": acc_ts,
+                "pos_event_time": pos_ts,
+                "acc_long_ratio": acc_long_ratio,
+                "acc_short_ratio": acc_short_ratio,
+                "pos_long_ratio": pos_long_ratio,
+                "pos_short_ratio": pos_short_ratio,
+                "acc_meta": acc_meta,
+                "pos_meta": pos_meta,
+                "acc_warn": self.cfg.acc_warn,
+                "acc_strong": self.cfg.acc_strong,
+                "pos_warn": self.cfg.pos_warn,
+                "pos_strong": self.cfg.pos_strong,
+                "require_both": self.cfg.require_both,
+                "choose_by": self.cfg.choose_by,
+                "metric_used": metric_used,
+                "score_acc_long": score_acc_long,
+                "score_acc_short": score_acc_short,
+                "score_pos_long": score_pos_long,
+                "score_pos_short": score_pos_short,
             },
         )
