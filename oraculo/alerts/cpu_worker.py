@@ -41,7 +41,7 @@ from oraculo.detect.detectors import (
     TapePressureDetector,
     Event,
 )
-from oraculo.detect.macro_detectors import OISpikeCfg, OISpikeDetector
+from oraculo.detect.macro_detectors import LiqClusterCfg, LiqClusterDetector, OISpikeCfg, OISpikeDetector
 from oraculo.obs import metrics as obs_metrics
 
 
@@ -130,6 +130,25 @@ def _build_oi_cfg(rules: Dict[str, Any]) -> OISpikeCfg:
     cfg.mom_warn_usd = float(oi_cfg_raw.get("mom_warn_usd", cfg.mom_warn_usd))
     cfg.mom_strong_usd = float(oi_cfg_raw.get("mom_strong_usd", cfg.mom_strong_usd))
     cfg.require_same_dir = bool(oi_cfg_raw.get("require_same_dir", cfg.require_same_dir))
+    return cfg
+
+
+def _build_liq_cfg(rules: Dict[str, Any]) -> LiqClusterCfg:
+    det = (rules or {}).get("detectors", {}) or {}
+    raw = det.get("liq_cluster") or {}
+    cfg = LiqClusterCfg()
+    cfg.enabled = bool(raw.get("enabled", cfg.enabled))
+    cfg.poll_s = float(raw.get("poll_s", cfg.poll_s))
+    cfg.window_s = float(raw.get("window_s", cfg.window_s))
+    cfg.retrigger_s = float(raw.get("retrigger_s", cfg.retrigger_s))
+    cfg.warn_usd = float(raw.get("warn_usd", cfg.warn_usd))
+    cfg.strong_usd = float(raw.get("strong_usd", cfg.strong_usd))
+    cfg.confirm_s = float(raw.get("confirm_s", cfg.confirm_s))
+    cfg.momentum_window_s = float(raw.get("momentum_window_s", cfg.momentum_window_s))
+    cfg.min_move_usd = float(raw.get("min_move_usd", cfg.min_move_usd))
+    cfg.max_rebound_usd = float(raw.get("max_rebound_usd", cfg.max_rebound_usd))
+    cfg.use_usd = bool(raw.get("use_usd", cfg.use_usd))
+    cfg.clamp_usd = float(raw.get("clamp_usd", cfg.clamp_usd))
     return cfg
 
 
@@ -419,11 +438,14 @@ class CPUWorkerProcess(mp.Process):
 
         oi_cfg = _build_oi_cfg(self.rules)
         oi_detector = OISpikeDetector(oi_cfg, self.instrument_id)
+        liq_cfg = _build_liq_cfg(self.rules)
+        liq_detector = LiqClusterDetector(liq_cfg, self.instrument_id)
         db_loop: Optional[asyncio.AbstractEventLoop] = None
         db_pool = None
         db_adapter: Optional[_AsyncpgAdapter] = None
         last_snapshot: Optional[Snapshot] = None
         last_oi_poll_ts = 0.0
+        last_liq_poll_ts = 0.0
 
         def _close_db_resources() -> None:
             nonlocal db_pool, db_loop, db_adapter
@@ -460,19 +482,20 @@ class CPUWorkerProcess(mp.Process):
                 db_loop = None
                 db_adapter = None
 
-        if oi_cfg.enabled and self.db_dsn and asyncpg is not None:
+        need_db = (oi_cfg.enabled or liq_cfg.enabled)
+        if need_db and self.db_dsn and asyncpg is not None:
             try:
                 db_loop = asyncio.new_event_loop()
                 db_pool = db_loop.run_until_complete(asyncpg.create_pool(dsn=self.db_dsn, min_size=1, max_size=2))
                 db_adapter = _AsyncpgAdapter(db_pool, db_loop)
-                logger.info("[cpu-worker] OI spike detector enabled with DB adapter.")
+                logger.info("[cpu-worker] DB adapter enabled for macro detectors.")
             except Exception as e:
-                logger.warning(f"[cpu-worker] Failed to init DB pool for OI spike detector: {e!s}")
+                logger.warning(f"[cpu-worker] Failed to init DB pool for macro detectors: {e!s}")
                 _close_db_resources()
-        elif oi_cfg.enabled and not self.db_dsn:
-            logger.warning("[cpu-worker] OI spike detector enabled but db_dsn not provided; skipping polls.")
-        elif oi_cfg.enabled and asyncpg is None:
-            logger.warning("[cpu-worker] OI spike detector enabled but asyncpg not available; skipping polls.")
+        elif need_db and not self.db_dsn:
+            logger.warning("[cpu-worker] Macro detectors enabled but db_dsn not provided; skipping polls.")
+        elif need_db and asyncpg is None:
+            logger.warning("[cpu-worker] Macro detectors enabled but asyncpg not available; skipping polls.")
 
         try:
             while True:
@@ -492,6 +515,21 @@ class CPUWorkerProcess(mp.Process):
                     if ev_macro is not None:
                         self._emit_result("macro", ev_macro, poll_t0, poll_t0)
                     last_oi_poll_ts = now_poll
+                if (
+                    liq_detector
+                    and liq_detector.cfg.enabled
+                    and db_adapter is not None
+                    and (now_poll - last_liq_poll_ts) >= float(liq_detector.cfg.poll_s)
+                ):
+                    poll_t0 = time.perf_counter()
+                    try:
+                        ev_macro = liq_detector.poll(now_poll, db_adapter, self.instrument_id, last_snapshot)
+                    except Exception:
+                        ev_macro = None
+                        logger.exception("[cpu-worker] liq_cluster poll failed")
+                    if ev_macro is not None:
+                        self._emit_result("macro", ev_macro, poll_t0, poll_t0)
+                    last_liq_poll_ts = now_poll
 
                 try:
                     req: WorkerRequest = self.in_queue.get(timeout=0.1)
@@ -536,6 +574,10 @@ class CPUWorkerProcess(mp.Process):
                             oi_detector.update_wmid(res.ts, getattr(res.snapshot, "wmid", None))
                         except Exception:
                             pass
+                        try:
+                            liq_detector.update_wmid(res.ts, getattr(res.snapshot, "wmid", None))
+                        except Exception:
+                            pass
                         self._emit_result("snapshot", res, t0, req.enqueued_at)
                     elif req.kind == "rules":
                         _apply_rules_to_detectors(
@@ -563,7 +605,17 @@ class CPUWorkerProcess(mp.Process):
                             oi_detector.wmid_window._trim(time.time())
                         except Exception:
                             pass
-                        if oi_cfg.enabled and db_adapter is None and self.db_dsn and asyncpg is not None:
+                        liq_cfg = _build_liq_cfg(req.payload or {})
+                        liq_detector.cfg = liq_cfg
+                        liq_detector.wmid_window.max_age_s = max(
+                            liq_detector.cfg.momentum_window_s * 3.0, liq_detector.cfg.window_s * 1.5
+                        )
+                        try:
+                            liq_detector.wmid_window._trim(time.time())
+                        except Exception:
+                            pass
+                        need_db_after = (oi_cfg.enabled or liq_cfg.enabled)
+                        if need_db_after and db_adapter is None and self.db_dsn and asyncpg is not None:
                             try:
                                 db_loop = asyncio.new_event_loop()
                                 db_pool = db_loop.run_until_complete(
