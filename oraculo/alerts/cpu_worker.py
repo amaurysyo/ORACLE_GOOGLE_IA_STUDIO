@@ -171,6 +171,8 @@ def _apply_rules_to_detectors(
     d = det.get("dominance") or {}
     det_dom.cfg.enabled = bool(d.get("enabled", det_dom.cfg.enabled))
     det_dom.cfg.dom_pct = float(d.get("dom_pct", det_dom.cfg.dom_pct))
+    det_dom.cfg.dom_pct_doc = float(d.get("dom_pct_doc", det_dom.cfg.dom_pct_doc))
+    det_dom.cfg.metric_source = str(d.get("metric_source", det_dom.cfg.metric_source))
     det_dom.cfg.max_spread_usd = float(d.get("max_spread_usd", det_dom.cfg.max_spread_usd))
     det_dom.cfg.levels = int(d.get("levels", det_dom.cfg.levels))
     det_dom.cfg.hold_ms = int(d.get("hold_ms", det_dom.cfg.hold_ms))
@@ -218,6 +220,10 @@ def _apply_rules_to_detectors(
     bx = basis_cfg.get("extreme") or {}
     basis_pos_trig.cfg.threshold = float(bx.get("pos_bps", basis_pos_trig.cfg.threshold))
     basis_neg_trig.cfg.threshold = float(bx.get("neg_bps", basis_neg_trig.cfg.threshold))
+    basis_pos_trig.cfg.metric_source = str(basis_cfg.get("metric_source", basis_pos_trig.cfg.metric_source))
+    basis_neg_trig.cfg.metric_source = str(basis_cfg.get("metric_source", basis_neg_trig.cfg.metric_source))
+    basis_pos_trig.cfg.doc_sign_mode = str(basis_cfg.get("doc_sign_mode", basis_pos_trig.cfg.doc_sign_mode))
+    basis_neg_trig.cfg.doc_sign_mode = str(basis_cfg.get("doc_sign_mode", basis_neg_trig.cfg.doc_sign_mode))
 
     bmr = basis_cfg.get("mean_revert") or {}
     if bmr:
@@ -241,6 +247,8 @@ def _apply_rules_to_detectors(
                 basis_mr.cfg.retrigger_s = float(basis_cfg["mr_hold_ms"]) / 1000.0
             except (TypeError, ValueError):
                 pass
+    basis_mr.cfg.metric_source = str(basis_cfg.get("metric_source", basis_mr.cfg.metric_source))
+    basis_mr.cfg.doc_sign_mode = str(basis_cfg.get("doc_sign_mode", basis_mr.cfg.doc_sign_mode))
 
     tp = det.get("tape_pressure") or {}
     tape_det.cfg.window_s = float(tp.get("window_s", tape_det.cfg.window_s))
@@ -476,7 +484,46 @@ class CPUWorkerProcess(mp.Process):
         now_ts = payload["ts"]
         snap = engine.get_snapshot(now_ts)
 
-        evd = det_dom.maybe_emit(now_ts, spread_usd=float(snap.spread_usd or 0.0) if snap.spread_usd is not None else None)
+        spread_usd = float(snap.spread_usd or 0.0) if snap.spread_usd is not None else None
+
+        dom_event: Optional[Event] = None
+        metric_source = (det_dom.cfg.metric_source or "legacy").lower()
+        if metric_source in ("doc", "auto"):
+            doc_bid = getattr(snap, "dominance_bid_doc", None)
+            doc_ask = getattr(snap, "dominance_ask_doc", None)
+            if spread_usd is not None and spread_usd <= det_dom.cfg.max_spread_usd:
+                side_doc: Optional[str] = None
+                dom_val: Optional[float] = None
+                metric_used: Optional[str] = None
+                if doc_bid is not None and doc_bid >= det_dom.cfg.dom_pct_doc:
+                    side_doc = "buy"
+                    dom_val = doc_bid
+                    metric_used = "dominance_bid_doc"
+                elif doc_ask is not None and doc_ask >= det_dom.cfg.dom_pct_doc:
+                    side_doc = "sell"
+                    dom_val = doc_ask
+                    metric_used = "dominance_ask_doc"
+
+                if side_doc and dom_val is not None:
+                    price = snap.best_bid if side_doc == "buy" else snap.best_ask
+                    dom_event = Event(
+                        "dominance",
+                        side_doc,
+                        now_ts,
+                        price or 0.0,
+                        dom_val * 100.0,
+                        {
+                            "metric_used": metric_used,
+                            "metric_source": "doc",
+                            "dom_pct_doc": det_dom.cfg.dom_pct_doc,
+                        },
+                    )
+
+        if dom_event is None and metric_source != "doc":
+            dom_event = det_dom.maybe_emit(now_ts, spread_usd=spread_usd)
+            if dom_event:
+                dom_event.fields["metric_used"] = "dom_levels_legacy"
+                dom_event.fields["metric_source"] = "legacy"
         ev_dep_bid = dep_bid_det.on_snapshot(now_ts, snap.__dict__ if hasattr(snap, "__dict__") else dict())
         ev_dep_ask = dep_ask_det.on_snapshot(now_ts, snap.__dict__ if hasattr(snap, "__dict__") else dict())
 
@@ -526,7 +573,7 @@ class CPUWorkerProcess(mp.Process):
         return SnapshotProcessResult(
             ts=now_ts,
             snapshot=snap,
-            dominance_event=evd,
+            dominance_event=dom_event,
             dep_bid_event=ev_dep_bid,
             dep_ask_event=ev_dep_ask,
             basis_pos_event=ev_bpos,

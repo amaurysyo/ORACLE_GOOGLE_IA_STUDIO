@@ -89,6 +89,12 @@ Fuente: Sección 6 “Métricas Microestructurales” del DOC `📘 Proyecto —
 - **Alertas/Rules**: el runner propaga eventos de dominancia, depleción y basis a reglas R1/R2, R9/R10, R13/R14, R15/R18.【F:oraculo/alerts/runner.py†L1360-L1449】
 - **Dashboards/consultas**: no hay referencias a `basis_bps`, `basis_vel_bps_s`, `dom_*`, `dep_*`, `refill_*` en `dashboards/pack-min.json` (búsqueda sin coincidencias); las únicas dependencias de nombres de métrica están en los detectores y en el pipeline de alertas citado arriba.
 
+## Rule migration status
+- **R9/R10 (Dominance)**: el CPU worker soporta `legacy|doc|auto`; en `auto` prioriza `dominance_*_doc` y cae a niveles legacy si la métrica DOC no está disponible.【F:oraculo/alerts/cpu_worker.py†L455-L486】
+- **R15/R16 (Basis extremo)**: los triggers de basis permiten `metric_source` `legacy|doc|auto`, con `doc_sign_mode` para invertir el signo de `basis_bps_doc` y registrar la métrica usada en el evento.【F:oraculo/detect/detectors.py†L526-L564】
+- **R17/R18 (Basis mean-revert)**: mean-revert usa `basis_bps_doc`/`basis_vel_bps_s_doc` con fallback legacy y expone en el evento las métricas usadas, `metric_source` y `doc_sign_mode`.【F:oraculo/detect/detectors.py†L573-L614】
+- `doc_sign_mode` queda en `legacy` por defecto para preservar la interpretación actual mientras se migra el consumo a métricas DOC.【F:config/rules.yaml†L76-L94】
+
 ## Post-fix (DOC vs legacy)
 - Se añadieron las series DOC, preservando las legacy: `imbalance_doc`, `dominance_bid_doc`, `dominance_ask_doc`, `wmid`, `depletion_bid_doc`, `depletion_ask_doc`, `basis_bps_doc`, `basis_vel_bps_s_doc`, `basis_accel_bps_s2_doc` y `oi_delta_pct_doc`.【F:oraculo/alerts/cpu_worker.py†L480-L500】【F:oraculo/ingest/binance_rest.py†L125-L155】
 - Fórmulas DOC aplicadas:
