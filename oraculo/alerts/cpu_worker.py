@@ -101,10 +101,19 @@ def _apply_rules_to_detectors(
 ) -> None:
     rules = rules or {}
 
-    def _apply_dep_cfg(detector: DepletionDetector, side: str, dep_cfg: Dict[str, Any]) -> None:
+    def _apply_dep_cfg(
+        detector: DepletionDetector,
+        side: str,
+        dep_cfg: Dict[str, Any],
+        dep_root: Dict[str, Any],
+        metrics_doc_cfg: Dict[str, Any],
+    ) -> None:
         pct_candidates = [
             dep_cfg.get("pct_drop"),
             dep_cfg.get("pct"),
+            dep_root.get("pct_drop"),
+            dep_root.get(f"pct_drop_{side}"),
+            dep_root.get(f"pct_{side}"),
             rules.get("depletion", {}).get(f"pct_drop_{side}"),
             rules.get("depletion", {}).get(f"pct_{side}"),
         ]
@@ -112,19 +121,37 @@ def _apply_rules_to_detectors(
         if pct_val is not None:
             detector.cfg.pct_drop = float(pct_val)
 
-        hold_val = dep_cfg.get("hold_ms", rules.get("depletion", {}).get("hold_ms"))
+        hold_val = dep_cfg.get("hold_ms", dep_root.get("hold_ms", rules.get("depletion", {}).get("hold_ms")))
         if hold_val is not None:
             detector.cfg.hold_ms = int(hold_val)
 
-        retrigger_val = dep_cfg.get("retrigger_s", rules.get("depletion", {}).get("retrigger_s"))
+        retrigger_val = dep_cfg.get("retrigger_s", dep_root.get("retrigger_s", rules.get("depletion", {}).get("retrigger_s")))
         if retrigger_val is not None:
             detector.cfg.retrigger_s = float(retrigger_val)
 
-        enabled_val = dep_cfg.get("enabled", rules.get("depletion", {}).get("enabled"))
+        enabled_val = dep_cfg.get("enabled", dep_root.get("enabled", rules.get("depletion", {}).get("enabled")))
         if enabled_val is not None:
             detector.cfg.enabled = bool(enabled_val)
 
+        metric_source_val = dep_cfg.get("metric_source", dep_root.get("metric_source"))
+        if metric_source_val is not None:
+            detector.cfg.metric_source = str(metric_source_val)
+
+        doc_cfg = dep_root.get("doc") or {}
+        detector.cfg.doc_window_s = float(doc_cfg.get("window_s", metrics_doc_cfg.get("depletion_doc_window_s", detector.cfg.doc_window_s)))
+        if "dv_warn" in doc_cfg:
+            detector.cfg.dv_warn = float(doc_cfg["dv_warn"])
+        if "dv_strong" in doc_cfg:
+            detector.cfg.dv_strong = float(doc_cfg["dv_strong"])
+        if "clamp_abs_dv" in doc_cfg:
+            detector.cfg.clamp_abs_dv = float(doc_cfg["clamp_abs_dv"])
+        if "severity_mode" in doc_cfg:
+            detector.cfg.severity_mode = str(doc_cfg["severity_mode"])
+        if "require_negative" in doc_cfg:
+            detector.cfg.require_negative = bool(doc_cfg["require_negative"])
+
     det = (rules or {}).get("detectors", {}) or {}
+    metrics_doc_cfg = det.get("metrics_doc") or {}
 
     # slicing iceberg (equal)
     s = det.get("slicing_aggr") or {}
@@ -213,8 +240,8 @@ def _apply_rules_to_detectors(
     dep = det.get("depletion") or {}
     dep_bid = dep.get("bid") or {}
     dep_ask = dep.get("ask") or {}
-    _apply_dep_cfg(dep_bid_det, "bid", dep_bid)
-    _apply_dep_cfg(dep_ask_det, "ask", dep_ask)
+    _apply_dep_cfg(dep_bid_det, "bid", dep_bid, dep, metrics_doc_cfg)
+    _apply_dep_cfg(dep_ask_det, "ask", dep_ask, dep, metrics_doc_cfg)
 
     basis_cfg = det.get("basis") or {}
     bx = basis_cfg.get("extreme") or {}

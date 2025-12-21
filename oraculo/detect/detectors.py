@@ -4,6 +4,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Tuple, List
+import math
 
 # --------- DTO de evento ----------
 @dataclass
@@ -478,6 +479,13 @@ class DepletionCfg:
     hold_ms: int = 800
     retrigger_s: int = 30
     enabled: bool = True       # permite activar/desactivar por rules.yaml
+    metric_source: str = "legacy"  # "legacy" | "doc" | "auto"
+    doc_window_s: float = 3.0
+    dv_warn: float = 10.0
+    dv_strong: float = 30.0
+    clamp_abs_dv: float = 200.0
+    severity_mode: str = "linear"  # "linear" | "log"
+    require_negative: bool = True
 
 class DepletionDetector:
     """
@@ -490,13 +498,73 @@ class DepletionDetector:
         self._arm_ts: Optional[float] = None
 
     def on_snapshot(self, ts: float, snap: Dict[str, Any]) -> Optional[Event]:
+        from oraculo.metrics.resolve import resolve
+        try:
+            from oraculo.obs import metrics as obs_metrics  # type: ignore
+        except Exception:  # pragma: no cover - observabilidad opcional
+            obs_metrics = None
+
         if not self.cfg.enabled:
             return None
 
         side = self.cfg.side
-        dep_key = "dep_bid" if side == "buy" else "dep_ask"
-        dep = float(snap.get(dep_key, 0.0) or 0.0)
-        if dep < self.cfg.pct_drop:
+        doc_key = "depletion_bid_doc" if side == "buy" else "depletion_ask_doc"
+        legacy_key = "dep_bid" if side == "buy" else "dep_ask"
+
+        res = resolve(snap, doc_key, fallback_key=legacy_key, source=self.cfg.metric_source)
+        val = res.value
+        if val is None:
+            self._arm_ts = None
+            return None
+
+        used_source = res.used_source or self.cfg.metric_source
+        if used_source == "legacy":
+            dep = float(val)
+            if dep < self.cfg.pct_drop:
+                self._arm_ts = None
+                return None
+
+            if (ts - self._last_emit_ts) < self.cfg.retrigger_s:
+                return None
+
+            if self._arm_ts is None:
+                self._arm_ts = ts
+                return None
+
+            if (ts - self._arm_ts) * 1000.0 >= self.cfg.hold_ms:
+                self._last_emit_ts = ts
+                self._arm_ts = None
+                event = Event(
+                    "depletion",
+                    side,
+                    ts,
+                    price=0.0,
+                    intensity=dep,
+                    fields={"metric_used": res.used_key, "metric_source": "legacy"},
+                )
+                if obs_metrics:
+                    try:
+                        obs_metrics.depletion_events_total.labels(source="legacy", side=side).inc()
+                    except Exception:
+                        pass
+                return event
+            return None
+
+        if used_source != "doc":
+            self._arm_ts = None
+            return None
+
+        dv = float(val)
+        if self.cfg.require_negative:
+            if dv >= 0:
+                self._arm_ts = None
+                return None
+            depletion_amount = max(0.0, -dv)
+        else:
+            depletion_amount = abs(dv)
+        depletion_amount = min(depletion_amount, self.cfg.clamp_abs_dv)
+
+        if depletion_amount < self.cfg.dv_warn:
             self._arm_ts = None
             return None
 
@@ -507,11 +575,41 @@ class DepletionDetector:
             self._arm_ts = ts
             return None
 
-        if (ts - self._arm_ts) * 1000.0 >= self.cfg.hold_ms:
-            self._last_emit_ts = ts
-            self._arm_ts = None
-            return Event("depletion", side, ts, price=0.0, intensity=dep, fields={})
-        return None
+        if (ts - self._arm_ts) * 1000.0 < self.cfg.hold_ms:
+            return None
+
+        warn = self.cfg.dv_warn
+        strong = self.cfg.dv_strong
+        if self.cfg.severity_mode == "log":
+            denom = math.log1p(strong / max(warn, 1e-9))
+            if denom <= 0:
+                intensity = 1.0
+            else:
+                intensity = math.log1p(depletion_amount / max(warn, 1e-9)) / denom
+        else:
+            intensity = (depletion_amount - warn) / max(strong - warn, 1e-9)
+        intensity = max(0.0, min(1.0, intensity))
+
+        self._last_emit_ts = ts
+        self._arm_ts = None
+
+        fields = {
+            "metric_used": res.used_key,
+            "metric_source": "doc",
+            "dv": dv,
+            "depletion_amount": depletion_amount,
+            "dv_warn": warn,
+            "dv_strong": strong,
+            "severity_mode": self.cfg.severity_mode,
+            "window_s": self.cfg.doc_window_s,
+        }
+        if obs_metrics:
+            try:
+                obs_metrics.depletion_events_total.labels(source="doc", side=side).inc()
+                obs_metrics.depletion_doc_amount.observe(depletion_amount)
+            except Exception:
+                pass
+        return Event("depletion", side, ts, price=0.0, intensity=intensity, fields=fields)
 
 # --------- Trigger genérico de métricas de snapshot ---------
 @dataclass
