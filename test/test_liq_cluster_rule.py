@@ -133,5 +133,8 @@ def test_audit_fields_present():
         "wmid",
         "momentum_usd",
         "armed_anchor_wmid",
+        "armed_ts",
     ]:
         assert key in fields
+    assert fields["armed_anchor_wmid"] is not None
+    assert fields["armed_ts"] is not None
