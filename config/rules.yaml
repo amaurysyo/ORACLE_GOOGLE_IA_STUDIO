@@ -41,6 +41,8 @@ detectors:
   dominance:
     enabled: true
     dom_pct: 0.80
+    dom_pct_doc: 0.60       # umbral por volumen DOC
+    metric_source: auto     # legacy|doc|auto
     max_spread_usd: 2.0
     levels: 1000             # puedes subir a 5000 si tu book/REST lo soporta
     hold_ms: 1000
@@ -73,10 +75,15 @@ detectors:
 
   # --- R15–R18 Basis thresholds (Mark/Index). Leídos por las reglas, no depth.
   basis:
-    extreme_pos_bps: 50     # contango extremo -> R15
-    extreme_neg_bps: -50    # backwardation extremo -> R16
-    mr_cross_eps_bps: 3     # tolerancia para cruce por cero en mean reversion
-    mr_hold_ms: 1000        # evitar flicker (mantener cruce un mínimo)
+    metric_source: auto     # legacy|doc|auto
+    doc_sign_mode: legacy   # legacy=invierte DOC para mantener semántica actual
+    extreme:
+      pos_bps: 100          # contango extremo -> R15
+      neg_bps: -100         # backwardation extremo -> R16
+    mean_revert:
+      gate_abs_bps: 25
+      vel_gate_abs: 1.5
+      retrigger_s: 60
 
   # --- R19–R22 Opciones (Deribit). Umbrales de IV y Skew de OI
   options:

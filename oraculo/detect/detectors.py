@@ -337,6 +337,8 @@ class BreakWallDetector:
 class DominanceCfg:
     enabled: bool = True
     dom_pct: float = 0.80
+    dom_pct_doc: float = 0.60
+    metric_source: str = "legacy"
     max_spread_usd: float = 2.0
     levels: int = 1000
     hold_ms: int = 1000
@@ -519,6 +521,9 @@ class MetricTrigCfg:
     direction: str = "above"   # "above" | "below"
     hold_ms: int = 500
     retrigger_s: int = 30
+    metric_doc: Optional[str] = None
+    metric_source: str = "legacy"  # "legacy" | "doc" | "auto"
+    doc_sign_mode: str = "legacy"  # "legacy" => invierte signo de DOC
 
 class MetricTriggerDetector:
     """
@@ -531,7 +536,13 @@ class MetricTriggerDetector:
         self._last_emit: float = 0.0
 
     def on_snapshot(self, ts: float, snap: Dict[str, Any], book=None) -> Optional[Event]:
-        val = snap.get(self.cfg.metric)
+        from oraculo.metrics.resolve import resolve
+
+        doc_key = self.cfg.metric_doc or (f"{self.cfg.metric}_doc" if not self.cfg.metric.endswith("_doc") else self.cfg.metric)
+        transform = (lambda x: -x) if self.cfg.doc_sign_mode == "legacy" else None
+        res = resolve(snap, doc_key, fallback_key=self.cfg.metric, source=self.cfg.metric_source, transform=transform)
+
+        val = res.value
         if val is None:
             self._arm_ts = None
             return None
@@ -557,7 +568,14 @@ class MetricTriggerDetector:
                 ts=ts,
                 price=0.0,
                 intensity=float(val),
-                fields={"metric": self.cfg.metric, "threshold": self.cfg.threshold, "dir": self.cfg.direction},
+                fields={
+                    "metric": self.cfg.metric,
+                    "threshold": self.cfg.threshold,
+                    "dir": self.cfg.direction,
+                    "metric_used": res.used_key or self.cfg.metric,
+                    "metric_source": res.used_source or self.cfg.metric_source,
+                    "doc_sign_mode": self.cfg.doc_sign_mode,
+                },
             )
         return None
 
@@ -567,6 +585,8 @@ class BasisMRcfg:
     gate_abs_bps: float = 25.0
     vel_gate_abs: float = 1.5
     retrigger_s: int = 60
+    metric_source: str = "legacy"
+    doc_sign_mode: str = "legacy"
 
 class BasisMeanRevertDetector:
     """
@@ -583,8 +603,21 @@ class BasisMeanRevertDetector:
         return 1 if x > 0 else (-1 if x < 0 else 0)
 
     def on_snapshot(self, ts: float, snap: Dict[str, Any], book=None) -> Optional[Event]:
-        bps = float(snap.get("basis_bps", 0.0) or 0.0)
-        vel = float(snap.get("basis_vel_bps_s", 0.0) or 0.0)
+        from oraculo.metrics.resolve import resolve
+
+        transform = (lambda x: -x) if self.cfg.doc_sign_mode == "legacy" else None
+        bps_res = resolve(snap, "basis_bps_doc", fallback_key="basis_bps", source=self.cfg.metric_source, transform=transform)
+        vel_res = resolve(
+            snap, "basis_vel_bps_s_doc", fallback_key="basis_vel_bps_s", source=self.cfg.metric_source, transform=transform
+        )
+
+        bps_val = bps_res.value
+        vel_val = vel_res.value
+        if bps_val is None or vel_val is None:
+            return None
+
+        bps = float(bps_val)
+        vel = float(vel_val)
         s = self._sign(vel)
         if self._last_sign is None:
             self._last_sign = s
@@ -600,7 +633,21 @@ class BasisMeanRevertDetector:
 
         side = "buy" if s > 0 else "sell"
         self._last_emit = ts
-        return Event("basis_mean_revert", side, ts, price=0.0, intensity=abs(vel), fields={"bps": bps})
+        used_source = vel_res.used_source or bps_res.used_source
+        return Event(
+            "basis_mean_revert",
+            side,
+            ts,
+            price=0.0,
+            intensity=abs(vel),
+            fields={
+                "bps": bps,
+                "metric_used_basis": bps_res.used_key or "basis_bps",
+                "metric_used_vel": vel_res.used_key or "basis_vel_bps_s",
+                "metric_source": used_source or self.cfg.metric_source,
+                "doc_sign_mode": self.cfg.doc_sign_mode,
+            },
+        )
 
 # --------- Tape pressure (ratio de agresiones) ---------
 @dataclass
