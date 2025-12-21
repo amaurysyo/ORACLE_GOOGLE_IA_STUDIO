@@ -274,7 +274,19 @@ class CPUWorkerProcess(mp.Process):
     def run(self) -> None:  # type: ignore[override]
         faulthandler = __import__("faulthandler")
         faulthandler.enable()
-        engine = MetricsEngine(top_n=1000)
+        det_rules = (self.rules or {}).get("detectors") or {}
+        metrics_doc_cfg = det_rules.get("metrics_doc") or {}
+        imbalance_doc_window_s = float(metrics_doc_cfg.get("imbalance_doc_window_s", 3.0))
+        dominance_doc_window_s = float(metrics_doc_cfg.get("dominance_doc_window_s", 2.0))
+        depletion_doc_window_s = float(metrics_doc_cfg.get("depletion_doc_window_s", 3.0))
+        basis_doc_window_s = float(metrics_doc_cfg.get("basis_doc_window_s", 120.0))
+        engine = MetricsEngine(
+            top_n=1000,
+            imbalance_doc_window_s=imbalance_doc_window_s,
+            dominance_doc_window_s=dominance_doc_window_s,
+            depletion_doc_window_s=depletion_doc_window_s,
+            basis_doc_window_s=basis_doc_window_s,
+        )
 
         det_slice_eq = SlicingAggDetector(SlicingAggConfig(require_equal=True, equal_tol_pct=0.0, equal_tol_abs=0.0))
         det_slice_hit = SlicingAggDetector(SlicingAggConfig(require_equal=False))
@@ -429,7 +441,7 @@ class CPUWorkerProcess(mp.Process):
         det_abs.on_best(bb, ba)
         ev_abs = det_abs.on_trade(ts, side, px, qty)
 
-        snap = engine.get_snapshot()
+        snap = engine.get_snapshot(ts)
         ev_tp = tape_det.on_trade(ts, side, px, qty)
 
         bw_event: Optional[Event] = None
@@ -462,7 +474,7 @@ class CPUWorkerProcess(mp.Process):
         payload: Dict[str, Any],
     ) -> SnapshotProcessResult:
         now_ts = payload["ts"]
-        snap = engine.get_snapshot()
+        snap = engine.get_snapshot(now_ts)
 
         evd = det_dom.maybe_emit(now_ts, spread_usd=float(snap.spread_usd or 0.0) if snap.spread_usd is not None else None)
         ev_dep_bid = dep_bid_det.on_snapshot(now_ts, snap.__dict__ if hasattr(snap, "__dict__") else dict())
@@ -474,23 +486,42 @@ class CPUWorkerProcess(mp.Process):
 
         rows: list[Tuple[str, dt.datetime, int, str, float, Optional[str], str]] = []
 
-        def add(name: str, val):
+        def add(name: str, val, window_s: int | float = 1):
             if val is None:
                 return
             if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):  # type: ignore[name-defined]
                 return
-            rows.append((self.instrument_id, dt.datetime.fromtimestamp(now_ts, tz=dt.timezone.utc), 1, name, float(val), self.profile, "{}"))
+            rows.append(
+                (
+                    self.instrument_id,
+                    dt.datetime.fromtimestamp(now_ts, tz=dt.timezone.utc),
+                    int(window_s),
+                    name,
+                    float(val),
+                    self.profile,
+                    "{}",
+                )
+            )
 
         add("spread_usd", getattr(snap, "spread_usd", None))
         add("basis_bps", getattr(snap, "basis_bps", None))
         add("basis_vel_bps_s", getattr(snap, "basis_vel_bps_s", None))
+        add("basis_bps_doc", getattr(snap, "basis_bps_doc", None), window_s=engine.basis_doc_window_s)
+        add("basis_vel_bps_s_doc", getattr(snap, "basis_vel_bps_s_doc", None), window_s=engine.basis_doc_window_s)
+        add("basis_accel_bps_s2_doc", getattr(snap, "basis_accel_bps_s2_doc", None), window_s=engine.basis_doc_window_s)
         add("dom_bid", getattr(snap, "dom_bid", None))
         add("dom_ask", getattr(snap, "dom_ask", None))
+        add("dominance_bid_doc", getattr(snap, "dominance_bid_doc", None), window_s=engine.dominance_doc_window_s)
+        add("dominance_ask_doc", getattr(snap, "dominance_ask_doc", None), window_s=engine.dominance_doc_window_s)
         add("imbalance", getattr(snap, "imbalance", None))
+        add("imbalance_doc", getattr(snap, "imbalance_doc", None), window_s=engine.imbalance_doc_window_s)
         add("dep_bid", getattr(snap, "dep_bid", None))
         add("dep_ask", getattr(snap, "dep_ask", None))
+        add("depletion_bid_doc", getattr(snap, "depletion_bid_doc", None), window_s=engine.depletion_doc_window_s)
+        add("depletion_ask_doc", getattr(snap, "depletion_ask_doc", None), window_s=engine.depletion_doc_window_s)
         add("refill_bid_3s", getattr(snap, "refill_bid_3s", None))
         add("refill_ask_3s", getattr(snap, "refill_ask_3s", None))
+        add("wmid", getattr(snap, "wmid", None), window_s=1)
 
         return SnapshotProcessResult(
             ts=now_ts,

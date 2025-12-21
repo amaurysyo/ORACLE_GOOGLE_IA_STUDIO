@@ -15,6 +15,7 @@ from aiohttp import ClientConnectorError, ClientResponseError
 from loguru import logger
 
 from .batch_writer import AsyncBatcher
+from ..db import DB
 from ..obs.metrics import http_fail_total, http_latency_ms
 
 BINANCE_FAPI = "https://fapi.binance.com"
@@ -103,7 +104,11 @@ async def _get_json(
 
 
 async def run_open_interest_poller(
-    batcher: AsyncBatcher, settings: dict, instrument_id: str = "BINANCE:PERP:BTCUSDT"
+    batcher: AsyncBatcher,
+    settings: dict,
+    instrument_id: str = "BINANCE:PERP:BTCUSDT",
+    *,
+    db: Optional[DB] = None,
 ) -> None:
     """
     GET /fapi/v1/openInterest -> binance_futures.open_interest
@@ -120,6 +125,7 @@ async def run_open_interest_poller(
     async with aiohttp.ClientSession(headers=headers, connector=connector, trust_env=True) as session:
         backoff = 0.5
         base_sleep = max(0.001, float(settings.get("open_interest_ms", settings.get("oi_ms", 1000))) / 1000.0)
+        oi_window_s = float(settings.get("oi_doc_window_s", settings.get("oi_window_s", 120)))
         while True:
             try:
                 await bucket.acquire(1.0)
@@ -132,6 +138,39 @@ async def run_open_interest_poller(
                 ts = _ms_to_ts(int(data["time"]))
                 oi = float(data["openInterest"])
                 batcher.add("bfut_oi", (instrument_id, ts, oi, "{}"))
+                if db is not None:
+                    try:
+                        prev_cutoff = ts - dt.timedelta(seconds=oi_window_s)
+                        prev_oi = await db.fetchval(
+                            """
+                            SELECT open_interest
+                            FROM binance_futures.open_interest
+                            WHERE instrument_id = $1 AND event_time <= $2
+                            ORDER BY event_time DESC
+                            LIMIT 1
+                            """,
+                            instrument_id,
+                            prev_cutoff,
+                        )
+                        if prev_oi not in (None, 0):
+                            delta_pct = (oi - float(prev_oi)) / float(prev_oi) * 100.0
+                            await db.execute(
+                                """
+                                INSERT INTO oraculo.metrics_series
+                                  (instrument_id, event_time, window_s, metric, value, profile, meta)
+                                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                                ON CONFLICT DO NOTHING
+                                """,
+                                instrument_id,
+                                ts,
+                                int(oi_window_s),
+                                "oi_delta_pct_doc",
+                                float(delta_pct),
+                                "default",
+                                "{}",
+                            )
+                    except Exception as e:
+                        logger.warning(f"[oi] fallo delta_pct_doc {type(e).__name__}: {e!s}")
                 await batcher.flush_if_needed()
                 backoff = 0.5
                 sleep_s = base_sleep * random.uniform(0.9, 1.1)
