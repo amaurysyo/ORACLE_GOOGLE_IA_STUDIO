@@ -232,6 +232,23 @@ http_latency_ms = Histogram(
     buckets=(5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000),
 )
 
+# OI spike (macro) observabilidad
+oi_spike_events_total = Counter(
+    "oraculo_oi_spike_events_total",
+    "oi_spike events by side and source",
+    ["side", "source_oi"],
+)
+oi_spike_last_oi_delta_pct = Gauge(
+    "oraculo_oi_spike_last_oi_delta_pct",
+    "Last observed oi_delta_pct used for oi_spike",
+    ["instrument_id"],
+)
+oi_spike_last_momentum_usd = Gauge(
+    "oraculo_oi_spike_last_momentum_usd",
+    "Last observed price momentum usd used for oi_spike",
+    ["instrument_id"],
+)
+
 
 cpu_process_seconds_total = Counter(
     "oraculo_cpu_process_seconds_total",

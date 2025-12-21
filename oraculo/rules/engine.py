@@ -13,8 +13,8 @@ from oraculo.obs import metrics as obs_metrics
 
 # R28+ catalog stubs (Opción A: completar DOC sin renumerar reglas existentes)
 UPCOMING_DOC_RULES = [
-    {"rule": "R28", "name": "OI spike + price (BUY)", "event_type": "oi_spike", "side": "buy", "status": "stub"},
-    {"rule": "R29", "name": "OI spike + price (SELL)", "event_type": "oi_spike", "side": "sell", "status": "stub"},
+    {"rule": "R28", "name": "OI spike + price (BUY)", "event_type": "oi_spike", "side": "buy", "status": "implemented"},
+    {"rule": "R29", "name": "OI spike + price (SELL)", "event_type": "oi_spike", "side": "sell", "status": "implemented"},
     {"rule": "R30", "name": "Top traders LONG bias", "event_type": "top_traders", "side": "long", "status": "stub"},
     {"rule": "R31", "name": "Top traders SHORT bias", "event_type": "top_traders", "side": "short", "status": "stub"},
     {"rule": "R32", "name": "Liquidation cluster SELL", "event_type": "liq_cluster", "side": "sell", "status": "stub"},
@@ -212,6 +212,14 @@ def eval_rules(ev: Dict[str, Any], ctx: RuleContext) -> List[Dict[str, Any]]:
         if et == "metric_trigger" and f.get("metric") == "spread_usd":
             # Si alguien quiere usarlo como R27 (squeeze): intensidad = spread actual
             _append("R27", "na", ev, severity_=_sev_from_val(abs(val or 0.0), 0.5, 1.0))
+            return out
+
+        # ---------- R28/R29: OI spike + precio ----------
+        if et == "oi_spike":
+            if side == "buy":
+                _append("R28", "buy", ev, severity_=_sev_from_val(val, 0.60, 0.80))
+            elif side == "sell":
+                _append("R29", "sell", ev, severity_=_sev_from_val(val, 0.60, 0.80))
             return out
 
         return out
