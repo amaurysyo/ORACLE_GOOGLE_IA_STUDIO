@@ -25,6 +25,22 @@ class OISpikeCfg:
     require_same_dir: bool = True
 
 
+@dataclass
+class LiqClusterCfg:
+    enabled: bool = False
+    poll_s: float = 5.0
+    window_s: float = 60.0
+    retrigger_s: float = 90.0
+    warn_usd: float = 1_000_000.0
+    strong_usd: float = 3_000_000.0
+    confirm_s: float = 10.0
+    momentum_window_s: float = 30.0
+    min_move_usd: float = 25.0
+    max_rebound_usd: float = 10.0
+    use_usd: bool = True
+    clamp_usd: float = 50_000_000.0
+
+
 def _clamp01(x: float) -> float:
     try:
         return max(0.0, min(1.0, float(x)))
@@ -295,5 +311,204 @@ class OISpikeDetector:
                 "oi_strong_pct": self.cfg.oi_strong_pct,
                 "mom_warn_usd": self.cfg.mom_warn_usd,
                 "mom_strong_usd": self.cfg.mom_strong_usd,
+            },
+        )
+
+
+class LiqClusterDetector:
+    """
+    Detector macro: clusters de liquidaciones con confirmación de precio.
+    Sigue patrón macro (polling) similar a OI spike.
+    """
+
+    def __init__(self, cfg: LiqClusterCfg, instrument_id: str):
+        self.cfg = cfg
+        self.instrument_id = instrument_id
+        self.last_fire_ts: Optional[float] = None
+        self.armed_side: Optional[str] = None
+        self.armed_ts: Optional[float] = None
+        self.armed_anchor_wmid: Optional[float] = None
+        self.wmid_window = RollingTimeWindow(max(self.cfg.momentum_window_s * 3.0, self.cfg.window_s * 1.5))
+
+    def update_wmid(self, ts: float, wmid: Optional[float]) -> None:
+        if wmid is None:
+            return
+        self.wmid_window.add(ts, float(wmid))
+
+    def _await_if_needed(self, maybe_coro: Any) -> Any:
+        if inspect.isawaitable(maybe_coro):
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(maybe_coro)
+            finally:
+                loop.close()
+        return maybe_coro
+
+    def _fetch(self, db: Any, sql: str, *args: Any) -> Optional[Dict[str, Any]]:
+        if db is None:
+            return None
+        try:
+            rows = None
+            if hasattr(db, "fetch"):
+                rows = self._await_if_needed(db.fetch(sql, *args))
+            elif hasattr(db, "fetchrow"):
+                row = self._await_if_needed(db.fetchrow(sql, *args))
+                rows = [row] if row else []
+            if not rows:
+                return None
+            res: Dict[str, Any] = {}
+            for r in rows:
+                try:
+                    row_dict = dict(r)
+                except Exception:
+                    row_dict = r  # type: ignore[assignment]
+                side = str(row_dict.get("side") or "").lower()
+                res[side] = float(row_dict.get("v") or 0.0)
+            return res
+        except Exception:
+            return None
+
+    def _query_liqs(self, db: Any, ts_now: float) -> Optional[Tuple[float, float, str]]:
+        window_s = float(self.cfg.window_s)
+        sql_usd = """
+            SELECT side, COALESCE(SUM(quote_qty_usd), 0) AS v
+            FROM binance_futures.liquidations
+            WHERE instrument_id = $1
+              AND event_time >= now() - ($2::text || ' seconds')::interval
+            GROUP BY side;
+        """
+        sql_qty = """
+            SELECT side, COALESCE(SUM(qty), 0) AS v
+            FROM binance_futures.liquidations
+            WHERE instrument_id = $1
+              AND event_time >= now() - ($2::text || ' seconds')::interval
+            GROUP BY side;
+        """
+        data: Optional[Dict[str, Any]]
+        metric_used = "qty"
+        if self.cfg.use_usd:
+            data = self._fetch(db, sql_usd, self.instrument_id, str(int(window_s)))
+            metric_used = "quote_qty_usd"
+            if data is None or not data:
+                data = self._fetch(db, sql_qty, self.instrument_id, str(int(window_s)))
+                metric_used = "qty"
+        else:
+            data = self._fetch(db, sql_qty, self.instrument_id, str(int(window_s)))
+        if data is None:
+            return None
+        sell_v = float(data.get("sell", 0.0) or 0.0)
+        buy_v = float(data.get("buy", 0.0) or 0.0)
+        if metric_used == "quote_qty_usd":
+            clamp = float(self.cfg.clamp_usd)
+            sell_v = min(max(sell_v, 0.0), clamp)
+            buy_v = min(max(buy_v, 0.0), clamp)
+        return sell_v, buy_v, metric_used
+
+    def _compute_wmid(self, ts_now: float, snapshot: Any) -> Optional[float]:
+        wmid = None
+        if snapshot is not None:
+            wmid = getattr(snapshot, "wmid", None)
+            if wmid is None:
+                bb = getattr(snapshot, "best_bid", None)
+                ba = getattr(snapshot, "best_ask", None)
+                if bb is not None and ba is not None:
+                    wmid = (float(bb) + float(ba)) / 2.0
+        if wmid is not None:
+            self.update_wmid(ts_now, float(wmid))
+        return wmid
+
+    def _compute_momentum(self, ts_now: float) -> Optional[float]:
+        return self.wmid_window.delta_over(float(self.cfg.momentum_window_s), ts_now)
+
+    def poll(self, ts_now: float, db: Any, instrument_id: str, snapshot: Any = None) -> Optional[Event]:
+        if not self.cfg.enabled:
+            return None
+        _ = instrument_id  # compatibility / future use
+
+        if self.last_fire_ts is not None and (ts_now - self.last_fire_ts) < float(self.cfg.retrigger_s):
+            return None
+
+        wmid_now = self._compute_wmid(ts_now, snapshot)
+        liq_row = self._query_liqs(db, ts_now)
+        if liq_row is None:
+            return None
+        sell_v, buy_v, metric_used = liq_row
+
+        cluster_side: Optional[str] = None
+        warn = float(self.cfg.warn_usd)
+        if sell_v >= warn and sell_v >= buy_v:
+            cluster_side = "sell"
+        elif buy_v >= warn and buy_v > sell_v:
+            cluster_side = "buy"
+        else:
+            self.armed_side = None
+            self.armed_ts = None
+            self.armed_anchor_wmid = None
+            return None
+
+        if self.armed_side != cluster_side:
+            self.armed_side = cluster_side
+            self.armed_ts = ts_now
+            self.armed_anchor_wmid = wmid_now
+            return None
+
+        if self.armed_anchor_wmid is None:
+            self.armed_anchor_wmid = wmid_now
+
+        rebound = None
+        if wmid_now is not None and self.armed_anchor_wmid is not None:
+            if cluster_side == "sell":
+                rebound = float(wmid_now - self.armed_anchor_wmid)
+            else:
+                rebound = float(self.armed_anchor_wmid - wmid_now)
+        if rebound is not None and rebound > float(self.cfg.max_rebound_usd):
+            self.armed_side = None
+            self.armed_ts = None
+            self.armed_anchor_wmid = None
+            return None
+
+        momentum = self._compute_momentum(ts_now)
+        if momentum is None:
+            return None
+        min_move = float(self.cfg.min_move_usd)
+        if cluster_side == "sell" and momentum > -min_move:
+            return None
+        if cluster_side == "buy" and momentum < min_move:
+            return None
+
+        if self.armed_ts is None or (ts_now - self.armed_ts) < float(self.cfg.confirm_s):
+            return None
+
+        cluster_v = sell_v if cluster_side == "sell" else buy_v
+        intensity = _clamp01((cluster_v - warn) / max(float(self.cfg.strong_usd - self.cfg.warn_usd), 1e-9))
+
+        self.last_fire_ts = ts_now
+        self.armed_side = None
+        self.armed_ts = None
+        self.armed_anchor_wmid = None
+
+        momentum_usd = float(momentum)
+        return Event(
+            kind="liq_cluster",
+            side=cluster_side,
+            ts=ts_now,
+            price=float(wmid_now or 0.0),
+            intensity=intensity,
+            fields={
+                "window_s": self.cfg.window_s,
+                "poll_s": self.cfg.poll_s,
+                "confirm_s": self.cfg.confirm_s,
+                "momentum_window_s": self.cfg.momentum_window_s,
+                "min_move_usd": self.cfg.min_move_usd,
+                "max_rebound_usd": self.cfg.max_rebound_usd,
+                "metric_used": metric_used,
+                "sell_v": sell_v,
+                "buy_v": buy_v,
+                "cluster_v": cluster_v,
+                "warn_usd": self.cfg.warn_usd,
+                "strong_usd": self.cfg.strong_usd,
+                "wmid": wmid_now,
+                "momentum_usd": momentum_usd,
+                "armed_anchor_wmid": self.armed_anchor_wmid,
             },
         )

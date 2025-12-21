@@ -139,6 +139,26 @@ detectors:
     mom_strong_usd: 20.0
     require_same_dir: true
 
+  liq_cluster:
+    enabled: false
+    poll_s: 5
+    window_s: 60
+    retrigger_s: 90
+
+    # Umbrales de cluster (preferir USD si existe quote_qty_usd)
+    warn_usd: 1_000_000
+    strong_usd: 3_000_000
+
+    # Confirmación por precio (no-rebound)
+    confirm_s: 10
+    momentum_window_s: 30
+    min_move_usd: 25.0
+    max_rebound_usd: 10.0
+
+    # Selección de métrica
+    use_usd: true          # si quote_qty_usd no existe, usar qty
+    clamp_usd: 50_000_000  # seguridad outliers
+
   spread_squeeze:
     enabled: true
     max_spread_usd: 0.5     # compresión del spread

@@ -17,8 +17,8 @@ UPCOMING_DOC_RULES = [
     {"rule": "R29", "name": "OI spike + price (SELL)", "event_type": "oi_spike", "side": "sell", "status": "implemented"},
     {"rule": "R30", "name": "Top traders LONG bias", "event_type": "top_traders", "side": "long", "status": "stub"},
     {"rule": "R31", "name": "Top traders SHORT bias", "event_type": "top_traders", "side": "short", "status": "stub"},
-    {"rule": "R32", "name": "Liquidation cluster SELL", "event_type": "liq_cluster", "side": "sell", "status": "stub"},
-    {"rule": "R33", "name": "Liquidation cluster BUY", "event_type": "liq_cluster", "side": "buy", "status": "stub"},
+    {"rule": "R32", "name": "Liquidation cluster SELL", "event_type": "liq_cluster", "side": "sell", "status": "implemented"},
+    {"rule": "R33", "name": "Liquidation cluster BUY", "event_type": "liq_cluster", "side": "buy", "status": "implemented"},
     {"rule": "R34", "name": "Basis dislocation DOC", "event_type": "basis_dislocation", "side": "na", "status": "stub"},
     {"rule": "R35", "name": "Skew shock 25Δ", "event_type": "skew_shock", "side": "na", "status": "stub"},
     {"rule": "R36", "name": "Gamma flip (GEX)", "event_type": "gamma_flip", "side": "na", "status": "stub"},
@@ -220,6 +220,14 @@ def eval_rules(ev: Dict[str, Any], ctx: RuleContext) -> List[Dict[str, Any]]:
                 _append("R28", "buy", ev, severity_=_sev_from_val(val, 0.60, 0.80))
             elif side == "sell":
                 _append("R29", "sell", ev, severity_=_sev_from_val(val, 0.60, 0.80))
+            return out
+
+        # ---------- R32/R33: Liquidation clusters ----------
+        if et == "liq_cluster":
+            if side == "sell":
+                _append("R32", "sell", ev, severity_=_sev_from_val(val, 0.40, 0.80))
+            elif side == "buy":
+                _append("R33", "buy", ev, severity_=_sev_from_val(val, 0.40, 0.80))
             return out
 
         return out
