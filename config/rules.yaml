@@ -119,3 +119,9 @@ detectors:
     basis_extreme_pos: 80.0
     basis_extreme_neg: -80.0
     spread_squeeze: 0.5
+  metrics_doc:
+    imbalance_doc_window_s: 3
+    dominance_doc_window_s: 2
+    depletion_doc_window_s: 3
+    basis_doc_window_s: 120
+    oi_doc_window_s: 120

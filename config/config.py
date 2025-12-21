@@ -34,6 +34,14 @@ class RoutingCfg(BaseModel):
     bot_errors: TelegramBotCfg
 
 
+class MetricsCfg(BaseModel):
+    imbalance_doc_window_s: float = 3.0
+    dominance_doc_window_s: float = 2.0
+    depletion_doc_window_s: float = 3.0
+    basis_doc_window_s: float = 120.0
+    oi_doc_window_s: float = 120.0
+
+
 class AppCfg(BaseModel):
     symbol: str = "BTCUSDT"
     network_timeout_ms: int = 1500
@@ -42,6 +50,7 @@ class AppCfg(BaseModel):
 
 class Config(BaseModel):
     app: AppCfg
+    metrics: MetricsCfg | None = None
     routing: dict[str, RoutingCfg] | None = None
     observability: dict | None = None
     failure_policies: dict | None = None

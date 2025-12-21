@@ -482,7 +482,7 @@ def ingest_run() -> None:
         # Binance REST
         rest_settings = getattr(cfg, "rest_pollers", {}) or {}
         tasks += [
-            asyncio.create_task(run_open_interest_poller(batcher, rest_settings), name="poll-oi"),
+            asyncio.create_task(run_open_interest_poller(batcher, rest_settings, db=db), name="poll-oi"),
             asyncio.create_task(run_top_traders_pollers(batcher, rest_settings), name="poll-toptraders"),
         ]
 

@@ -6,6 +6,12 @@ app:
     dsn: ${PG_DSN}
     batch_max_rows: 200
     flush_ms: 100
+metrics:
+  imbalance_doc_window_s: 3
+  dominance_doc_window_s: 2
+  depletion_doc_window_s: 3
+  basis_doc_window_s: 120
+  oi_doc_window_s: 120
 alerts:
   source: ws   # ws | db
   depth_levels: 20
@@ -31,6 +37,7 @@ binance:
       
 rest_pollers:
   open_interest_ms: 1000        # 1s OK para /fapi/v1/openInterest (peso=1)
+  oi_doc_window_s: 120          # Δ% OI DOC
   top_traders_ms: 15000         # 15s recomendado (period≥5m)
   top_traders_period: "5m"      # válido: 5m,15m,30m,1h,...
   user_agent: "Oraculo/1.0 (+https://example.local)"

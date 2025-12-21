@@ -88,3 +88,15 @@ Fuente: Sección 6 “Métricas Microestructurales” del DOC `📘 Proyecto —
 - **Detección**: `DominanceDetector`, `DepletionDetector`, `BreakWallDetector`, `BasisMeanRevertDetector` y `MetricTriggerDetector` consumen directamente `dom_*`, `dep_*`, `refill_*_3s`, `basis_bps`, `basis_vel_bps_s`.【F:oraculo/detect/detectors.py†L261-L333】【F:oraculo/detect/detectors.py†L482-L511】【F:oraculo/detect/detectors.py†L523-L562】【F:oraculo/detect/detectors.py†L565-L604】
 - **Alertas/Rules**: el runner propaga eventos de dominancia, depleción y basis a reglas R1/R2, R9/R10, R13/R14, R15/R18.【F:oraculo/alerts/runner.py†L1360-L1449】
 - **Dashboards/consultas**: no hay referencias a `basis_bps`, `basis_vel_bps_s`, `dom_*`, `dep_*`, `refill_*` en `dashboards/pack-min.json` (búsqueda sin coincidencias); las únicas dependencias de nombres de métrica están en los detectores y en el pipeline de alertas citado arriba.
+
+## Post-fix (DOC vs legacy)
+- Se añadieron las series DOC, preservando las legacy: `imbalance_doc`, `dominance_bid_doc`, `dominance_ask_doc`, `wmid`, `depletion_bid_doc`, `depletion_ask_doc`, `basis_bps_doc`, `basis_vel_bps_s_doc`, `basis_accel_bps_s2_doc` y `oi_delta_pct_doc`.【F:oraculo/alerts/cpu_worker.py†L480-L500】【F:oraculo/ingest/binance_rest.py†L125-L155】
+- Fórmulas DOC aplicadas:
+  - Dominance DOC = ΣBid_vol_topn / (ΣBid+ΣAsk) y complementario para ask, con media rolling 1–3s configurable.【F:oraculo/detect/metrics_engine.py†L129-L153】
+  - Imbalance DOC = media rolling de la serie instantánea sobre 1–5s configurable.【F:oraculo/detect/metrics_engine.py†L119-L145】
+  - Depletion DOC = Δvolumen top-n por lado en ventana 1–5s (delta absoluto, cubre replenishment con signo).【F:oraculo/detect/metrics_engine.py†L145-L153】
+  - Wmid = (best_bid + best_ask)/2 tick a tick.【F:oraculo/detect/metrics_engine.py†L115-L123】
+  - Basis DOC = (Index−Mark)/Mark en bps + derivadas 1ª y 2ª sobre ventana 60–300s configurable.【F:oraculo/detect/metrics_engine.py†L88-L117】
+  - OI Δ% = (OI_t−OI_{t−Δ})/OI_{t−Δ} calculado en ingest REST y persistido con `window_s` configurable (default 120s).【F:oraculo/ingest/binance_rest.py†L129-L155】
+- Ventanas configurables añadidas (defaults DOC): imbalance_doc=3s, dominance_doc=2s, depletion_doc=3s, basis_doc=120s, oi_doc=120s en reglas/config para hot-reload sin afectar legacy.【F:config/rules.yaml†L85-L92】【F:config/config.yaml†L8-L17】
+- Regla de migración: las reglas/detectores actuales siguen consumiendo las métricas legacy; la migración a métricas DOC queda pendiente de un sprint posterior.
