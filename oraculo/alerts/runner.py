@@ -1460,32 +1460,45 @@ async def run_pipeline(
                 continue
             telemetry.bump(ev.ts, rule["rule"], rule.get("side", "na"), emitted=1)
             fields = ev.fields or {}
-            oi_val = fields.get("oi_delta_pct")
-            mom_val = fields.get("momentum_usd")
-            try:
-                oi_str = f"{float(oi_val):.2f}%"
-            except Exception:
-                oi_str = "na"
-            try:
-                mom_str = f"{float(mom_val):.2f} USD"
-            except Exception:
-                mom_str = "na"
-            try:
-                obs_metrics.oi_spike_events_total.labels(
-                    side=rule.get("side", "na"), source_oi=str(fields.get("metric_used_oi") or "na")
-                ).inc()
-                if oi_val is not None:
-                    obs_metrics.oi_spike_last_oi_delta_pct.labels(instrument_id=ctx.instrument_id).set(float(oi_val))
-                if mom_val is not None:
-                    obs_metrics.oi_spike_last_momentum_usd.labels(instrument_id=ctx.instrument_id).set(float(mom_val))
-            except Exception:
-                logger.debug("[metrics] failed to observe oi_spike metrics", exc_info=True)
-            text = (
-                f"#{rule['rule']} OI spike {rule.get('side', 'na').upper()} | "
-                f"oi={oi_str} "
-                f"mom={mom_str} "
-                f"i={ev.intensity:.2f}"
-            )
+            text = f"#{rule['rule']} {ev.kind} {rule.get('side', 'na').upper()} | i={ev.intensity:.2f}"
+            if ev.kind == "oi_spike":
+                oi_val = fields.get("oi_delta_pct")
+                mom_val = fields.get("momentum_usd")
+                try:
+                    oi_str = f"{float(oi_val):.2f}%"
+                except Exception:
+                    oi_str = "na"
+                try:
+                    mom_str = f"{float(mom_val):.2f} USD"
+                except Exception:
+                    mom_str = "na"
+                try:
+                    obs_metrics.oi_spike_events_total.labels(
+                        side=rule.get("side", "na"), source_oi=str(fields.get("metric_used_oi") or "na")
+                    ).inc()
+                    if oi_val is not None:
+                        obs_metrics.oi_spike_last_oi_delta_pct.labels(instrument_id=ctx.instrument_id).set(float(oi_val))
+                    if mom_val is not None:
+                        obs_metrics.oi_spike_last_momentum_usd.labels(instrument_id=ctx.instrument_id).set(float(mom_val))
+                except Exception:
+                    logger.debug("[metrics] failed to observe oi_spike metrics", exc_info=True)
+                text = (
+                    f"#{rule['rule']} OI spike {rule.get('side', 'na').upper()} | "
+                    f"oi={oi_str} "
+                    f"mom={mom_str} "
+                    f"i={ev.intensity:.2f}"
+                )
+            elif ev.kind == "top_traders":
+                acc_lr = fields.get("acc_long_ratio")
+                acc_sr = fields.get("acc_short_ratio")
+                pos_lr = fields.get("pos_long_ratio")
+                pos_sr = fields.get("pos_short_ratio")
+                text = (
+                    f"#{rule['rule']} top_traders {rule.get('side', 'na').upper()} | "
+                    f"acc=({acc_lr},{acc_sr}) "
+                    f"pos=({pos_lr},{pos_sr}) "
+                    f"i={ev.intensity:.2f}"
+                )
             await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
 
     async def _dispatch_worker_result(res: WorkerResult) -> None:

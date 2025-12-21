@@ -15,8 +15,8 @@ from oraculo.obs import metrics as obs_metrics
 UPCOMING_DOC_RULES = [
     {"rule": "R28", "name": "OI spike + price (BUY)", "event_type": "oi_spike", "side": "buy", "status": "implemented"},
     {"rule": "R29", "name": "OI spike + price (SELL)", "event_type": "oi_spike", "side": "sell", "status": "implemented"},
-    {"rule": "R30", "name": "Top traders LONG bias", "event_type": "top_traders", "side": "long", "status": "stub"},
-    {"rule": "R31", "name": "Top traders SHORT bias", "event_type": "top_traders", "side": "short", "status": "stub"},
+    {"rule": "R30", "name": "Top traders LONG bias", "event_type": "top_traders", "side": "long", "status": "implemented"},
+    {"rule": "R31", "name": "Top traders SHORT bias", "event_type": "top_traders", "side": "short", "status": "implemented"},
     {"rule": "R32", "name": "Liquidation cluster SELL", "event_type": "liq_cluster", "side": "sell", "status": "implemented"},
     {"rule": "R33", "name": "Liquidation cluster BUY", "event_type": "liq_cluster", "side": "buy", "status": "implemented"},
     {"rule": "R34", "name": "Basis dislocation DOC", "event_type": "basis_dislocation", "side": "na", "status": "stub"},
@@ -220,6 +220,25 @@ def eval_rules(ev: Dict[str, Any], ctx: RuleContext) -> List[Dict[str, Any]]:
                 _append("R28", "buy", ev, severity_=_sev_from_val(val, 0.60, 0.80))
             elif side == "sell":
                 _append("R29", "sell", ev, severity_=_sev_from_val(val, 0.60, 0.80))
+            return out
+
+        # ---------- R30/R31: Top Traders bias ----------
+        if et == "top_traders":
+            def _sev_top(x: Optional[float]) -> str:
+                if x is None:
+                    return "MEDIUM"
+                if x >= 0.80:
+                    return "HIGH"
+                if x >= 0.60:
+                    return "MEDIUM"
+                if x >= 0.40:
+                    return "LOW"
+                return "LOW"
+
+            if side == "long":
+                _append("R30", "long", ev, severity_=_sev_top(val))
+            elif side == "short":
+                _append("R31", "short", ev, severity_=_sev_top(val))
             return out
 
         # ---------- R32/R33: Liquidation clusters ----------

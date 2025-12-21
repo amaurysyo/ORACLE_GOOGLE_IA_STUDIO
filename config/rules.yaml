@@ -159,6 +159,20 @@ detectors:
     use_usd: true          # si quote_qty_usd no existe, usar qty
     clamp_usd: 50_000_000  # seguridad outliers
 
+  top_traders:
+    enabled: false
+    poll_s: 15
+    retrigger_s: 300
+    # Umbrales para ACCOUNT ratio
+    acc_warn: 0.60
+    acc_strong: 0.70
+    # Umbrales para POSITION ratio
+    pos_warn: 0.60
+    pos_strong: 0.70
+    # Política de disparo
+    require_both: false          # true => exige account y position a la vez
+    choose_by: "max_score"       # max_score | account_only | position_only
+
   spread_squeeze:
     enabled: true
     max_spread_usd: 0.5     # compresión del spread
