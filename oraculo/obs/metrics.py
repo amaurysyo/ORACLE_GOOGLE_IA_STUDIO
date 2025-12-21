@@ -121,6 +121,18 @@ alerts_queue_dropped_total = Counter(
     "Dropped events in alerts hot path queue",
 )
 
+# Depletion DOC/legacy observabilidad
+depletion_events_total = Counter(
+    "oraculo_depletion_events_total",
+    "Depletion events by source and side",
+    ["source", "side"],
+)
+depletion_doc_amount = Histogram(
+    "oraculo_depletion_doc_amount",
+    "Observed DOC depletion amount (abs delta volume)",
+    buckets=(1, 2, 5, 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 750, 1000),
+)
+
 # CPU worker (multiprocessing) metrics
 worker_queue_in_depth = Gauge(
     "oraculo_worker_queue_in_depth",

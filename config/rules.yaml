@@ -72,6 +72,17 @@ detectors:
     n_levels: 50            # niveles a evaluar
     pct_drop_bid: 0.35      # caída relativa en bid
     pct_drop_ask: 0.35      # caída relativa en ask
+    pct_drop: 0.35          # compat: umbral global si no se usa pct_drop_{side}
+    hold_ms: 800
+    retrigger_s: 30
+    metric_source: legacy   # legacy|doc|auto
+    doc:
+      window_s: 3               # debe coincidir con depletion_*_doc.window_s (metrics_doc)
+      dv_warn: 10.0             # umbral mínimo en unidades de volumen (ej. BTC qty)
+      dv_strong: 30.0           # umbral “fuerte” en mismas unidades
+      clamp_abs_dv: 200.0       # seguridad outliers
+      severity_mode: linear     # linear|log
+      require_negative: true    # solo considerar depletion cuando dv < 0 (delta negativo)
 
   # --- R15–R18 Basis thresholds (Mark/Index). Leídos por las reglas, no depth.
   basis:
