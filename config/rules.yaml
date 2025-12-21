@@ -31,6 +31,13 @@ detectors:
     n_min: 3
     dep_pct: 0.40
     basis_vel_abs_bps_s: 1.5
+    metric_source: legacy          # legacy|doc|auto (default legacy por seguridad)
+    doc:
+      window_s: 3.0                # debe alinear con metrics_doc depletion window
+      dv_dep_warn: 20.0            # p95 recomendado (calibrable)
+      dv_refill_max: 10.0          # máximo refill permitido (calibrable)
+      clamp_abs_dv: 300.0
+      require_negative: true       # para considerar depletion solo si dv<0
     require_depletion: true
     top_levels_gate: 20         # niveles top para gating
     tick_size: 0.1              # Binance BTCUSDT
