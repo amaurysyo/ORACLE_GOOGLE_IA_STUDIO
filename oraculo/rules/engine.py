@@ -11,6 +11,20 @@ from loguru import logger
 
 from oraculo.obs import metrics as obs_metrics
 
+# R28+ catalog stubs (Opción A: completar DOC sin renumerar reglas existentes)
+UPCOMING_DOC_RULES = [
+    {"rule": "R28", "name": "OI spike + price (BUY)", "event_type": "oi_spike", "side": "buy", "status": "stub"},
+    {"rule": "R29", "name": "OI spike + price (SELL)", "event_type": "oi_spike", "side": "sell", "status": "stub"},
+    {"rule": "R30", "name": "Top traders LONG bias", "event_type": "top_traders", "side": "long", "status": "stub"},
+    {"rule": "R31", "name": "Top traders SHORT bias", "event_type": "top_traders", "side": "short", "status": "stub"},
+    {"rule": "R32", "name": "Liquidation cluster SELL", "event_type": "liq_cluster", "side": "sell", "status": "stub"},
+    {"rule": "R33", "name": "Liquidation cluster BUY", "event_type": "liq_cluster", "side": "buy", "status": "stub"},
+    {"rule": "R34", "name": "Basis dislocation DOC", "event_type": "basis_dislocation", "side": "na", "status": "stub"},
+    {"rule": "R35", "name": "Skew shock 25Δ", "event_type": "skew_shock", "side": "na", "status": "stub"},
+    {"rule": "R36", "name": "Gamma flip (GEX)", "event_type": "gamma_flip", "side": "na", "status": "stub"},
+    {"rule": "R37", "name": "Term structure invertida", "event_type": "term_structure_inverted", "side": "na", "status": "stub"},
+]
+
 @dataclass
 class RuleContext:
     instrument_id: str

@@ -95,6 +95,11 @@ Fuente: Sección 6 “Métricas Microestructurales” del DOC `📘 Proyecto —
 - **R17/R18 (Basis mean-revert)**: mean-revert usa `basis_bps_doc`/`basis_vel_bps_s_doc` con fallback legacy y expone en el evento las métricas usadas, `metric_source` y `doc_sign_mode`.【F:oraculo/detect/detectors.py†L573-L614】
 - `doc_sign_mode` queda en `legacy` por defecto para preservar la interpretación actual mientras se migra el consumo a métricas DOC.【F:config/rules.yaml†L76-L94】
 
+## Section 7 progress
+- **Cobertura actual**: R1/R2 (break_wall+basis_vel), R3/R4 (absorción), R5–R8 (slicing agresivo/pasivo), R9/R10 (dominance), R11/R12 (spoofing), R13/R14 (depletion proxy), R15–R18 (basis extremo/mean-revert) y R19–R22 (stubs de opciones) están implementadas en el engine con semántica legacy o parcial respecto al DOC.【F:oraculo/rules/engine.py†L22-L218】
+- **Brechas DOC**: OI spike+precio, basis dislocation DOC (con funding_trend), top traders bias, clusters de liquidaciones, skew shock 25Δ, gamma flip y term structure invertida no tienen reglas ni eventos equivalentes.
+- **Preparación Opción A**: se reservaron slots R28–R37 para cubrir las brechas sin renumerar reglas existentes; los stubs documentan nombre, `event_type` y `side` esperados y no alteran el runtime hasta conectar detectores específicos.【F:oraculo/rules/engine.py†L16-L33】
+
 ## Post-fix (DOC vs legacy)
 - Se añadieron las series DOC, preservando las legacy: `imbalance_doc`, `dominance_bid_doc`, `dominance_ask_doc`, `wmid`, `depletion_bid_doc`, `depletion_ask_doc`, `basis_bps_doc`, `basis_vel_bps_s_doc`, `basis_accel_bps_s2_doc` y `oi_delta_pct_doc`.【F:oraculo/alerts/cpu_worker.py†L480-L500】【F:oraculo/ingest/binance_rest.py†L125-L155】
 - Fórmulas DOC aplicadas:
