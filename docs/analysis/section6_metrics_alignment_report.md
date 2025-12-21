@@ -97,10 +97,11 @@ Fuente: Sección 6 “Métricas Microestructurales” del DOC `📘 Proyecto —
 
 ## Section 7 progress
 - **Cobertura actual**: R1/R2 (break_wall+basis_vel), R3/R4 (absorción), R5–R8 (slicing agresivo/pasivo), R9/R10 (dominance), R11/R12 (spoofing), R13/R14 (depletion proxy), R15–R18 (basis extremo/mean-revert) y R19–R22 (stubs de opciones) están implementadas en el engine con semántica legacy o parcial respecto al DOC.【F:oraculo/rules/engine.py†L22-L218】
-- **Brechas DOC**: basis dislocation DOC (con funding_trend), top traders bias, clusters de liquidaciones, skew shock 25Δ, gamma flip y term structure invertida no tienen reglas ni eventos equivalentes; OI spike se cubre con R28/R29 (feature-flagged).
+- **Brechas DOC**: basis dislocation DOC (con funding_trend), top traders bias, skew shock 25Δ, gamma flip y term structure invertida no tienen reglas ni eventos equivalentes; OI spike se cubre con R28/R29 (feature-flagged).
 - **Preparación Opción A**: se reservaron slots R28–R37 para cubrir las brechas sin renumerar reglas existentes; los stubs documentan nombre, `event_type` y `side` esperados y no alteran el runtime hasta conectar detectores específicos.【F:oraculo/rules/engine.py†L16-L33】
 - **R28/R29 (oi_spike)**: implementadas y feature-flagged (`detectors.oi_spike.enabled=false` por defecto) para evitar cambios en producción hasta habilitación explícita.【F:oraculo/rules/engine.py†L16-L33】【F:config/rules.yaml†L130-L149】
 - **Auditoría oi_spike**: el evento reporta `metric_used_oi`/`metric_used_price`, usa `oi_delta_pct_doc` con fallback `open_interest` y momentum de `wmid` cuando esté disponible.【F:oraculo/alerts/cpu_worker.py†L395-L493】【F:oraculo/detect/macro_detectors.py†L37-L148】
+- **R32/R33 (liq_cluster)**: implementadas y compuerta `detectors.liq_cluster.enabled=false` por defecto; auditan `sell_v`/`buy_v`, `momentum_usd`, `rebound`, `armed_anchor_wmid` y `armed_ts` para trazabilidad del ancla y la confirmación.【F:oraculo/detect/macro_detectors.py†L335-L454】【F:config/rules.yaml†L122-L148】
 
 ## Post-fix (DOC vs legacy)
 - Se añadieron las series DOC, preservando las legacy: `imbalance_doc`, `dominance_bid_doc`, `dominance_ask_doc`, `wmid`, `depletion_bid_doc`, `depletion_ask_doc`, `basis_bps_doc`, `basis_vel_bps_s_doc`, `basis_accel_bps_s2_doc` y `oi_delta_pct_doc`.【F:oraculo/alerts/cpu_worker.py†L480-L500】【F:oraculo/ingest/binance_rest.py†L125-L155】

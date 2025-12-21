@@ -482,6 +482,8 @@ class LiqClusterDetector:
         cluster_v = sell_v if cluster_side == "sell" else buy_v
         intensity = _clamp01((cluster_v - warn) / max(float(self.cfg.strong_usd - self.cfg.warn_usd), 1e-9))
 
+        anchor = self.armed_anchor_wmid
+        armed_ts = self.armed_ts
         self.last_fire_ts = ts_now
         self.armed_side = None
         self.armed_ts = None
@@ -509,6 +511,7 @@ class LiqClusterDetector:
                 "strong_usd": self.cfg.strong_usd,
                 "wmid": wmid_now,
                 "momentum_usd": momentum_usd,
-                "armed_anchor_wmid": self.armed_anchor_wmid,
+                "armed_anchor_wmid": anchor,
+                "armed_ts": armed_ts,
             },
         )
