@@ -721,6 +721,84 @@ def _observe_rule_event(rule: dict, event_ts: float) -> None:
         logger.debug("[metrics] failed to observe rule event", exc_info=True)
 
 
+async def dispatch_macro_event(
+    ev: Event,
+    ctx: RuleContext,
+    enqueue_rule: Callable[[dict, float], Awaitable[tuple[Optional[int], Optional[dt.datetime]]]],
+    telemetry: Any,
+    router: Any,
+) -> None:
+    for rule in eval_rules(_evdict(ev), ctx):
+        aid, t0_dt = await enqueue_rule(rule, ev.ts)
+        if aid is None:
+            continue
+        telemetry.bump(ev.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+        fields = ev.fields or {}
+        text = f"#{rule['rule']} {ev.kind} {rule.get('side', 'na').upper()} | i={ev.intensity:.2f}"
+        if ev.kind == "oi_spike":
+            oi_val = fields.get("oi_delta_pct")
+            mom_val = fields.get("momentum_usd")
+            try:
+                oi_str = f"{float(oi_val):.2f}%"
+            except Exception:
+                oi_str = "na"
+            try:
+                mom_str = f"{float(mom_val):.2f} USD"
+            except Exception:
+                mom_str = "na"
+            try:
+                obs_metrics.oi_spike_events_total.labels(
+                    side=rule.get("side", "na"), source_oi=str(fields.get("metric_used_oi") or "na")
+                ).inc()
+                if oi_val is not None:
+                    obs_metrics.oi_spike_last_oi_delta_pct.labels(instrument_id=ctx.instrument_id).set(float(oi_val))
+                if mom_val is not None:
+                    obs_metrics.oi_spike_last_momentum_usd.labels(instrument_id=ctx.instrument_id).set(float(mom_val))
+            except Exception:
+                logger.debug("[metrics] failed to observe oi_spike metrics", exc_info=True)
+            text = (
+                f"#{rule['rule']} OI spike {rule.get('side', 'na').upper()} | "
+                f"oi={oi_str} "
+                f"mom={mom_str} "
+                f"i={ev.intensity:.2f}"
+            )
+        elif ev.kind == "liq_cluster":
+            liq_sum_usd = fields.get("liq_sum_usd")
+            liq_orders = fields.get("liq_orders")
+            price_max = fields.get("price_max")
+            price_min = fields.get("price_min")
+            try:
+                liq_sum = f"{float(liq_sum_usd):.0f} USD"
+            except Exception:
+                liq_sum = "na"
+            try:
+                liq_ord_str = f"k={int(liq_orders)}"
+            except Exception:
+                liq_ord_str = "k=na"
+            try:
+                price_span = f"[{float(price_min):.1f}, {float(price_max):.1f}]"
+            except Exception:
+                price_span = "[na, na]"
+            text = (
+                f"#{rule['rule']} liq_cluster {rule.get('side', 'na').upper()} | "
+                f"{liq_sum} "
+                f"{liq_ord_str} "
+                f"{price_span} "
+                f"i={ev.intensity:.2f}"
+            )
+        elif ev.kind == "top_traders":
+            acc_lr = fields.get("acc_long_ratio")
+            acc_sr = fields.get("acc_short_ratio")
+            pos_lr = fields.get("pos_long_ratio")
+            pos_sr = fields.get("pos_short_ratio")
+            text = (
+                f"#{rule['rule']} top_traders {rule.get('side', 'na').upper()} | "
+                f"acc=({acc_lr},{acc_sr}) "
+                f"pos=({pos_lr},{pos_sr}) "
+                f"i={ev.intensity:.2f}"
+            )
+        await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
+
 # ---- Telemetría (agregada y volcada a tabla oraculo.rule_telemetry) ----
 class Telemetry:
     def __init__(self, db: DB, instrument_id: str, profile: str):
@@ -1454,52 +1532,7 @@ async def run_pipeline(
         await enqueue_telemetry_flush()
 
     async def _handle_macro_event(ev: Event) -> None:
-        for rule in eval_rules(_evdict(ev), ctx):
-            aid, t0_dt = await enqueue_rule(rule, ev.ts)
-            if aid is None:
-                continue
-            telemetry.bump(ev.ts, rule["rule"], rule.get("side", "na"), emitted=1)
-            fields = ev.fields or {}
-            text = f"#{rule['rule']} {ev.kind} {rule.get('side', 'na').upper()} | i={ev.intensity:.2f}"
-            if ev.kind == "oi_spike":
-                oi_val = fields.get("oi_delta_pct")
-                mom_val = fields.get("momentum_usd")
-                try:
-                    oi_str = f"{float(oi_val):.2f}%"
-                except Exception:
-                    oi_str = "na"
-                try:
-                    mom_str = f"{float(mom_val):.2f} USD"
-                except Exception:
-                    mom_str = "na"
-                try:
-                    obs_metrics.oi_spike_events_total.labels(
-                        side=rule.get("side", "na"), source_oi=str(fields.get("metric_used_oi") or "na")
-                    ).inc()
-                    if oi_val is not None:
-                        obs_metrics.oi_spike_last_oi_delta_pct.labels(instrument_id=ctx.instrument_id).set(float(oi_val))
-                    if mom_val is not None:
-                        obs_metrics.oi_spike_last_momentum_usd.labels(instrument_id=ctx.instrument_id).set(float(mom_val))
-                except Exception:
-                    logger.debug("[metrics] failed to observe oi_spike metrics", exc_info=True)
-                text = (
-                    f"#{rule['rule']} OI spike {rule.get('side', 'na').upper()} | "
-                    f"oi={oi_str} "
-                    f"mom={mom_str} "
-                    f"i={ev.intensity:.2f}"
-                )
-            elif ev.kind == "top_traders":
-                acc_lr = fields.get("acc_long_ratio")
-                acc_sr = fields.get("acc_short_ratio")
-                pos_lr = fields.get("pos_long_ratio")
-                pos_sr = fields.get("pos_short_ratio")
-                text = (
-                    f"#{rule['rule']} top_traders {rule.get('side', 'na').upper()} | "
-                    f"acc=({acc_lr},{acc_sr}) "
-                    f"pos=({pos_lr},{pos_sr}) "
-                    f"i={ev.intensity:.2f}"
-                )
-            await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
+        await dispatch_macro_event(ev, ctx, enqueue_rule, telemetry, router)
 
     async def _dispatch_worker_result(res: WorkerResult) -> None:
         stage = res.kind or "unknown"
