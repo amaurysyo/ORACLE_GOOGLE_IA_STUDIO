@@ -73,6 +73,23 @@ class BasisDislocationCfg:
     clamp_abs_vel_bps_s: float
 
 
+@dataclass
+class SkewShockCfg:
+    enabled: bool = False
+    poll_s: float = 15.0
+    retrigger_s: float = 300.0
+    underlying: str = "BTC"
+    window_s: float = 300.0
+    delta_warn: float = 0.010
+    delta_strong: float = 0.020
+    vel_warn_per_s: float = 0.00003
+    vel_strong_per_s: float = 0.00006
+    clamp_abs_rr: float = 1.0
+    clamp_abs_delta: float = 0.2
+    clamp_abs_vel_per_s: float = 0.01
+    require_recent_past: bool = True
+
+
 def _clamp01(x: float) -> float:
     try:
         return max(0.0, min(1.0, float(x)))
@@ -989,4 +1006,154 @@ class BasisDislocationDetector:
             price=0.0,
             intensity=intensity,
             fields=fields,
+        )
+
+
+class SkewShockDetector:
+    def __init__(self, cfg: SkewShockCfg, instrument_id: str):
+        self.cfg = cfg
+        self.instrument_id = instrument_id
+        self.last_fire_ts: Optional[float] = None
+
+    @staticmethod
+    def _await_if_needed(maybe_coro: Any) -> Any:
+        if inspect.isawaitable(maybe_coro):
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(maybe_coro)
+            finally:
+                loop.close()
+        return maybe_coro
+
+    def _fetch_one(self, db: Any, sql: str, *args: Any) -> Optional[Dict[str, Any]]:
+        if db is None:
+            return None
+        row = None
+        if hasattr(db, "fetchrow"):
+            try:
+                row = self._await_if_needed(db.fetchrow(sql, *args))
+            except Exception:
+                row = None
+        if row is None and hasattr(db, "fetch"):
+            try:
+                rows = self._await_if_needed(db.fetch(sql, *args))
+                row = rows[0] if rows else None
+            except Exception:
+                row = None
+        if row is None:
+            return None
+        try:
+            return dict(row)
+        except Exception:
+            return row  # type: ignore[return-value]
+
+    @staticmethod
+    def _clamp(x: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, x))
+
+    def poll(self, ts_now: float, db: Any, instrument_id: str) -> Optional[Event]:
+        if not self.cfg.enabled:
+            return None
+        _ = instrument_id
+
+        if self.last_fire_ts is not None and (ts_now - self.last_fire_ts) < float(self.cfg.retrigger_s):
+            return None
+
+        sql_latest = """
+            SELECT bucket, rr_25d_avg, bf_25d_avg, iv_avg
+            FROM oraculo.iv_surface_1m
+            WHERE underlying=$1
+            ORDER BY bucket DESC
+            LIMIT 1;
+        """
+        row_now = self._fetch_one(db, sql_latest, self.cfg.underlying)
+        if not row_now:
+            return None
+
+        bucket_now = row_now.get("bucket")
+        rr_now_raw = row_now.get("rr_25d_avg")
+        bf_now = row_now.get("bf_25d_avg")
+        iv_now = row_now.get("iv_avg")
+        if bucket_now is None or rr_now_raw is None or iv_now is None or bf_now is None:
+            return None
+
+        sql_past = """
+            SELECT bucket, rr_25d_avg, bf_25d_avg, iv_avg
+            FROM oraculo.iv_surface_1m
+            WHERE underlying=$1 AND bucket <= $2
+            ORDER BY bucket DESC
+            LIMIT 1;
+        """
+        past_ts = dt.datetime.fromtimestamp(ts_now - float(self.cfg.window_s), tz=dt.timezone.utc)
+        row_past = self._fetch_one(db, sql_past, self.cfg.underlying, past_ts)
+        if not row_past:
+            if self.cfg.require_recent_past:
+                return None
+            return None
+
+        bucket_past = row_past.get("bucket")
+        rr_past_raw = row_past.get("rr_25d_avg")
+        bf_past = row_past.get("bf_25d_avg")
+        iv_past = row_past.get("iv_avg")
+        if bucket_past is None or rr_past_raw is None or iv_past is None or bf_past is None:
+            return None
+
+        rr_now = self._clamp(float(rr_now_raw), -float(self.cfg.clamp_abs_rr), float(self.cfg.clamp_abs_rr))
+        rr_past = self._clamp(float(rr_past_raw), -float(self.cfg.clamp_abs_rr), float(self.cfg.clamp_abs_rr))
+        delta = rr_now - rr_past
+
+        try:
+            dt_s = max(1.0, (bucket_now - bucket_past).total_seconds())
+        except Exception:
+            return None
+        vel = delta / dt_s
+
+        delta = self._clamp(delta, -float(self.cfg.clamp_abs_delta), float(self.cfg.clamp_abs_delta))
+        vel = self._clamp(vel, -float(self.cfg.clamp_abs_vel_per_s), float(self.cfg.clamp_abs_vel_per_s))
+
+        if abs(delta) < float(self.cfg.delta_warn):
+            return None
+        if abs(vel) < float(self.cfg.vel_warn_per_s):
+            return None
+
+        side = "bull" if delta > 0 else "bear"
+
+        i_delta = _clamp01(
+            (abs(delta) - float(self.cfg.delta_warn)) / max(float(self.cfg.delta_strong - self.cfg.delta_warn), 1e-9)
+        )
+        i_vel = _clamp01(
+            (abs(vel) - float(self.cfg.vel_warn_per_s)) / max(
+                float(self.cfg.vel_strong_per_s - self.cfg.vel_warn_per_s), 1e-9
+            )
+        )
+        intensity = _clamp01(max(i_delta, i_vel))
+
+        self.last_fire_ts = ts_now
+
+        return Event(
+            kind="skew_shock",
+            side=side,
+            ts=ts_now,
+            price=0.0,
+            intensity=intensity,
+            fields={
+                "underlying": self.cfg.underlying,
+                "window_s": self.cfg.window_s,
+                "bucket_now": bucket_now,
+                "bucket_past": bucket_past,
+                "rr_25d_now": rr_now,
+                "rr_25d_past": rr_past,
+                "rr_delta": delta,
+                "rr_vel_per_s": vel,
+                "iv_now": iv_now,
+                "iv_past": iv_past,
+                "bf_25d_now": bf_now,
+                "bf_25d_past": bf_past,
+                "delta_warn": self.cfg.delta_warn,
+                "delta_strong": self.cfg.delta_strong,
+                "vel_warn_per_s": self.cfg.vel_warn_per_s,
+                "vel_strong_per_s": self.cfg.vel_strong_per_s,
+                "i_delta": i_delta,
+                "i_vel": i_vel,
+            },
         )

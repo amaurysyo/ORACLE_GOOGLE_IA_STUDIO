@@ -810,6 +810,22 @@ async def dispatch_macro_event(
                 f"mb={metric_used_basis} mv={metric_used_vel} "
                 f"i={ev.intensity:.2f}"
             )
+        elif ev.kind == "skew_shock":
+            delta = fields.get("rr_delta")
+            vel = fields.get("rr_vel_per_s")
+            side_macro = ev.side or rule.get("side", "na")
+            try:
+                delta_str = f"{float(delta):.4f}"
+            except Exception:
+                delta_str = "na"
+            try:
+                vel_str = f"{float(vel):.6f}/s"
+            except Exception:
+                vel_str = "na/s"
+            text = (
+                f"[{rule['rule']}] Skew shock (25Δ) {side_macro} "
+                f"ΔRR={delta_str}, vel={vel_str}, i={ev.intensity:.2f}"
+            )
         await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
 
 # ---- Telemetría (agregada y volcada a tabla oraculo.rule_telemetry) ----
