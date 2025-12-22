@@ -50,6 +50,8 @@ from oraculo.detect.macro_detectors import (
     BasisDislocationDetector,
     TopTradersCfg,
     TopTradersDetector,
+    SkewShockCfg,
+    SkewShockDetector,
 )
 from oraculo.obs import metrics as obs_metrics
 
@@ -197,6 +199,26 @@ def _build_basis_dislocation_cfg(rules: Dict[str, Any]) -> BasisDislocationCfg:
         clamp_abs_basis_bps=float(raw.get("clamp_abs_basis_bps", 1000.0)),
         clamp_abs_vel_bps_s=float(raw.get("clamp_abs_vel_bps_s", 50.0)),
     )
+
+
+def _build_skew_shock_cfg(rules: Dict[str, Any]) -> SkewShockCfg:
+    det = (rules or {}).get("detectors", {}) or {}
+    raw = det.get("skew_shock") or {}
+    cfg = SkewShockCfg()
+    cfg.enabled = bool(raw.get("enabled", cfg.enabled))
+    cfg.poll_s = float(raw.get("poll_s", cfg.poll_s))
+    cfg.retrigger_s = float(raw.get("retrigger_s", cfg.retrigger_s))
+    cfg.underlying = str(raw.get("underlying", cfg.underlying))
+    cfg.window_s = float(raw.get("window_s", cfg.window_s))
+    cfg.delta_warn = float(raw.get("delta_warn", cfg.delta_warn))
+    cfg.delta_strong = float(raw.get("delta_strong", cfg.delta_strong))
+    cfg.vel_warn_per_s = float(raw.get("vel_warn_per_s", cfg.vel_warn_per_s))
+    cfg.vel_strong_per_s = float(raw.get("vel_strong_per_s", cfg.vel_strong_per_s))
+    cfg.clamp_abs_rr = float(raw.get("clamp_abs_rr", cfg.clamp_abs_rr))
+    cfg.clamp_abs_delta = float(raw.get("clamp_abs_delta", cfg.clamp_abs_delta))
+    cfg.clamp_abs_vel_per_s = float(raw.get("clamp_abs_vel_per_s", cfg.clamp_abs_vel_per_s))
+    cfg.require_recent_past = bool(raw.get("require_recent_past", cfg.require_recent_past))
+    return cfg
 
 
 def _apply_rules_to_detectors(
@@ -491,6 +513,8 @@ class CPUWorkerProcess(mp.Process):
         top_traders_detector = TopTradersDetector(top_traders_cfg, self.instrument_id)
         basis_dislocation_cfg = _build_basis_dislocation_cfg(self.rules)
         basis_dislocation_detector = BasisDislocationDetector(basis_dislocation_cfg, self.instrument_id)
+        skew_cfg = _build_skew_shock_cfg(self.rules)
+        skew_detector = SkewShockDetector(skew_cfg, self.instrument_id)
         db_loop: Optional[asyncio.AbstractEventLoop] = None
         db_pool = None
         db_adapter: Optional[_AsyncpgAdapter] = None
@@ -499,6 +523,7 @@ class CPUWorkerProcess(mp.Process):
         last_liq_poll_ts = 0.0
         last_tt_poll_ts = 0.0
         last_basis_poll_ts = 0.0
+        last_skew_poll_ts = 0.0
 
         def _close_db_resources() -> None:
             nonlocal db_pool, db_loop, db_adapter
@@ -535,7 +560,13 @@ class CPUWorkerProcess(mp.Process):
                 db_loop = None
                 db_adapter = None
 
-        need_db = (oi_cfg.enabled or liq_cfg.enabled or top_traders_cfg.enabled or basis_dislocation_cfg.enabled)
+        need_db = (
+            oi_cfg.enabled
+            or liq_cfg.enabled
+            or top_traders_cfg.enabled
+            or basis_dislocation_cfg.enabled
+            or skew_cfg.enabled
+        )
         if need_db and self.db_dsn and asyncpg is not None:
             try:
                 db_loop = asyncio.new_event_loop()
@@ -613,6 +644,21 @@ class CPUWorkerProcess(mp.Process):
                     if ev_macro is not None:
                         self._emit_result("macro", ev_macro, poll_t0, poll_t0)
                     last_basis_poll_ts = now_poll
+                if (
+                    skew_detector
+                    and skew_detector.cfg.enabled
+                    and db_adapter is not None
+                    and (now_poll - last_skew_poll_ts) >= float(skew_detector.cfg.poll_s)
+                ):
+                    poll_t0 = time.perf_counter()
+                    try:
+                        ev_macro = skew_detector.poll(now_poll, db_adapter, self.instrument_id)
+                    except Exception:
+                        ev_macro = None
+                        logger.exception("[cpu-worker] skew_shock poll failed")
+                    if ev_macro is not None:
+                        self._emit_result("macro", ev_macro, poll_t0, poll_t0)
+                    last_skew_poll_ts = now_poll
 
                 try:
                     req: WorkerRequest = self.in_queue.get(timeout=0.1)
@@ -701,7 +747,15 @@ class CPUWorkerProcess(mp.Process):
                         top_traders_detector.cfg = top_traders_cfg
                         basis_dislocation_cfg = _build_basis_dislocation_cfg(req.payload or {})
                         basis_dislocation_detector.cfg = basis_dislocation_cfg
-                        need_db_after = (oi_cfg.enabled or liq_cfg.enabled or top_traders_cfg.enabled or basis_dislocation_cfg.enabled)
+                        skew_cfg = _build_skew_shock_cfg(req.payload or {})
+                        skew_detector.cfg = skew_cfg
+                        need_db_after = (
+                            oi_cfg.enabled
+                            or liq_cfg.enabled
+                            or top_traders_cfg.enabled
+                            or basis_dislocation_cfg.enabled
+                            or skew_cfg.enabled
+                        )
                         if need_db_after and db_adapter is None and self.db_dsn and asyncpg is not None:
                             try:
                                 db_loop = asyncio.new_event_loop()

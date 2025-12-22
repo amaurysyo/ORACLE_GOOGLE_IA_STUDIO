@@ -196,6 +196,25 @@ detectors:
     clamp_abs_basis_bps: 1000.0
     clamp_abs_vel_bps_s: 50.0
 
+  skew_shock:
+    enabled: false
+    poll_s: 15
+    retrigger_s: 300
+
+    underlying: "BTC"
+    window_s: 300
+    # Umbrales de shock (unidades de rr_25d, típicamente “vol points” en decimal)
+    delta_warn: 0.010
+    delta_strong: 0.020
+    vel_warn_per_s: 0.00003
+    vel_strong_per_s: 0.00006
+
+    clamp_abs_rr: 1.0
+    clamp_abs_delta: 0.2
+    clamp_abs_vel_per_s: 0.01
+
+    require_recent_past: true
+
   spread_squeeze:
     enabled: true
     max_spread_usd: 0.5     # compresión del spread
