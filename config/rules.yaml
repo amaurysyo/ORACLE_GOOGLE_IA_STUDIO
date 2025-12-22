@@ -173,6 +173,29 @@ detectors:
     require_both: false          # true => exige account y position a la vez
     choose_by: "max_score"       # max_score | account_only | position_only
 
+  basis_dislocation:
+    enabled: false
+    poll_s: 10
+    retrigger_s: 180
+
+    metric_source: auto        # legacy|doc|auto
+    # thresholds basis/vel (bps)
+    basis_warn_bps: 60.0
+    basis_strong_bps: 120.0
+    vel_warn_bps_s: 1.0
+    vel_strong_bps_s: 2.0
+
+    # funding confirm (DOC)
+    require_funding_confirm: true
+    funding_window_s: 900              # 15m
+    funding_trend_warn: 0.00001
+    funding_trend_strong: 0.00003
+
+    # policy
+    allow_emit_without_funding: false  # si true, permite emitir con basis+vel aunque falte funding
+    clamp_abs_basis_bps: 1000.0
+    clamp_abs_vel_bps_s: 50.0
+
   spread_squeeze:
     enabled: true
     max_spread_usd: 0.5     # compresión del spread

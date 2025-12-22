@@ -54,6 +54,25 @@ class TopTradersCfg:
     choose_by: str = "max_score"
 
 
+@dataclass
+class BasisDislocationCfg:
+    enabled: bool
+    poll_s: float
+    retrigger_s: float
+    metric_source: str
+    basis_warn_bps: float
+    basis_strong_bps: float
+    vel_warn_bps_s: float
+    vel_strong_bps_s: float
+    require_funding_confirm: bool
+    funding_window_s: float
+    funding_trend_warn: float
+    funding_trend_strong: float
+    allow_emit_without_funding: bool
+    clamp_abs_basis_bps: float
+    clamp_abs_vel_bps_s: float
+
+
 def _clamp01(x: float) -> float:
     try:
         return max(0.0, min(1.0, float(x)))
@@ -741,4 +760,233 @@ class TopTradersDetector:
                 "score_pos_long": score_pos_long,
                 "score_pos_short": score_pos_short,
             },
+        )
+
+
+class BasisDislocationDetector:
+    """
+    Detector macro: dislocación de basis (DOC) con confirmación opcional por funding.
+    - Usa métricas DOC preferentemente, con fallback legacy en modo auto.
+    - Siempre audita métrica usada, umbrales y datos de funding (presentes o ausentes).
+    """
+
+    def __init__(self, cfg: BasisDislocationCfg, instrument_id: str):
+        self.cfg = cfg
+        self.instrument_id = instrument_id
+        self.last_fire_ts: Optional[float] = None
+
+    def _await_if_needed(self, maybe_coro: Any) -> Any:
+        if inspect.isawaitable(maybe_coro):
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(maybe_coro)
+            finally:
+                loop.close()
+        return maybe_coro
+
+    def _fetch_one(self, db: Any, sql: str, *args: Any) -> Optional[Dict[str, Any]]:
+        if db is None:
+            return None
+        row = None
+        if hasattr(db, "fetchrow"):
+            try:
+                row = self._await_if_needed(db.fetchrow(sql, *args))
+            except Exception:
+                row = None
+        if row is None and hasattr(db, "fetch"):
+            try:
+                rows = self._await_if_needed(db.fetch(sql, *args))
+                row = rows[0] if rows else None
+            except Exception:
+                row = None
+        if row is None:
+            return None
+        try:
+            return dict(row)
+        except Exception:
+            return row  # type: ignore[return-value]
+
+    @staticmethod
+    def _norm(x: float, warn: float, strong: float) -> float:
+        return _clamp01((float(x) - float(warn)) / max(float(strong - warn), 1e-9))
+
+    def _fetch_latest_metric_series(
+        self, db: Any, metric: str, window_candidates: tuple[int, ...]
+    ) -> Optional[Tuple[float, float]]:
+        for window_s in window_candidates:
+            sql = """
+                SELECT event_time, value
+                FROM oraculo.metrics_series
+                WHERE metric=$1
+                  AND window_s=$2
+                  AND instrument_id=$3
+                ORDER BY event_time DESC
+                LIMIT 1
+            """
+            row = self._fetch_one(db, sql, metric, int(window_s), self.instrument_id)
+            if not row:
+                continue
+            ts = _ts_to_epoch(row.get("event_time"))
+            val = row.get("value")
+            if ts is None or val is None:
+                continue
+            try:
+                return ts, float(val)
+            except Exception:
+                continue
+        return None
+
+    def _funding_rows(
+        self, db: Any, ts_now: float
+    ) -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
+        sql_now = """
+            SELECT event_time, funding_rate
+            FROM binance_futures.mark_funding
+            WHERE instrument_id=$1
+            ORDER BY event_time DESC
+            LIMIT 1;
+        """
+        sql_past = """
+            SELECT event_time, funding_rate
+            FROM binance_futures.mark_funding
+            WHERE instrument_id=$1
+              AND event_time <= now() - ($2::text || ' seconds')::interval
+            ORDER BY event_time DESC
+            LIMIT 1;
+        """
+        row_now = self._fetch_one(db, sql_now, self.instrument_id)
+        row_past = self._fetch_one(db, sql_past, self.instrument_id, str(int(self.cfg.funding_window_s)))
+        funding_now = None
+        funding_past = None
+        if row_now is not None:
+            ts = _ts_to_epoch(row_now.get("event_time"))
+            fr = row_now.get("funding_rate")
+            if ts is not None and fr is not None:
+                funding_now = (ts, float(fr))
+        if row_past is not None:
+            ts = _ts_to_epoch(row_past.get("event_time"))
+            fr = row_past.get("funding_rate")
+            if ts is not None and fr is not None:
+                funding_past = (ts, float(fr))
+        return funding_now, funding_past
+
+    @staticmethod
+    def _clamp(x: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, x))
+
+    def poll(self, ts_now: float, db: Any, instrument_id: str) -> Optional[Event]:
+        if not self.cfg.enabled:
+            return None
+        _ = instrument_id
+
+        if self.last_fire_ts is not None and (ts_now - self.last_fire_ts) < float(self.cfg.retrigger_s):
+            return None
+
+        metric_source = (self.cfg.metric_source or "legacy").lower()
+        basis_sample: Optional[Tuple[float, float]] = None
+        vel_sample: Optional[Tuple[float, float]] = None
+        metric_used_basis = None
+        metric_used_vel = None
+
+        doc_windows = (120, 1)
+        if metric_source in ("doc", "auto"):
+            basis_sample = self._fetch_latest_metric_series(db, "basis_bps_doc", doc_windows)
+            vel_sample = self._fetch_latest_metric_series(db, "basis_vel_bps_s_doc", doc_windows)
+            if basis_sample is not None:
+                metric_used_basis = "basis_bps_doc"
+            if vel_sample is not None:
+                metric_used_vel = "basis_vel_bps_s_doc"
+            if metric_source == "doc" and (basis_sample is None or vel_sample is None):
+                return None
+
+        if (basis_sample is None or vel_sample is None) and metric_source in ("legacy", "auto"):
+            legacy_windows = (1,)
+            if basis_sample is None:
+                basis_sample = self._fetch_latest_metric_series(db, "basis_bps", legacy_windows)
+                if basis_sample is not None:
+                    metric_used_basis = "basis_bps"
+            if vel_sample is None:
+                vel_sample = self._fetch_latest_metric_series(db, "basis_vel_bps_s", legacy_windows)
+                if vel_sample is not None:
+                    metric_used_vel = "basis_vel_bps_s"
+
+        if basis_sample is None or vel_sample is None:
+            return None
+
+        basis_val = self._clamp(float(basis_sample[1]), -float(self.cfg.clamp_abs_basis_bps), float(self.cfg.clamp_abs_basis_bps))
+        vel_val = self._clamp(float(vel_sample[1]), -float(self.cfg.clamp_abs_vel_bps_s), float(self.cfg.clamp_abs_vel_bps_s))
+
+        if abs(basis_val) < float(self.cfg.basis_warn_bps):
+            return None
+        if abs(vel_val) < float(self.cfg.vel_warn_bps_s):
+            return None
+
+        funding_now, funding_past = self._funding_rows(db, ts_now)
+        funding_missing = False
+        funding_trend: Optional[float] = None
+        if funding_now is None or funding_past is None:
+            funding_missing = True
+            if self.cfg.require_funding_confirm and not self.cfg.allow_emit_without_funding:
+                return None
+        else:
+            dt_s = max(1.0, float(funding_now[0] - funding_past[0]))
+            try:
+                funding_trend = (funding_now[1] - funding_past[1]) / dt_s
+            except Exception:
+                funding_trend = None
+            if (
+                self.cfg.require_funding_confirm
+                and (funding_trend is None or abs(funding_trend) < float(self.cfg.funding_trend_warn))
+            ):
+                return None
+
+        if self.last_fire_ts is not None and (ts_now - self.last_fire_ts) < float(self.cfg.retrigger_s):
+            return None
+
+        i_basis = self._norm(abs(basis_val), self.cfg.basis_warn_bps, self.cfg.basis_strong_bps)
+        i_vel = self._norm(abs(vel_val), self.cfg.vel_warn_bps_s, self.cfg.vel_strong_bps_s)
+        i_fund = 0.0
+        if funding_trend is not None:
+            i_fund = self._norm(abs(funding_trend), self.cfg.funding_trend_warn, self.cfg.funding_trend_strong)
+        intensity = _clamp01(max(i_basis, i_vel, i_fund if self.cfg.require_funding_confirm else 0.0))
+
+        self.last_fire_ts = ts_now
+
+        fields = {
+            "basis_bps": basis_val,
+            "basis_vel_bps_s": vel_val,
+            "metric_used_basis": metric_used_basis,
+            "metric_used_vel": metric_used_vel,
+            "metric_source": metric_source,
+            "funding_window_s": self.cfg.funding_window_s,
+            "funding_trend_warn": self.cfg.funding_trend_warn,
+            "funding_trend_strong": self.cfg.funding_trend_strong,
+            "require_funding_confirm": self.cfg.require_funding_confirm,
+            "allow_emit_without_funding": self.cfg.allow_emit_without_funding,
+            "basis_warn_bps": self.cfg.basis_warn_bps,
+            "basis_strong_bps": self.cfg.basis_strong_bps,
+            "vel_warn_bps_s": self.cfg.vel_warn_bps_s,
+            "vel_strong_bps_s": self.cfg.vel_strong_bps_s,
+            "funding_missing": funding_missing,
+            "i_basis": i_basis,
+            "i_vel": i_vel,
+            "i_funding": i_fund,
+        }
+
+        if funding_now is not None:
+            fields["funding_rate_now"] = funding_now[1]
+            fields["funding_ts_now"] = funding_now[0]
+        if funding_past is not None:
+            fields["funding_rate_past"] = funding_past[1]
+            fields["funding_ts_past"] = funding_past[0]
+        if funding_trend is not None:
+            fields["funding_trend"] = funding_trend
+
+        return Event(
+            kind="basis_dislocation",
+            side="na",
+            ts=ts_now,
+            price=0.0,
+            intensity=intensity,
+            fields=fields,
         )
