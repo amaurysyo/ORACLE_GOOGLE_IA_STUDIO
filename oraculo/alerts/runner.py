@@ -797,6 +797,19 @@ async def dispatch_macro_event(
                 f"pos=({pos_lr},{pos_sr}) "
                 f"i={ev.intensity:.2f}"
             )
+        elif ev.kind == "basis_dislocation":
+            basis = fields.get("basis_bps")
+            vel = fields.get("basis_vel_bps_s")
+            ftrend = fields.get("funding_trend")
+            metric_used_basis = fields.get("metric_used_basis")
+            metric_used_vel = fields.get("metric_used_vel")
+            text = (
+                f"#{rule['rule']} basis_dislocation | "
+                f"basis={basis} vel={vel} "
+                f"f_trend={ftrend} "
+                f"mb={metric_used_basis} mv={metric_used_vel} "
+                f"i={ev.intensity:.2f}"
+            )
         await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
 
 # ---- Telemetría (agregada y volcada a tabla oraculo.rule_telemetry) ----

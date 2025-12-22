@@ -46,6 +46,8 @@ from oraculo.detect.macro_detectors import (
     LiqClusterDetector,
     OISpikeCfg,
     OISpikeDetector,
+    BasisDislocationCfg,
+    BasisDislocationDetector,
     TopTradersCfg,
     TopTradersDetector,
 )
@@ -173,6 +175,28 @@ def _build_top_traders_cfg(rules: Dict[str, Any]) -> TopTradersCfg:
     cfg.require_both = bool(raw.get("require_both", cfg.require_both))
     cfg.choose_by = str(raw.get("choose_by", cfg.choose_by))
     return cfg
+
+
+def _build_basis_dislocation_cfg(rules: Dict[str, Any]) -> BasisDislocationCfg:
+    det = (rules or {}).get("detectors", {}) or {}
+    raw = det.get("basis_dislocation") or {}
+    return BasisDislocationCfg(
+        enabled=bool(raw.get("enabled", False)),
+        poll_s=float(raw.get("poll_s", 10.0)),
+        retrigger_s=float(raw.get("retrigger_s", 180.0)),
+        metric_source=str(raw.get("metric_source", "auto")),
+        basis_warn_bps=float(raw.get("basis_warn_bps", 60.0)),
+        basis_strong_bps=float(raw.get("basis_strong_bps", 120.0)),
+        vel_warn_bps_s=float(raw.get("vel_warn_bps_s", 1.0)),
+        vel_strong_bps_s=float(raw.get("vel_strong_bps_s", 2.0)),
+        require_funding_confirm=bool(raw.get("require_funding_confirm", True)),
+        funding_window_s=float(raw.get("funding_window_s", 900.0)),
+        funding_trend_warn=float(raw.get("funding_trend_warn", 0.00001)),
+        funding_trend_strong=float(raw.get("funding_trend_strong", 0.00003)),
+        allow_emit_without_funding=bool(raw.get("allow_emit_without_funding", False)),
+        clamp_abs_basis_bps=float(raw.get("clamp_abs_basis_bps", 1000.0)),
+        clamp_abs_vel_bps_s=float(raw.get("clamp_abs_vel_bps_s", 50.0)),
+    )
 
 
 def _apply_rules_to_detectors(
@@ -465,6 +489,8 @@ class CPUWorkerProcess(mp.Process):
         liq_detector = LiqClusterDetector(liq_cfg, self.instrument_id)
         top_traders_cfg = _build_top_traders_cfg(self.rules)
         top_traders_detector = TopTradersDetector(top_traders_cfg, self.instrument_id)
+        basis_dislocation_cfg = _build_basis_dislocation_cfg(self.rules)
+        basis_dislocation_detector = BasisDislocationDetector(basis_dislocation_cfg, self.instrument_id)
         db_loop: Optional[asyncio.AbstractEventLoop] = None
         db_pool = None
         db_adapter: Optional[_AsyncpgAdapter] = None
@@ -472,6 +498,7 @@ class CPUWorkerProcess(mp.Process):
         last_oi_poll_ts = 0.0
         last_liq_poll_ts = 0.0
         last_tt_poll_ts = 0.0
+        last_basis_poll_ts = 0.0
 
         def _close_db_resources() -> None:
             nonlocal db_pool, db_loop, db_adapter
@@ -508,7 +535,7 @@ class CPUWorkerProcess(mp.Process):
                 db_loop = None
                 db_adapter = None
 
-        need_db = (oi_cfg.enabled or liq_cfg.enabled or top_traders_cfg.enabled)
+        need_db = (oi_cfg.enabled or liq_cfg.enabled or top_traders_cfg.enabled or basis_dislocation_cfg.enabled)
         if need_db and self.db_dsn and asyncpg is not None:
             try:
                 db_loop = asyncio.new_event_loop()
@@ -571,6 +598,21 @@ class CPUWorkerProcess(mp.Process):
                     if ev_macro is not None:
                         self._emit_result("macro", ev_macro, poll_t0, poll_t0)
                     last_tt_poll_ts = now_poll
+                if (
+                    basis_dislocation_detector
+                    and basis_dislocation_detector.cfg.enabled
+                    and db_adapter is not None
+                    and (now_poll - last_basis_poll_ts) >= float(basis_dislocation_detector.cfg.poll_s)
+                ):
+                    poll_t0 = time.perf_counter()
+                    try:
+                        ev_macro = basis_dislocation_detector.poll(now_poll, db_adapter, self.instrument_id)
+                    except Exception:
+                        ev_macro = None
+                        logger.exception("[cpu-worker] basis_dislocation poll failed")
+                    if ev_macro is not None:
+                        self._emit_result("macro", ev_macro, poll_t0, poll_t0)
+                    last_basis_poll_ts = now_poll
 
                 try:
                     req: WorkerRequest = self.in_queue.get(timeout=0.1)
@@ -657,7 +699,9 @@ class CPUWorkerProcess(mp.Process):
                             pass
                         top_traders_cfg = _build_top_traders_cfg(req.payload or {})
                         top_traders_detector.cfg = top_traders_cfg
-                        need_db_after = (oi_cfg.enabled or liq_cfg.enabled or top_traders_cfg.enabled)
+                        basis_dislocation_cfg = _build_basis_dislocation_cfg(req.payload or {})
+                        basis_dislocation_detector.cfg = basis_dislocation_cfg
+                        need_db_after = (oi_cfg.enabled or liq_cfg.enabled or top_traders_cfg.enabled or basis_dislocation_cfg.enabled)
                         if need_db_after and db_adapter is None and self.db_dsn and asyncpg is not None:
                             try:
                                 db_loop = asyncio.new_event_loop()
