@@ -18,6 +18,7 @@ deribit_surface_builder:
   min_oi: 0
   min_quotes: 2          # filtra opciones sin bid/ask
   use_oi_weight: true
+  expiry_agg_mode: "oi_weighted"  # oi_weighted | equal (ponderación entre expiries)
   clamp_iv: [0.0, 5.0]
   clamp_rr: [-2.0, 2.0]
   clamp_bf: [-2.0, 2.0]
@@ -41,6 +42,14 @@ deribit_surface_builder:
    asyncio.run(main())
    ```
 
+## Agregación intra-bucket (opción B, anti-colisión PK)
+- La PK de `deribit.options_iv_surface` se mantiene en `(underlying, event_time, tenor_bucket, moneyness_bucket)`.
+- Si hay varias expiries dentro del mismo `tenor_bucket` (p.ej., `max_expiries_per_bucket>1`), se agregan antes de upsert:
+  - **RR/BF/ATM (bucket moneyness=NA)**: promedio ponderado por OI de la expiry si `expiry_agg_mode=oi_weighted`/`use_oi_weight=true`; ponderación igualitaria si `expiry_agg_mode=equal`. Expiries con call/put/atm faltantes no contribuyen y sólo incrementan `meta.n_components_missing`.
+  - **Moneyness buckets**: promedio ponderado por OI por expiry (o simple si `use_oi_weight=false`), y luego ponderado entre expiries según `expiry_agg_mode`.
+- El upsert sigue siendo determinista: 1 fila final por PK y ventana, sin sobrescritura “última expiry gana”.
+- `meta_json` por fila incluye `n_expiries_used`, `weights_used`, `sum_weights`, `expiries.count/sample/min/max` y, para RR/BF/ATM, `n_components_missing`.
+
 ## Verificaciones
 - Población de surface:
   ```sql
@@ -50,12 +59,27 @@ deribit_surface_builder:
   ```sql
   SELECT count(*), max(bucket) FROM oraculo.iv_surface_1m WHERE underlying='BTC';
   ```
-- Último bucket construido (meta):
+- Último bucket construido (meta agregada):
   ```sql
-  SELECT event_time, meta->>'expiry' AS expiry, tenor_bucket, moneyness_bucket
+  SELECT event_time, meta->'expiries' AS expiries, tenor_bucket, moneyness_bucket
   FROM deribit.options_iv_surface
   ORDER BY event_time DESC
   LIMIT 10;
+  ```
+- Anti-colisión PK (1 fila por bucket+minuto) y auditoría de expiries agregadas:
+  ```sql
+  SELECT event_time, tenor_bucket, moneyness_bucket, count(*) AS n_rows
+  FROM deribit.options_iv_surface
+  WHERE event_time >= now() - interval '1 hour'
+  GROUP BY 1,2,3
+  HAVING count(*) > 1;
+
+  SELECT event_time, tenor_bucket, moneyness_bucket,
+         meta->'expiries' AS expiries_meta,
+         meta->>'weights_used' AS weights_mode,
+         meta->'n_components_missing' AS missing_components
+  FROM deribit.options_iv_surface
+  WHERE event_time = (SELECT max(event_time) FROM deribit.options_iv_surface);
   ```
 
 ## Troubleshooting
