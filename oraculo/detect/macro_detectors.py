@@ -90,6 +90,28 @@ class SkewShockCfg:
     require_recent_past: bool = True
 
 
+@dataclass
+class TermStructureInvertCfg:
+    enabled: bool = False
+    poll_s: float = 30.0
+    retrigger_s: float = 600.0
+    underlying: str = "BTC"
+    lookback_s: float = 600.0
+    short_tenor_bucket: str = "0_7d"
+    long_tenor_bucket: str = "30_90d"
+    moneyness_bucket: str = "NA"
+    spread_warn: float = 0.05
+    spread_strong: float = 0.10
+    vel_warn_per_s: float = 0.0002
+    vel_strong_per_s: float = 0.0004
+    use_velocity_gate: bool = False
+    clamp_abs_iv: float = 5.0
+    clamp_abs_spread: float = 1.0
+    clamp_abs_vel_per_s: float = 0.01
+    require_both_present: bool = True
+    require_positive_inversion: bool = True
+
+
 def _clamp01(x: float) -> float:
     try:
         return max(0.0, min(1.0, float(x)))
@@ -1156,4 +1178,187 @@ class SkewShockDetector:
                 "i_delta": i_delta,
                 "i_vel": i_vel,
             },
+        )
+
+
+class TermStructureInvertDetector:
+    def __init__(self, cfg: TermStructureInvertCfg, instrument_id: str):
+        self.cfg = cfg
+        self.instrument_id = instrument_id
+        self.last_fire_ts: Optional[float] = None
+        self.last_spread: Optional[float] = None
+        self.last_spread_ts: Optional[float] = None
+
+    @staticmethod
+    def _await_if_needed(maybe_coro: Any) -> Any:
+        if inspect.isawaitable(maybe_coro):
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(maybe_coro)
+            finally:
+                loop.close()
+        return maybe_coro
+
+    def _fetch_one(self, db: Any, sql: str, *args: Any) -> Optional[Dict[str, Any]]:
+        if db is None:
+            return None
+        row = None
+        if hasattr(db, "fetchrow"):
+            try:
+                row = self._await_if_needed(db.fetchrow(sql, *args))
+            except Exception:
+                row = None
+        if row is None and hasattr(db, "fetch"):
+            try:
+                rows = self._await_if_needed(db.fetch(sql, *args))
+                row = rows[0] if rows else None
+            except Exception:
+                row = None
+        if row is None:
+            return None
+        try:
+            return dict(row)
+        except Exception:
+            return row  # type: ignore[return-value]
+
+    @staticmethod
+    def _clamp(x: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, x))
+
+    @staticmethod
+    def _safe_float(val: Any) -> Optional[float]:
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    def _fetch_surface_row(self, db: Any, ts_now: float, tenor_bucket: str) -> Optional[Dict[str, Any]]:
+        sql = """
+            SELECT event_time, iv, rr_25d, bf_25d, n_used, meta_json
+            FROM deribit.options_iv_surface
+            WHERE underlying=$1
+              AND tenor_bucket=$2
+              AND moneyness_bucket=$3
+              AND event_time >= (to_timestamp($4) - ($5 || ' seconds')::interval)
+            ORDER BY event_time DESC
+            LIMIT 1;
+        """
+        return self._fetch_one(
+            db,
+            sql,
+            self.cfg.underlying,
+            tenor_bucket,
+            self.cfg.moneyness_bucket,
+            ts_now,
+            self.cfg.lookback_s,
+        )
+
+    def poll(self, ts_now: float, db: Any, instrument_id: str) -> Optional[Event]:
+        if not self.cfg.enabled:
+            return None
+        _ = instrument_id
+
+        if self.last_fire_ts is not None and (ts_now - self.last_fire_ts) < float(self.cfg.retrigger_s):
+            return None
+
+        row_short = self._fetch_surface_row(db, ts_now, self.cfg.short_tenor_bucket)
+        row_long = self._fetch_surface_row(db, ts_now, self.cfg.long_tenor_bucket)
+
+        if (row_short is None or row_long is None) and self.cfg.require_both_present:
+            return None
+        if row_short is None or row_long is None:
+            return None
+
+        iv_s_raw = self._safe_float(row_short.get("iv"))
+        iv_l_raw = self._safe_float(row_long.get("iv"))
+        if iv_s_raw is None or iv_l_raw is None:
+            return None
+
+        iv_s = self._clamp(iv_s_raw, 0.0, float(self.cfg.clamp_abs_iv))
+        iv_l = self._clamp(iv_l_raw, 0.0, float(self.cfg.clamp_abs_iv))
+
+        ts_short = _ts_to_epoch(row_short.get("event_time"))
+        ts_long = _ts_to_epoch(row_long.get("event_time"))
+        rr_s = self._safe_float(row_short.get("rr_25d"))
+        rr_l = self._safe_float(row_long.get("rr_25d"))
+        bf_s = self._safe_float(row_short.get("bf_25d"))
+        bf_l = self._safe_float(row_long.get("bf_25d"))
+        n_used_s = row_short.get("n_used")
+        n_used_l = row_long.get("n_used")
+
+        spread = iv_s - iv_l
+        spread = self._clamp(spread, -float(self.cfg.clamp_abs_spread), float(self.cfg.clamp_abs_spread))
+
+        vel: Optional[float] = None
+        if self.last_spread is not None and self.last_spread_ts is not None:
+            dt_s = ts_now - self.last_spread_ts
+            if dt_s > 0:
+                vel = (spread - self.last_spread) / dt_s
+                vel = self._clamp(vel, -float(self.cfg.clamp_abs_vel_per_s), float(self.cfg.clamp_abs_vel_per_s))
+
+        self.last_spread = spread
+        self.last_spread_ts = ts_now
+
+        if self.cfg.require_positive_inversion and spread <= 0:
+            return None
+        if abs(spread) < float(self.cfg.spread_warn):
+            return None
+
+        if self.cfg.use_velocity_gate:
+            if vel is None:
+                return None
+            if abs(vel) < float(self.cfg.vel_warn_per_s):
+                return None
+
+        i_spread = _clamp01(
+            (abs(spread) - float(self.cfg.spread_warn))
+            / max(float(self.cfg.spread_strong - self.cfg.spread_warn), 1e-9)
+        )
+        i_vel = 0.0
+        if vel is not None:
+            i_vel = _clamp01(
+                (abs(vel) - float(self.cfg.vel_warn_per_s))
+                / max(float(self.cfg.vel_strong_per_s - self.cfg.vel_warn_per_s), 1e-9)
+            )
+
+        intensity = _clamp01(max(i_spread, i_vel if self.cfg.use_velocity_gate else 0.0))
+
+        self.last_fire_ts = ts_now
+
+        fields: Dict[str, Any] = {
+            "underlying": self.cfg.underlying,
+            "short_tenor_bucket": self.cfg.short_tenor_bucket,
+            "long_tenor_bucket": self.cfg.long_tenor_bucket,
+            "moneyness_bucket": self.cfg.moneyness_bucket,
+            "iv_short": iv_s,
+            "iv_long": iv_l,
+            "spread": spread,
+            "ts_short": ts_short,
+            "ts_long": ts_long,
+            "lookback_s": self.cfg.lookback_s,
+            "rr_short": rr_s,
+            "bf_short": bf_s,
+            "rr_long": rr_l,
+            "bf_long": bf_l,
+            "n_used_short": n_used_s,
+            "n_used_long": n_used_l,
+            "spread_warn": self.cfg.spread_warn,
+            "spread_strong": self.cfg.spread_strong,
+            "use_velocity_gate": self.cfg.use_velocity_gate,
+            "vel_warn_per_s": self.cfg.vel_warn_per_s,
+            "vel_strong_per_s": self.cfg.vel_strong_per_s,
+            "i_spread": i_spread,
+        }
+
+        if vel is not None:
+            fields["vel_per_s"] = vel
+            fields["i_vel"] = i_vel
+
+        return Event(
+            kind="term_structure_invert",
+            side="invert",
+            ts=ts_now,
+            price=0.0,
+            intensity=intensity,
+            fields=fields,
         )

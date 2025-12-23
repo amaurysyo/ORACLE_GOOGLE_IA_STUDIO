@@ -52,6 +52,8 @@ from oraculo.detect.macro_detectors import (
     TopTradersDetector,
     SkewShockCfg,
     SkewShockDetector,
+    TermStructureInvertCfg,
+    TermStructureInvertDetector,
 )
 from oraculo.obs import metrics as obs_metrics
 
@@ -218,6 +220,31 @@ def _build_skew_shock_cfg(rules: Dict[str, Any]) -> SkewShockCfg:
     cfg.clamp_abs_delta = float(raw.get("clamp_abs_delta", cfg.clamp_abs_delta))
     cfg.clamp_abs_vel_per_s = float(raw.get("clamp_abs_vel_per_s", cfg.clamp_abs_vel_per_s))
     cfg.require_recent_past = bool(raw.get("require_recent_past", cfg.require_recent_past))
+    return cfg
+
+
+def _build_term_structure_invert_cfg(rules: Dict[str, Any]) -> TermStructureInvertCfg:
+    det = (rules or {}).get("detectors", {}) or {}
+    raw = det.get("term_structure_invert") or {}
+    cfg = TermStructureInvertCfg()
+    cfg.enabled = bool(raw.get("enabled", cfg.enabled))
+    cfg.poll_s = float(raw.get("poll_s", cfg.poll_s))
+    cfg.retrigger_s = float(raw.get("retrigger_s", cfg.retrigger_s))
+    cfg.underlying = str(raw.get("underlying", cfg.underlying))
+    cfg.lookback_s = float(raw.get("lookback_s", cfg.lookback_s))
+    cfg.short_tenor_bucket = str(raw.get("short_tenor_bucket", cfg.short_tenor_bucket))
+    cfg.long_tenor_bucket = str(raw.get("long_tenor_bucket", cfg.long_tenor_bucket))
+    cfg.moneyness_bucket = str(raw.get("moneyness_bucket", cfg.moneyness_bucket))
+    cfg.spread_warn = float(raw.get("spread_warn", cfg.spread_warn))
+    cfg.spread_strong = float(raw.get("spread_strong", cfg.spread_strong))
+    cfg.vel_warn_per_s = float(raw.get("vel_warn_per_s", cfg.vel_warn_per_s))
+    cfg.vel_strong_per_s = float(raw.get("vel_strong_per_s", cfg.vel_strong_per_s))
+    cfg.use_velocity_gate = bool(raw.get("use_velocity_gate", cfg.use_velocity_gate))
+    cfg.clamp_abs_iv = float(raw.get("clamp_abs_iv", cfg.clamp_abs_iv))
+    cfg.clamp_abs_spread = float(raw.get("clamp_abs_spread", cfg.clamp_abs_spread))
+    cfg.clamp_abs_vel_per_s = float(raw.get("clamp_abs_vel_per_s", cfg.clamp_abs_vel_per_s))
+    cfg.require_both_present = bool(raw.get("require_both_present", cfg.require_both_present))
+    cfg.require_positive_inversion = bool(raw.get("require_positive_inversion", cfg.require_positive_inversion))
     return cfg
 
 
@@ -515,6 +542,8 @@ class CPUWorkerProcess(mp.Process):
         basis_dislocation_detector = BasisDislocationDetector(basis_dislocation_cfg, self.instrument_id)
         skew_cfg = _build_skew_shock_cfg(self.rules)
         skew_detector = SkewShockDetector(skew_cfg, self.instrument_id)
+        term_structure_cfg = _build_term_structure_invert_cfg(self.rules)
+        term_structure_detector = TermStructureInvertDetector(term_structure_cfg, self.instrument_id)
         db_loop: Optional[asyncio.AbstractEventLoop] = None
         db_pool = None
         db_adapter: Optional[_AsyncpgAdapter] = None
@@ -524,6 +553,7 @@ class CPUWorkerProcess(mp.Process):
         last_tt_poll_ts = 0.0
         last_basis_poll_ts = 0.0
         last_skew_poll_ts = 0.0
+        last_term_structure_poll_ts = 0.0
 
         def _close_db_resources() -> None:
             nonlocal db_pool, db_loop, db_adapter
@@ -566,6 +596,7 @@ class CPUWorkerProcess(mp.Process):
             or top_traders_cfg.enabled
             or basis_dislocation_cfg.enabled
             or skew_cfg.enabled
+            or term_structure_cfg.enabled
         )
         if need_db and self.db_dsn and asyncpg is not None:
             try:
@@ -659,6 +690,21 @@ class CPUWorkerProcess(mp.Process):
                     if ev_macro is not None:
                         self._emit_result("macro", ev_macro, poll_t0, poll_t0)
                     last_skew_poll_ts = now_poll
+                if (
+                    term_structure_detector
+                    and term_structure_detector.cfg.enabled
+                    and db_adapter is not None
+                    and (now_poll - last_term_structure_poll_ts) >= float(term_structure_detector.cfg.poll_s)
+                ):
+                    poll_t0 = time.perf_counter()
+                    try:
+                        ev_macro = term_structure_detector.poll(now_poll, db_adapter, self.instrument_id)
+                    except Exception:
+                        ev_macro = None
+                        logger.exception("[cpu-worker] term_structure_invert poll failed")
+                    if ev_macro is not None:
+                        self._emit_result("macro", ev_macro, poll_t0, poll_t0)
+                    last_term_structure_poll_ts = now_poll
 
                 try:
                     req: WorkerRequest = self.in_queue.get(timeout=0.1)
@@ -749,12 +795,15 @@ class CPUWorkerProcess(mp.Process):
                         basis_dislocation_detector.cfg = basis_dislocation_cfg
                         skew_cfg = _build_skew_shock_cfg(req.payload or {})
                         skew_detector.cfg = skew_cfg
+                        term_structure_cfg = _build_term_structure_invert_cfg(req.payload or {})
+                        term_structure_detector.cfg = term_structure_cfg
                         need_db_after = (
                             oi_cfg.enabled
                             or liq_cfg.enabled
                             or top_traders_cfg.enabled
                             or basis_dislocation_cfg.enabled
                             or skew_cfg.enabled
+                            or term_structure_cfg.enabled
                         )
                         if need_db_after and db_adapter is None and self.db_dsn and asyncpg is not None:
                             try:
