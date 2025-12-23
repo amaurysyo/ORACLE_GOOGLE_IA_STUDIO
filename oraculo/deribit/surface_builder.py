@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
-import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from loguru import logger
@@ -19,6 +18,62 @@ def _clamp(x: Optional[float], bounds: Tuple[float, float]) -> Optional[float]:
 
 
 @dataclass
+class _BucketAgg:
+    iv_num: float = 0.0
+    iv_den: float = 0.0
+    rr_num: float = 0.0
+    rr_den: float = 0.0
+    bf_num: float = 0.0
+    bf_den: float = 0.0
+    n_expiries_used: int = 0
+    n_used_total: int = 0
+    sum_weights: float = 0.0
+    expiries_sample: List[str] = field(default_factory=list)
+    expiry_min: Optional[dt.date] = None
+    expiry_max: Optional[dt.date] = None
+    missing_components: Dict[str, int] = field(default_factory=lambda: {"call": 0, "put": 0, "atm": 0})
+
+    def add_expiry(
+        self,
+        *,
+        expiry: Optional[dt.date],
+        iv: Optional[float],
+        rr: Optional[float],
+        bf: Optional[float],
+        weight: float,
+        missing_components: Optional[Dict[str, int]] = None,
+        n_used: int = 0,
+    ) -> None:
+        w = float(weight) if weight and weight > 0 else 1.0
+        contributed = False
+        if iv is not None:
+            self.iv_num += iv * w
+            self.iv_den += w
+            contributed = True
+        if rr is not None:
+            self.rr_num += rr * w
+            self.rr_den += w
+            contributed = True
+        if bf is not None:
+            self.bf_num += bf * w
+            self.bf_den += w
+            contributed = True
+        if contributed:
+            self.n_expiries_used += 1
+            self.sum_weights += w
+            self.n_used_total += max(int(n_used), 0)
+            if expiry:
+                if len(self.expiries_sample) < 5:
+                    self.expiries_sample.append(expiry.isoformat())
+                self.expiry_min = expiry if self.expiry_min is None or expiry < self.expiry_min else self.expiry_min
+                self.expiry_max = expiry if self.expiry_max is None or expiry > self.expiry_max else self.expiry_max
+        if missing_components:
+            for comp, cnt in missing_components.items():
+                self.missing_components[comp] = self.missing_components.get(comp, 0) + int(cnt)
+
+
+
+@dataclass
 class SurfaceBuilderCfg:
     enabled: bool = False
     poll_s: float = 30.0
@@ -31,6 +86,7 @@ class SurfaceBuilderCfg:
     min_oi: float = 0.0
     min_quotes: int = 0
     use_oi_weight: bool = True
+    expiry_agg_mode: Optional[str] = None
     clamp_iv: Tuple[float, float] = (0.0, 5.0)
     clamp_rr: Tuple[float, float] = (-2.0, 2.0)
     clamp_bf: Tuple[float, float] = (-2.0, 2.0)
@@ -40,6 +96,11 @@ class DeribitSurfaceBuilder:
     def __init__(self, cfg: SurfaceBuilderCfg) -> None:
         self.cfg = cfg
         self._last_bucket_ts: Optional[dt.datetime] = None
+        mode = (self.cfg.expiry_agg_mode or ("oi_weighted" if self.cfg.use_oi_weight else "equal")).lower()
+        self._expiry_weight_mode = mode if mode in ("oi_weighted", "equal") else "oi_weighted"
+
+    def _use_oi_weights_for_expiry(self) -> bool:
+        return self._expiry_weight_mode != "equal"
 
     @staticmethod
     def _floor_minute(ts: dt.datetime) -> dt.datetime:
@@ -185,8 +246,10 @@ class DeribitSurfaceBuilder:
         return best[1] if best else None
 
     def _compute_rr_bf_atm(
-        self, rows: Sequence[Dict[str, Any]], spot: float
-    ) -> Tuple[Optional[float], Optional[float], Optional[float], Dict[str, Any]]:
+        self, rows: Sequence[Dict[str, Any]], spot: float, use_oi_weight: bool
+    ) -> Tuple[
+        Optional[float], Optional[float], Optional[float], Dict[str, Any], float, Dict[str, int]
+    ]:
         audit: Dict[str, Any] = {"components": {}}
         call = self._select_by_delta(rows, self.cfg.delta_target, self.cfg.delta_tolerance, "C")
         put = self._select_by_delta(rows, -self.cfg.delta_target, self.cfg.delta_tolerance, "P")
@@ -212,11 +275,25 @@ class DeribitSurfaceBuilder:
         audit["n_used"] = len(rows)
         audit["delta_target"] = self.cfg.delta_target
         audit["delta_tolerance"] = self.cfg.delta_tolerance
-        return iv_atm, rr, bf, audit
+        missing = {
+            "call": int(call is None),
+            "put": int(put is None),
+            "atm": int(atm is None),
+        }
+        weight = 1.0
+        if use_oi_weight:
+            ois = []
+            for row in (call, put, atm):
+                try:
+                    ois.append(max(float(row.get("open_interest") or 0.0), 0.0) if row else 0.0)
+                except Exception:
+                    ois.append(0.0)
+            weight = sum(ois) or 1.0
+        return iv_atm, rr, bf, audit, weight, missing
 
     def _compute_moneyness_iv(
-        self, rows: Sequence[Dict[str, Any]], spot: float
-    ) -> Dict[str, Tuple[Optional[float], Dict[str, Any], int]]:
+        self, rows: Sequence[Dict[str, Any]], spot: float, use_oi_weight_for_expiry: bool
+    ) -> Dict[str, Tuple[Optional[float], Dict[str, Any], int, float]]:
         buckets: Dict[str, List[Tuple[float, float]]] = {}
         for r in rows:
             iv_raw = r.get("mark_iv")
@@ -238,7 +315,7 @@ class DeribitSurfaceBuilder:
                 continue
             buckets.setdefault(mb, []).append((iv, oi))
 
-        out: Dict[str, Tuple[Optional[float], Dict[str, Any], int]] = {}
+        out: Dict[str, Tuple[Optional[float], Dict[str, Any], int, float]] = {}
         for mb, items in buckets.items():
             n = len(items)
             if n == 0:
@@ -249,7 +326,8 @@ class DeribitSurfaceBuilder:
                 iv_avg = num / den
             else:
                 iv_avg = sum(iv for iv, _ in items) / n
-            out[mb] = (_clamp(iv_avg, self.cfg.clamp_iv), {"n": n}, n)
+            weight = sum(max(oi, 0.0) for _, oi in items) if use_oi_weight_for_expiry else n
+            out[mb] = (_clamp(iv_avg, self.cfg.clamp_iv), {"n": n}, n, weight or 1.0)
         return out
 
     async def _upsert_surface_rows(self, db: Any, rows: Iterable[Tuple]) -> None:
@@ -287,7 +365,16 @@ class DeribitSurfaceBuilder:
             return 0
 
         rows_to_insert: List[Tuple] = []
+        aggregates: Dict[Tuple[str, str], _BucketAgg] = {}
+        use_oi_weight_for_expiry = self._use_oi_weights_for_expiry()
         for tenor_bucket, expiries in expiries_by_bucket.items():
+            if len(expiries) > 1:
+                logger.debug(
+                    "[surface_builder] Aggregating expiries within bucket: n=%s tenor_bucket=%s event_time=%s",
+                    len(expiries),
+                    tenor_bucket,
+                    bucket_ts,
+                )
             for expiry in expiries:
                 snap_rows = await self._fetch_snapshot_for_expiry(db, expiry, bucket_ts)
                 if not snap_rows:
@@ -301,32 +388,75 @@ class DeribitSurfaceBuilder:
                     filtered_rows.append(r)
                 if not filtered_rows:
                     continue
-                iv_atm, rr, bf, audit = self._compute_rr_bf_atm(filtered_rows, spot)
-                meta = {
-                    "expiry": expiry.isoformat(),
-                    "bucket_ts": bucket_ts.isoformat(),
-                    "tenor_bucket": tenor_bucket,
-                    "expiry_days": (expiry - bucket_ts.date()).days,
-                    "audit": audit,
-                }
-                rows_to_insert.append(
-                    (self.cfg.underlying, bucket_ts, tenor_bucket, "NA", iv_atm, rr, bf, meta)
+                iv_atm, rr, bf, _audit, weight_rr, missing_components = self._compute_rr_bf_atm(
+                    filtered_rows, spot, use_oi_weight_for_expiry
+                )
+                agg = aggregates.setdefault((tenor_bucket, "NA"), _BucketAgg())
+                should_contribute_rr = not any(missing_components.values())
+                agg.add_expiry(
+                    expiry=expiry,
+                    iv=iv_atm if should_contribute_rr else None,
+                    rr=rr if should_contribute_rr else None,
+                    bf=bf if should_contribute_rr else None,
+                    weight=weight_rr if use_oi_weight_for_expiry else 1.0,
+                    missing_components=missing_components,
+                    n_used=len(filtered_rows),
                 )
 
-                m_iv = self._compute_moneyness_iv(filtered_rows, spot)
-                for m_bucket, (iv_avg, m_audit, n_used) in m_iv.items():
-                    meta_m = {
-                        "expiry": expiry.isoformat(),
-                        "bucket_ts": bucket_ts.isoformat(),
-                        "tenor_bucket": tenor_bucket,
-                        "moneyness_bucket": m_bucket,
-                        "expiry_days": (expiry - bucket_ts.date()).days,
-                        "audit": m_audit,
-                        "n_used": n_used,
-                    }
-                    rows_to_insert.append(
-                        (self.cfg.underlying, bucket_ts, tenor_bucket, m_bucket, iv_avg, None, None, meta_m)
+                m_iv = self._compute_moneyness_iv(filtered_rows, spot, use_oi_weight_for_expiry)
+                for m_bucket, (iv_avg, m_audit, n_used, weight_m) in m_iv.items():
+                    agg_m = aggregates.setdefault((tenor_bucket, m_bucket), _BucketAgg())
+                    agg_m.add_expiry(
+                        expiry=expiry,
+                        iv=iv_avg,
+                        rr=None,
+                        bf=None,
+                        weight=weight_m if use_oi_weight_for_expiry else 1.0,
+                        missing_components=None,
+                        n_used=n_used,
                     )
+
+        for (tenor_bucket, m_bucket), agg in aggregates.items():
+            iv_val = agg.iv_num / agg.iv_den if agg.iv_den > 0 else None
+            rr_val = agg.rr_num / agg.rr_den if agg.rr_den > 0 else None
+            bf_val = agg.bf_num / agg.bf_den if agg.bf_den > 0 else None
+            if iv_val is None and rr_val is None and bf_val is None:
+                continue
+
+            if agg.n_expiries_used > 1:
+                logger.debug(
+                    "[surface_builder] Aggregating expiries within bucket: n=%s tenor_bucket=%s moneyness_bucket=%s event_time=%s",
+                    agg.n_expiries_used,
+                    tenor_bucket,
+                    m_bucket,
+                    bucket_ts,
+                )
+
+            expiries_meta: Dict[str, Any] = {"count": agg.n_expiries_used}
+            if agg.expiries_sample:
+                expiries_meta["sample"] = agg.expiries_sample
+            if agg.expiry_min:
+                expiries_meta["min"] = agg.expiry_min.isoformat()
+            if agg.expiry_max:
+                expiries_meta["max"] = agg.expiry_max.isoformat()
+
+            meta = {
+                "bucket_ts": bucket_ts.isoformat(),
+                "tenor_bucket": tenor_bucket,
+                "moneyness_bucket": m_bucket,
+                "n_expiries_used": agg.n_expiries_used,
+                "n_used_total": agg.n_used_total,
+                "sum_weights": agg.sum_weights,
+                "weights_used": "oi" if use_oi_weight_for_expiry else "equal",
+                "expiries": expiries_meta,
+            }
+            missing_counts = {k: v for k, v in agg.missing_components.items() if v}
+            if missing_counts:
+                meta["n_components_missing"] = missing_counts
+
+            rows_to_insert.append(
+                (self.cfg.underlying, bucket_ts, tenor_bucket, m_bucket, iv_val, rr_val, bf_val, meta)
+            )
 
         if not rows_to_insert:
             return 0

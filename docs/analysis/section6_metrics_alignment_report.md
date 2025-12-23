@@ -15,6 +15,11 @@
 
 Fuente: Sección 6 “Métricas Microestructurales” del DOC `📘 Proyecto — Oráculo Btcusdt  V1 — ACTUALIZADO.docx`.
 
+## Estado actual (post-tareas 1–11.1)
+- Métricas DOC implementadas y persistidas en `metrics_series`: `wmid`, `imbalance_doc`, `dominance_*_doc`, `depletion_*_doc`, `basis_bps_doc`, `basis_vel_bps_s_doc`, `basis_accel_bps_s2_doc`, `oi_delta_pct_doc`. Legacy se preserva en paralelo.
+- El resolver de métricas usa `metric_source=doc|legacy|auto` con fallback para mantener compatibilidad en reglas durante la transición.
+- Algunas reglas continúan consumiendo métricas legacy por política de rollout, aunque las métricas DOC ya estén disponibles.
+
 ## Mapeo DOC → CÓDIGO → BD por métrica
 
 ### Imbalance
@@ -34,9 +39,9 @@ Fuente: Sección 6 “Métricas Microestructurales” del DOC `📘 Proyecto —
 - **Estado**: Alineada (mismas magnitudes; DOC expresa en ticks pero la implementación usa USD del libro).
 
 ### Wmid
-- **Código**: existe helper `spread_wmid` en `orderbook`, pero el `Snapshot` del engine no expone ni calcula `wmid`.【F:oraculo/detect/orderbook.py†L119-L125】【F:oraculo/detect/metrics_engine.py†L78-L209】
-- **Persistencia**: no se inserta ninguna serie `wmid` en `metrics_series`.【F:oraculo/alerts/cpu_worker.py†L477-L493】
-- **Estado**: H4 confirmada (no calculada ni persistida).
+- **Código**: `Snapshot` expone `wmid` calculado a partir del best bid/ask; los detectores lo consumen con fallback al cálculo directo cuando falta la serie.【F:oraculo/detect/metrics_engine.py†L78-L209】【F:oraculo/detect/macro_detectors.py†L456-L516】
+- **Persistencia**: se inserta `wmid` en `metrics_series` con `window_s` configurado; detectores macro consultan la serie si el snapshot no trae valor reciente.【F:oraculo/alerts/cpu_worker.py†L477-L500】【F:oraculo/detect/macro_detectors.py†L223-L287】
+- **Estado**: Implementada (DOC) con fallback legacy.
 
 ### Depletion / Replenishment
 - **Código**: proxy en ventana fija de 3s por lado: `dep = deletions/(insertions+deletions)` y `refill = min(insertions/deletions, 1)`. No usa Δvolumen top-n.【F:oraculo/detect/metrics_engine.py†L171-L184】
@@ -50,13 +55,13 @@ Fuente: Sección 6 “Métricas Microestructurales” del DOC `📘 Proyecto —
 - **Estado**: H2 confirmada (signo y denominador difieren del DOC `(Index−Mark)/Mark`).
 
 ### Velocity / Accel Basis
-- **Código**: sólo deriva velocidad `basis_vel_bps_s` como diferencia de basis entre marcas consecutivas / Δt; no se calcula aceleración ni segunda derivada.【F:oraculo/detect/metrics_engine.py†L139-L148】【F:oraculo/detect/metrics_engine.py†L196-L209】
-- **Persistencia**: sólo `basis_vel_bps_s` se guarda; no existe métrica de aceleración.【F:oraculo/alerts/cpu_worker.py†L485-L493】
-- **Estado**: H5 confirmada (velocidad presente, aceleración ausente).
+- **Código**: deriva `basis_vel_bps_s` y `basis_accel_bps_s2_doc` sobre la ventana DOC configurable, manteniendo cálculo legacy en paralelo.【F:oraculo/detect/metrics_engine.py†L139-L209】
+- **Persistencia**: se guardan `basis_vel_bps_s_doc` y `basis_accel_bps_s2_doc` en `metrics_series` con `window_s=basis_doc_window_s`.【F:oraculo/alerts/cpu_worker.py†L477-L500】
+- **Estado**: Implementada (velocidad y aceleración DOC disponibles con fallback legacy). 
 
 ### OI Δ%
-- **Código/BD**: se ingesta `open_interest` en tabla homónima, pero no se deriva ni publica `oi_delta_pct` en `metrics_series` ni en el `Snapshot`.【F:SQL/SQL_ORACULO_BACKUP.sql†L1020-L1044】【F:oraculo/alerts/cpu_worker.py†L477-L493】
-- **Estado**: H6 confirmada (serie derivada no implementada).
+- **Código/BD**: derivación y persistencia de `oi_delta_pct_doc` vía ingest REST con ventanas configurables; detectores consumen la serie con fallback a `open_interest` si falta.【F:oraculo/ingest/binance_rest.py†L125-L191】【F:oraculo/detect/macro_detectors.py†L147-L241】
+- **Estado**: Implementada (DOC) con fallback a legacy.
 
 ## Validación de hipótesis H1–H6
 
@@ -65,9 +70,9 @@ Fuente: Sección 6 “Métricas Microestructurales” del DOC `📘 Proyecto —
 | H1 Dominance Ask/Bid | Confirmada | Dominance usa conteo de niveles no nulos (no volumen).【F:oraculo/detect/metrics_engine.py†L151-L160】【F:oraculo/detect/detectors.py†L347-L384】 |
 | H2 Basis | Confirmada | Código aplica `(mark/index−1)*10000` (signo/denominador invertidos vs DOC).【F:oraculo/detect/metrics_engine.py†L139-L148】【F:oraculo/ingest/binance_ws.py†L346-L356】 |
 | H3 Depletion/Replenishment | Confirmada | Proxy ins/del 3s en vez de Δvolumen top-n.【F:oraculo/detect/metrics_engine.py†L171-L184】 |
-| H4 Wmid | Confirmada | Snapshot no expone ni persiste `wmid`; sólo helper independiente.【F:oraculo/detect/orderbook.py†L119-L125】【F:oraculo/detect/metrics_engine.py†L78-L209】【F:oraculo/alerts/cpu_worker.py†L477-L493】 |
-| H5 Velocity/Accel Basis | Confirmada | Sólo velocidad `basis_vel_bps_s`; no hay aceleración ni persistencia asociada.【F:oraculo/detect/metrics_engine.py†L139-L148】【F:oraculo/alerts/cpu_worker.py†L485-L493】 |
-| H6 OI Δ% | Confirmada | BD tiene `open_interest`, pero no se deriva ni se almacena `oi_delta_pct`.【F:SQL/SQL_ORACULO_BACKUP.sql†L1020-L1044】【F:oraculo/alerts/cpu_worker.py†L477-L493】 |
+| H4 Wmid | Actualizada | `wmid` se calcula y persiste; los detectores usan snapshot o serie con fallback al cálculo directo.【F:oraculo/detect/metrics_engine.py†L78-L209】【F:oraculo/alerts/cpu_worker.py†L477-L500】【F:oraculo/detect/macro_detectors.py†L223-L287】 |
+| H5 Velocity/Accel Basis | Actualizada | Se derivan y persisten `basis_vel_bps_s_doc` y `basis_accel_bps_s2_doc` junto al legacy; el resolver elige fuente según `metric_source`.【F:oraculo/detect/metrics_engine.py†L139-L209】【F:oraculo/alerts/cpu_worker.py†L477-L500】 |
+| H6 OI Δ% | Actualizada | `oi_delta_pct_doc` se deriva en ingest REST y se persiste con fallback a `open_interest` para detectores.【F:oraculo/ingest/binance_rest.py†L125-L191】【F:oraculo/detect/macro_detectors.py†L147-L241】 |
 
 ## Tabla resumen DOC vs Código vs BD
 
@@ -76,12 +81,12 @@ Fuente: Sección 6 “Métricas Microestructurales” del DOC `📘 Proyecto —
 | Imbalance | `imbalance` | (ΣBid−ΣAsk)/(ΣBid+ΣAsk) instantáneo sobre `top_n`.【F:oraculo/detect/metrics_engine.py†L162-L169】 | Sí (`window_s=1`).【F:oraculo/alerts/cpu_worker.py†L477-L493】 | Sin ventana 1–5s. | Cambiar a ventana temporal alteraría Depletion/BW gating que usa snapshots actuales. |
 | Dominance Ask/Bid | `dom_bid` / `dom_ask` | Conteo de niveles no nulos por lado / total niveles.【F:oraculo/detect/metrics_engine.py†L151-L160】 | Sí. | No usa % volumen (significado distinto). | Cambiar semántica afectaría `DominanceDetector` y alertas R9/R10.【F:oraculo/detect/detectors.py†L347-L384】【F:oraculo/alerts/runner.py†L1402-L1415】 |
 | Spread | `spread_usd` | best_ask − best_bid.【F:oraculo/detect/metrics_engine.py†L186-L199】 | Sí. | Alineada (unidad USD vs “tick” en DOC). | Impacto bajo. |
-| Wmid | — | No se calcula; helper externo `(ask+bid)/2`.【F:oraculo/detect/orderbook.py†L119-L125】 | No. | Métrica faltante. | Detectores/reglas que requieran referencia mid-price no pueden habilitarse. |
+| Wmid | `wmid` | Calculado como midpoint (best_bid+best_ask)/2 y expuesto en snapshot; detectores usan snapshot o serie persistida con fallback.【F:oraculo/detect/metrics_engine.py†L78-L209】【F:oraculo/alerts/cpu_worker.py†L477-L500】 | Sí. | Alineada (mid DOC disponible). | Impacto bajo; mantener fallback legacy mientras se migra el consumo. |
 | Depletion/Replenishment | `dep_bid` / `dep_ask` y `refill_*_3s` | Proxy: deletions/(ins+del) y ins/del (cap 1) en 3s.【F:oraculo/detect/metrics_engine.py†L171-L184】 | Sí. | No es Δvolumen top-n; ventana fija 3s. | Cambiar proxy rompería `DepletionDetector` y `BreakWallDetector`.【F:oraculo/detect/detectors.py†L261-L333】【F:oraculo/detect/detectors.py†L482-L511】 |
 | Basis | `basis_bps` | (Mark/Index − 1) * 10000.【F:oraculo/detect/metrics_engine.py†L139-L148】 | Sí. | Signo/denominador distinto. | Revertir signo afectaría triggers R15/R16 y mean-revert R17/R18.【F:oraculo/alerts/runner.py†L1426-L1449】 |
-| Velocity Basis | `basis_vel_bps_s` | Δbasis/Δt (bps/s).【F:oraculo/detect/metrics_engine.py†L139-L148】 | Sí. | Falta aceleración. | Cálculo de aceleración requerido por DOC no disponible para reglas futuras. |
-| Accel Basis | — | No implementada. | No. | Falta completa. | Debe añadirse cálculo y persistencia para cumplir DOC. |
-| OI Δ% | — | No implementada; sólo OI bruto en BD.【F:SQL/SQL_ORACULO_BACKUP.sql†L1020-L1044】 | No. | Falta completa. | Dashboards/reglas sobre cambios OI no disponibles. |
+| Velocity Basis | `basis_vel_bps_s_doc` | Δbasis_doc/Δt (bps/s) sobre ventana configurable.【F:oraculo/detect/metrics_engine.py†L139-L209】 | Sí. | Alineada (más clamp/ventana DOC). | Mantener `metric_source` para compatibilidad durante transición. |
+| Accel Basis | `basis_accel_bps_s2_doc` | Segunda derivada de basis_doc sobre ventana configurable.【F:oraculo/detect/metrics_engine.py†L139-L209】 | Sí. | Nueva vs DOC legacy (antes faltante). | Permite habilitar reglas/alertas dependientes de curvatura de basis. |
+| OI Δ% | `oi_delta_pct_doc` | (OI_t−OI_{t−Δ})/OI_{t−Δ} derivado en ingest REST y persistido.【F:oraculo/ingest/binance_rest.py†L125-L191】 | Sí. | Alineada (con fallback a `open_interest`). | Requiere mantener ventana/config para coherencia con reglas macro. |
 
 ## Componentes y dependencias relevantes
 - **Persistencia**: `metrics_series` almacena todas las series de microestructura (columna `metric` + `window_s`).【F:SQL/SQL_ORACULO_BACKUP.sql†L124114-L124122】
