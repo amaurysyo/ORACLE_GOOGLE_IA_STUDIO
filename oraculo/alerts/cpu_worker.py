@@ -54,6 +54,8 @@ from oraculo.detect.macro_detectors import (
     SkewShockDetector,
     TermStructureInvertCfg,
     TermStructureInvertDetector,
+    GammaFlipCfg,
+    GammaFlipDetector,
 )
 from oraculo.obs import metrics as obs_metrics
 
@@ -245,6 +247,42 @@ def _build_term_structure_invert_cfg(rules: Dict[str, Any]) -> TermStructureInve
     cfg.clamp_abs_vel_per_s = float(raw.get("clamp_abs_vel_per_s", cfg.clamp_abs_vel_per_s))
     cfg.require_both_present = bool(raw.get("require_both_present", cfg.require_both_present))
     cfg.require_positive_inversion = bool(raw.get("require_positive_inversion", cfg.require_positive_inversion))
+    return cfg
+
+
+def _build_gamma_flip_cfg(rules: Dict[str, Any]) -> GammaFlipCfg:
+    det = (rules or {}).get("detectors", {}) or {}
+    raw = det.get("gamma_flip") or {}
+    cfg = GammaFlipCfg()
+    cfg.enabled = bool(raw.get("enabled", cfg.enabled))
+    cfg.poll_s = float(raw.get("poll_s", cfg.poll_s))
+    cfg.retrigger_s = float(raw.get("retrigger_s", cfg.retrigger_s))
+    cfg.underlying = str(raw.get("underlying", cfg.underlying))
+    cfg.lookback_s = float(raw.get("lookback_s", cfg.lookback_s))
+    cfg.expiry_max_days = float(raw.get("expiry_max_days", cfg.expiry_max_days))
+    cfg.moneyness_abs = float(raw.get("moneyness_abs", cfg.moneyness_abs))
+    cfg.delta_gate_enabled = bool(raw.get("delta_gate_enabled", cfg.delta_gate_enabled))
+    cfg.delta_min = float(raw.get("delta_min", cfg.delta_min))
+    cfg.delta_max = float(raw.get("delta_max", cfg.delta_max))
+    cfg.min_instruments = int(raw.get("min_instruments", cfg.min_instruments))
+    cfg.min_abs_net_gex = float(raw.get("min_abs_net_gex", cfg.min_abs_net_gex))
+    cfg.flip_hysteresis = float(raw.get("flip_hysteresis", cfg.flip_hysteresis))
+    cfg.intensity_warn = float(raw.get("intensity_warn", cfg.intensity_warn))
+    cfg.intensity_strong = float(raw.get("intensity_strong", cfg.intensity_strong))
+    cfg.require_stable_samples = int(raw.get("require_stable_samples", cfg.require_stable_samples))
+    cfg.min_oi = float(raw.get("min_oi", cfg.min_oi))
+
+    def _parse_pair(val, fallback):
+        try:
+            if isinstance(val, (list, tuple)) and len(val) == 2:
+                return float(val[0]), float(val[1])
+        except Exception:
+            return fallback
+        return fallback
+
+    cfg.clamp_spot = _parse_pair(raw.get("clamp_spot"), cfg.clamp_spot)
+    cfg.clamp_gamma = _parse_pair(raw.get("clamp_gamma"), cfg.clamp_gamma)
+    cfg.clamp_oi = _parse_pair(raw.get("clamp_oi"), cfg.clamp_oi)
     return cfg
 
 
@@ -544,6 +582,8 @@ class CPUWorkerProcess(mp.Process):
         skew_detector = SkewShockDetector(skew_cfg, self.instrument_id)
         term_structure_cfg = _build_term_structure_invert_cfg(self.rules)
         term_structure_detector = TermStructureInvertDetector(term_structure_cfg, self.instrument_id)
+        gamma_flip_cfg = _build_gamma_flip_cfg(self.rules)
+        gamma_flip_detector = GammaFlipDetector(gamma_flip_cfg, self.instrument_id)
         db_loop: Optional[asyncio.AbstractEventLoop] = None
         db_pool = None
         db_adapter: Optional[_AsyncpgAdapter] = None
@@ -554,6 +594,7 @@ class CPUWorkerProcess(mp.Process):
         last_basis_poll_ts = 0.0
         last_skew_poll_ts = 0.0
         last_term_structure_poll_ts = 0.0
+        last_gamma_flip_poll_ts = 0.0
 
         def _close_db_resources() -> None:
             nonlocal db_pool, db_loop, db_adapter
@@ -597,6 +638,7 @@ class CPUWorkerProcess(mp.Process):
             or basis_dislocation_cfg.enabled
             or skew_cfg.enabled
             or term_structure_cfg.enabled
+            or gamma_flip_cfg.enabled
         )
         if need_db and self.db_dsn and asyncpg is not None:
             try:
@@ -705,6 +747,21 @@ class CPUWorkerProcess(mp.Process):
                     if ev_macro is not None:
                         self._emit_result("macro", ev_macro, poll_t0, poll_t0)
                     last_term_structure_poll_ts = now_poll
+                if (
+                    gamma_flip_detector
+                    and gamma_flip_detector.cfg.enabled
+                    and db_adapter is not None
+                    and (now_poll - last_gamma_flip_poll_ts) >= float(gamma_flip_detector.cfg.poll_s)
+                ):
+                    poll_t0 = time.perf_counter()
+                    try:
+                        ev_macro = gamma_flip_detector.poll(now_poll, db_adapter, self.instrument_id)
+                    except Exception:
+                        ev_macro = None
+                        logger.exception("[cpu-worker] gamma_flip poll failed")
+                    if ev_macro is not None:
+                        self._emit_result("macro", ev_macro, poll_t0, poll_t0)
+                    last_gamma_flip_poll_ts = now_poll
 
                 try:
                     req: WorkerRequest = self.in_queue.get(timeout=0.1)
@@ -797,6 +854,18 @@ class CPUWorkerProcess(mp.Process):
                         skew_detector.cfg = skew_cfg
                         term_structure_cfg = _build_term_structure_invert_cfg(req.payload or {})
                         term_structure_detector.cfg = term_structure_cfg
+                        prev_underlying = gamma_flip_detector.cfg.underlying
+                        gamma_flip_cfg = _build_gamma_flip_cfg(req.payload or {})
+                        gamma_flip_detector.cfg = gamma_flip_cfg
+                        gamma_flip_detector.pending_sign = None
+                        gamma_flip_detector.pending_count = 0
+                        if gamma_flip_detector.cfg.underlying != prev_underlying:
+                            gamma_flip_detector.prev_sign = 0
+                            gamma_flip_detector.pending_sign = None
+                            gamma_flip_detector.pending_count = 0
+                            gamma_flip_detector.last_fire_ts = None
+                            gamma_flip_detector.last_net_gex = None
+                            gamma_flip_detector.last_ts = None
                         need_db_after = (
                             oi_cfg.enabled
                             or liq_cfg.enabled
@@ -804,6 +873,7 @@ class CPUWorkerProcess(mp.Process):
                             or basis_dislocation_cfg.enabled
                             or skew_cfg.enabled
                             or term_structure_cfg.enabled
+                            or gamma_flip_cfg.enabled
                         )
                         if need_db_after and db_adapter is None and self.db_dsn and asyncpg is not None:
                             try:
