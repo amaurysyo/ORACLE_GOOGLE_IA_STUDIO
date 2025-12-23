@@ -215,6 +215,31 @@ detectors:
 
     require_recent_past: true
 
+  term_structure_invert:
+    enabled: false
+    poll_s: 30
+    retrigger_s: 600
+
+    underlying: "BTC"
+    lookback_s: 600
+    short_tenor_bucket: "0_7d"
+    long_tenor_bucket: "30_90d"
+    moneyness_bucket: "NA"
+
+    spread_warn: 0.05
+    spread_strong: 0.10
+
+    vel_warn_per_s: 0.0002
+    vel_strong_per_s: 0.0004
+    use_velocity_gate: false
+
+    clamp_abs_iv: 5.0
+    clamp_abs_spread: 1.0
+    clamp_abs_vel_per_s: 0.01
+
+    require_both_present: true
+    require_positive_inversion: true
+
   spread_squeeze:
     enabled: true
     max_spread_usd: 0.5     # compresión del spread

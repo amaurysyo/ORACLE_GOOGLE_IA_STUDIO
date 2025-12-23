@@ -827,6 +827,27 @@ async def dispatch_macro_event(
                 f"[{rule['rule']}] Skew shock (25Δ) {side_macro} "
                 f"ΔRR={delta_str}, vel={vel_str}, i={ev.intensity:.2f}"
             )
+        elif ev.kind == "term_structure_invert":
+            iv_s = fields.get("iv_short")
+            iv_l = fields.get("iv_long")
+            spread = fields.get("spread")
+            try:
+                iv_s_str = f"{float(iv_s):.3f}"
+            except Exception:
+                iv_s_str = "na"
+            try:
+                iv_l_str = f"{float(iv_l):.3f}"
+            except Exception:
+                iv_l_str = "na"
+            try:
+                spread_str = f"{float(spread):.3f}"
+            except Exception:
+                spread_str = "na"
+            text = (
+                f"[{rule['rule']}] Term structure invertida: "
+                f"IV(short)={iv_s_str} IV(long)={iv_l_str} spread={spread_str} "
+                f"i={ev.intensity:.2f}"
+            )
         await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
 
 # ---- Telemetría (agregada y volcada a tabla oraculo.rule_telemetry) ----

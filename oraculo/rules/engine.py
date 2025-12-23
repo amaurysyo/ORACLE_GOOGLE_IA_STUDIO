@@ -22,7 +22,7 @@ UPCOMING_DOC_RULES = [
     {"rule": "R34", "name": "Basis dislocation DOC", "event_type": "basis_dislocation", "side": "na", "status": "implemented"},
     {"rule": "R35", "name": "Skew shock 25Δ", "event_type": "skew_shock", "side": "na", "status": "implemented"},
     {"rule": "R36", "name": "Gamma flip (GEX)", "event_type": "gamma_flip", "side": "na", "status": "stub"},
-    {"rule": "R37", "name": "Term structure invertida", "event_type": "term_structure_inverted", "side": "na", "status": "stub"},
+    {"rule": "R37", "name": "Term structure invertida", "event_type": "term_structure_invert", "side": "na", "status": "implemented"},
 ]
 
 @dataclass
@@ -257,6 +257,11 @@ def eval_rules(ev: Dict[str, Any], ctx: RuleContext) -> List[Dict[str, Any]]:
         # ---------- R35: Skew shock 25Δ ----------
         if et == "skew_shock":
             _append("R35", "na", ev, severity_=_sev_from_val(val, 0.60, 0.80))
+            return out
+
+        # ---------- R37: Term structure invertida ----------
+        if et == "term_structure_invert":
+            _append("R37", "na", ev, severity_=_sev_from_val(val, 0.60, 0.80))
             return out
 
         return out
