@@ -215,6 +215,34 @@ detectors:
 
     require_recent_past: true
 
+  gamma_flip:
+    enabled: false
+    poll_s: 30
+    retrigger_s: 900
+
+    underlying: "BTC"
+
+    lookback_s: 600
+    expiry_max_days: 45
+    moneyness_abs: 0.10
+    delta_gate_enabled: true
+    delta_min: 0.35
+    delta_max: 0.65
+
+    min_instruments: 30
+    min_abs_net_gex: 1.0e6
+    flip_hysteresis: 0.10
+
+    clamp_spot: [1000, 1000000]
+    clamp_gamma: [0, 1e3]
+    clamp_oi: [0, 1e9]
+
+    intensity_warn: 1.0e6
+    intensity_strong: 5.0e6
+
+    require_stable_samples: 2
+    min_oi: 0.0
+
   term_structure_invert:
     enabled: false
     poll_s: 30

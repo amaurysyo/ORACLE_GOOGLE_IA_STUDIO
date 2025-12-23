@@ -112,6 +112,30 @@ class TermStructureInvertCfg:
     require_positive_inversion: bool = True
 
 
+@dataclass
+class GammaFlipCfg:
+    enabled: bool = False
+    poll_s: float = 30.0
+    retrigger_s: float = 900.0
+    underlying: str = "BTC"
+    lookback_s: float = 600.0
+    expiry_max_days: float = 45.0
+    moneyness_abs: float = 0.10
+    delta_gate_enabled: bool = True
+    delta_min: float = 0.35
+    delta_max: float = 0.65
+    min_instruments: int = 30
+    min_abs_net_gex: float = 1_000_000.0
+    flip_hysteresis: float = 0.10
+    clamp_spot: Tuple[float, float] = (1000.0, 1_000_000.0)
+    clamp_gamma: Tuple[float, float] = (0.0, 1_000.0)
+    clamp_oi: Tuple[float, float] = (0.0, 1_000_000_000.0)
+    intensity_warn: float = 1_000_000.0
+    intensity_strong: float = 5_000_000.0
+    require_stable_samples: int = 2
+    min_oi: float = 0.0
+
+
 def _clamp01(x: float) -> float:
     try:
         return max(0.0, min(1.0, float(x)))
@@ -1362,3 +1386,248 @@ class TermStructureInvertDetector:
             intensity=intensity,
             fields=fields,
         )
+
+
+class GammaFlipDetector:
+    def __init__(self, cfg: GammaFlipCfg, instrument_id: str):
+        self.cfg = cfg
+        self.instrument_id = instrument_id
+        self.last_fire_ts: Optional[float] = None
+        self.prev_sign: int = 0
+        self.pending_sign: Optional[int] = None
+        self.pending_count: int = 0
+        self.last_net_gex: Optional[float] = None
+        self.last_ts: Optional[float] = None
+
+    @staticmethod
+    def _await_if_needed(maybe_coro: Any) -> Any:
+        if inspect.isawaitable(maybe_coro):
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(maybe_coro)
+            finally:
+                loop.close()
+        return maybe_coro
+
+    def _fetch_one(self, db: Any, sql: str, *args: Any) -> Optional[Dict[str, Any]]:
+        if db is None:
+            return None
+        row = None
+        if hasattr(db, "fetchrow"):
+            try:
+                row = self._await_if_needed(db.fetchrow(sql, *args))
+            except Exception:
+                row = None
+        if row is None and hasattr(db, "fetch"):
+            try:
+                rows = self._await_if_needed(db.fetch(sql, *args))
+                row = rows[0] if rows else None
+            except Exception:
+                row = None
+        if row is None:
+            return None
+        try:
+            return dict(row)
+        except Exception:
+            return row  # type: ignore[return-value]
+
+    def _fetch_many(self, db: Any, sql: str, *args: Any) -> list[Dict[str, Any]]:
+        if db is None:
+            return []
+        rows = []
+        if hasattr(db, "fetch"):
+            try:
+                rows = self._await_if_needed(db.fetch(sql, *args)) or []
+            except Exception:
+                rows = []
+        elif hasattr(db, "fetchrow"):
+            try:
+                row = self._await_if_needed(db.fetchrow(sql, *args))
+                rows = [row] if row is not None else []
+            except Exception:
+                rows = []
+        out: list[Dict[str, Any]] = []
+        for r in rows:
+            try:
+                out.append(dict(r))
+            except Exception:
+                out.append(r)  # type: ignore[arg-type]
+        return out
+
+    @staticmethod
+    def _clamp(x: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, x))
+
+    @staticmethod
+    def _safe_float(val: Any) -> Optional[float]:
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    def _spot_row(self, db: Any, ts_now: float) -> Optional[Dict[str, Any]]:
+        sql = """
+            SELECT underlying_price, event_time
+            FROM deribit.options_ticker
+            WHERE event_time >= (to_timestamp($1) - ($2 || ' seconds')::interval)
+            ORDER BY event_time DESC
+            LIMIT 1;
+        """
+        return self._fetch_one(db, sql, ts_now, float(self.cfg.lookback_s))
+
+    def _gex_rows(self, db: Any, ts_now: float, spot_ref: float) -> list[Dict[str, Any]]:
+        sql = """
+            SELECT
+              t.instrument_id, t.event_time, t.gamma, t.open_interest, t.delta, t.underlying_price,
+              i.option_type, i.strike, i.expiration
+            FROM deribit.options_ticker t
+            JOIN deribit.options_instruments i ON i.instrument_id=t.instrument_id
+            WHERE i.underlying=$1
+              AND t.event_time >= (to_timestamp($2) - ($3 || ' seconds')::interval)
+              AND i.expiration >= to_timestamp($2)
+              AND i.expiration <= (to_timestamp($2) + ($4 || ' days')::interval)
+              AND i.strike BETWEEN ($5*(1-$6)) AND ($5*(1+$6))
+              AND t.open_interest IS NOT NULL AND t.gamma IS NOT NULL
+        """
+        args: list[Any] = [
+            self.cfg.underlying,
+            ts_now,
+            float(self.cfg.lookback_s),
+            float(self.cfg.expiry_max_days),
+            spot_ref,
+            float(self.cfg.moneyness_abs),
+        ]
+        if self.cfg.min_oi > 0:
+            sql += "              AND t.open_interest >= $7\n"
+            args.append(float(self.cfg.min_oi))
+        if self.cfg.delta_gate_enabled:
+            delta_start_idx = len(args) + 1
+            sql += f"              AND abs(t.delta) BETWEEN ${delta_start_idx} AND ${delta_start_idx + 1}\n"
+            args.extend([float(self.cfg.delta_min), float(self.cfg.delta_max)])
+        return self._fetch_many(db, sql, *args)
+
+    def poll(self, ts_now: float, db: Any, instrument_id: str) -> Optional[Event]:
+        if not self.cfg.enabled:
+            return None
+        _ = instrument_id
+
+        spot_row = self._spot_row(db, ts_now)
+        if not spot_row:
+            return None
+        spot_raw = self._safe_float(spot_row.get("underlying_price"))
+        if spot_raw is None:
+            return None
+        spot_ref = self._clamp(spot_raw, float(self.cfg.clamp_spot[0]), float(self.cfg.clamp_spot[1]))
+
+        rows = self._gex_rows(db, ts_now, spot_ref)
+        if not rows:
+            return None
+
+        call_gex = 0.0
+        put_gex = 0.0
+        net_gex = 0.0
+        n_used = 0
+
+        for row in rows:
+            gamma_raw = self._safe_float(row.get("gamma"))
+            oi_raw = self._safe_float(row.get("open_interest"))
+            option_type = (row.get("option_type") or "").lower()
+            if gamma_raw is None or oi_raw is None:
+                continue
+            if option_type not in ("call", "put"):
+                continue
+            gamma_val = self._clamp(gamma_raw, float(self.cfg.clamp_gamma[0]), float(self.cfg.clamp_gamma[1]))
+            oi_val = self._clamp(oi_raw, float(self.cfg.clamp_oi[0]), float(self.cfg.clamp_oi[1]))
+            gex_mag = gamma_val * oi_val * spot_ref * spot_ref
+            if option_type == "call":
+                call_gex += gex_mag
+                net_gex += gex_mag
+            else:
+                put_gex += gex_mag
+                net_gex -= gex_mag
+            n_used += 1
+
+        if n_used < int(self.cfg.min_instruments):
+            return None
+        if abs(net_gex) < float(self.cfg.min_abs_net_gex):
+            return None
+
+        sign = 1 if net_gex > 0 else -1 if net_gex < 0 else 0
+
+        if self.prev_sign == 0:
+            self.prev_sign = sign
+            self.last_net_gex = net_gex
+            self.last_ts = ts_now
+            self.pending_sign = None
+            self.pending_count = 0
+            return None
+
+        if sign == self.prev_sign:
+            self.pending_sign = None
+            self.pending_count = 0
+            self.last_net_gex = net_gex
+            self.last_ts = ts_now
+            return None
+
+        if abs(net_gex) < float(self.cfg.min_abs_net_gex) * (1.0 + float(self.cfg.flip_hysteresis)):
+            self.pending_sign = None
+            self.pending_count = 0
+            self.last_net_gex = net_gex
+            self.last_ts = ts_now
+            return None
+
+        if self.pending_sign != sign:
+            self.pending_sign = sign
+            self.pending_count = 1
+        else:
+            self.pending_count += 1
+
+        self.last_net_gex = net_gex
+        self.last_ts = ts_now
+
+        if self.pending_count < int(self.cfg.require_stable_samples):
+            return None
+
+        if self.last_fire_ts is not None and (ts_now - self.last_fire_ts) < float(self.cfg.retrigger_s):
+            return None
+
+        intensity = _clamp01(
+            (abs(net_gex) - float(self.cfg.intensity_warn))
+            / max(float(self.cfg.intensity_strong - self.cfg.intensity_warn), 1e-9)
+        )
+
+        ev = Event(
+            kind="gamma_flip",
+            side="na",
+            ts=ts_now,
+            price=0.0,
+            intensity=float(intensity),
+            fields={
+                "underlying": self.cfg.underlying,
+                "net_gex": net_gex,
+                "call_gex": call_gex,
+                "put_gex": put_gex,
+                "spot": spot_ref,
+                "n_used": n_used,
+                "lookback_s": self.cfg.lookback_s,
+                "expiry_max_days": self.cfg.expiry_max_days,
+                "moneyness_abs": self.cfg.moneyness_abs,
+                "delta_gate_enabled": self.cfg.delta_gate_enabled,
+                "delta_min": self.cfg.delta_min,
+                "delta_max": self.cfg.delta_max,
+                "prev_sign": self.prev_sign,
+                "new_sign": sign,
+                "min_abs_net_gex": self.cfg.min_abs_net_gex,
+                "require_stable_samples": self.cfg.require_stable_samples,
+                "intensity_warn": self.cfg.intensity_warn,
+                "intensity_strong": self.cfg.intensity_strong,
+                "i_abs_gex": float(intensity),
+            },
+        )
+
+        self.prev_sign = sign
+        self.pending_sign = None
+        self.pending_count = 0
+        self.last_fire_ts = ts_now
+
+        return ev

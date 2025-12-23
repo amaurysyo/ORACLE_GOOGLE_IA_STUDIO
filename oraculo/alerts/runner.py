@@ -827,6 +827,29 @@ async def dispatch_macro_event(
                 f"[{rule['rule']}] Skew shock (25Δ) {side_macro} "
                 f"ΔRR={delta_str}, vel={vel_str}, i={ev.intensity:.2f}"
             )
+        elif ev.kind == "gamma_flip":
+            net = fields.get("net_gex")
+            call_gex = fields.get("call_gex")
+            put_gex = fields.get("put_gex")
+            prev_sign = fields.get("prev_sign")
+            new_sign = fields.get("new_sign")
+            try:
+                net_str = f"{float(net):.3e}"
+            except Exception:
+                net_str = "na"
+            try:
+                call_str = f"{float(call_gex):.3e}"
+            except Exception:
+                call_str = "na"
+            try:
+                put_str = f"{float(put_gex):.3e}"
+            except Exception:
+                put_str = "na"
+            text = (
+                f"[{rule['rule']}] Gamma flip: net_gex={net_str} "
+                f"(call={call_str}, put={put_str}) sign {prev_sign}->{new_sign} "
+                f"i={ev.intensity:.2f}"
+            )
         elif ev.kind == "term_structure_invert":
             iv_s = fields.get("iv_short")
             iv_l = fields.get("iv_long")
