@@ -20,6 +20,7 @@ import aiohttp
 from loguru import logger
 
 from oraculo.db import DB
+from oraculo.deribit.surface_builder import DeribitSurfaceBuilder, SurfaceBuilderCfg
 from oraculo.alerts.cpu_worker import (
     CPUWorkerClient,
     DepthProcessResult,
@@ -989,6 +990,35 @@ async def run_pipeline(
             symbol = getattr(cfg_obj.app, "symbol", symbol)
         except Exception:
             pass
+    surface_builder_cfg = SurfaceBuilderCfg()
+    if cfg_mgr is not None and getattr(cfg_mgr, "cfg", None) is not None:
+        try:
+            cfg_obj = cfg_mgr.cfg
+            raw = (
+                getattr(cfg_obj, "deribit_surface_builder", None)
+                or getattr(cfg_obj, "model_extra", {}).get("deribit_surface_builder", {})
+            ) or {}
+            surface_builder_cfg.enabled = bool(raw.get("enabled", surface_builder_cfg.enabled))
+            surface_builder_cfg.poll_s = float(raw.get("poll_s", surface_builder_cfg.poll_s))
+            surface_builder_cfg.lookback_s = float(raw.get("lookback_s", surface_builder_cfg.lookback_s))
+            surface_builder_cfg.lag_s = float(raw.get("lag_s", surface_builder_cfg.lag_s))
+            surface_builder_cfg.underlying = str(raw.get("underlying", surface_builder_cfg.underlying))
+            surface_builder_cfg.max_expiries_per_bucket = int(
+                raw.get("max_expiries_per_bucket", surface_builder_cfg.max_expiries_per_bucket)
+            )
+            surface_builder_cfg.delta_target = float(raw.get("delta_target", surface_builder_cfg.delta_target))
+            surface_builder_cfg.delta_tolerance = float(raw.get("delta_tolerance", surface_builder_cfg.delta_tolerance))
+            surface_builder_cfg.min_oi = float(raw.get("min_oi", surface_builder_cfg.min_oi))
+            surface_builder_cfg.min_quotes = int(raw.get("min_quotes", surface_builder_cfg.min_quotes))
+            surface_builder_cfg.use_oi_weight = bool(raw.get("use_oi_weight", surface_builder_cfg.use_oi_weight))
+            if "clamp_iv" in raw and isinstance(raw["clamp_iv"], (list, tuple)) and len(raw["clamp_iv"]) == 2:
+                surface_builder_cfg.clamp_iv = (float(raw["clamp_iv"][0]), float(raw["clamp_iv"][1]))
+            if "clamp_rr" in raw and isinstance(raw["clamp_rr"], (list, tuple)) and len(raw["clamp_rr"]) == 2:
+                surface_builder_cfg.clamp_rr = (float(raw["clamp_rr"][0]), float(raw["clamp_rr"][1]))
+            if "clamp_bf" in raw and isinstance(raw["clamp_bf"], (list, tuple)) and len(raw["clamp_bf"]) == 2:
+                surface_builder_cfg.clamp_bf = (float(raw["clamp_bf"][0]), float(raw["clamp_bf"][1]))
+        except Exception:
+            logger.warning("[alerts] failed to load deribit_surface_builder config", exc_info=True)
 
     cpu_sampler_task = asyncio.create_task(
         obs_metrics.cpu_sampler_loop(
@@ -1014,6 +1044,25 @@ async def run_pipeline(
             name="alerts-executor-metrics",
         )
     )
+    if surface_builder_cfg.enabled:
+        surface_builder = DeribitSurfaceBuilder(surface_builder_cfg)
+
+        async def _surface_builder_loop() -> None:
+            while True:
+                try:
+                    await surface_builder.run_once(db, ts_now=time.time())
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    logger.exception("[alerts] surface_builder loop failed")
+                await asyncio.sleep(surface_builder_cfg.poll_s)
+
+        background_tasks.append(
+            _attach_task_monitor(
+                asyncio.create_task(_surface_builder_loop(), name="alerts-deribit-surface-builder"),
+                label="deribit_surface_builder",
+            )
+        )
 
     def _default_executor_queue_depth() -> int:
         executor = getattr(loop, "_default_executor", None)

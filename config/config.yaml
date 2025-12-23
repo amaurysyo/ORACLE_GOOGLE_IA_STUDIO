@@ -110,3 +110,19 @@ hot_reload:
   enabled: true
   watch: ["config/config.yaml", ".env"]
   debounce_ms: 300
+
+deribit_surface_builder:
+  enabled: false
+  poll_s: 30
+  lookback_s: 600
+  lag_s: 60
+  underlying: "BTC"
+  max_expiries_per_bucket: 3
+  delta_target: 0.25
+  delta_tolerance: 0.05
+  min_oi: 0
+  min_quotes: 2
+  use_oi_weight: true
+  clamp_iv: [0.0, 5.0]
+  clamp_rr: [-2.0, 2.0]
+  clamp_bf: [-2.0, 2.0]
