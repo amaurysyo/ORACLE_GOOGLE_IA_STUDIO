@@ -44,6 +44,8 @@ from oraculo.detect.detectors import (
 from oraculo.detect.macro_detectors import (
     LiqClusterCfg,
     LiqClusterDetector,
+    IVSpikeCfg,
+    IVSpikeDetector,
     OISpikeCfg,
     OISpikeDetector,
     BasisDislocationCfg,
@@ -164,6 +166,45 @@ def _build_liq_cfg(rules: Dict[str, Any]) -> LiqClusterCfg:
     cfg.max_rebound_usd = float(raw.get("max_rebound_usd", cfg.max_rebound_usd))
     cfg.use_usd = bool(raw.get("use_usd", cfg.use_usd))
     cfg.clamp_usd = float(raw.get("clamp_usd", cfg.clamp_usd))
+    return cfg
+
+
+def _build_iv_spike_cfg(rules: Dict[str, Any]) -> IVSpikeCfg:
+    def _tuple(val: Any, default: Tuple[float, float]) -> Tuple[float, float]:
+        try:
+            if isinstance(val, (list, tuple)) and len(val) == 2:
+                return float(val[0]), float(val[1])
+        except Exception:
+            return default
+        return default
+
+    det = (rules or {}).get("detectors", {}) or {}
+    raw = det.get("iv_spike") or {}
+    cfg = IVSpikeCfg()
+    cfg.enabled = bool(raw.get("enabled", cfg.enabled))
+    cfg.poll_s = float(raw.get("poll_s", cfg.poll_s))
+    cfg.retrigger_s = float(raw.get("retrigger_s", cfg.retrigger_s))
+    cfg.underlying = str(raw.get("underlying", cfg.underlying))
+    cfg.tenor_bucket = str(raw.get("tenor_bucket", cfg.tenor_bucket))
+    cfg.moneyness_bucket = str(raw.get("moneyness_bucket", cfg.moneyness_bucket))
+    cfg.lookback_s = float(raw.get("lookback_s", cfg.lookback_s))
+    cfg.window_s = float(raw.get("window_s", cfg.window_s))
+    cfg.dv_warn = float(raw.get("dv_warn", cfg.dv_warn))
+    cfg.dv_strong = float(raw.get("dv_strong", cfg.dv_strong))
+    cfg.vel_warn_per_s = float(raw.get("vel_warn_per_s", cfg.vel_warn_per_s))
+    cfg.vel_strong_per_s = float(raw.get("vel_strong_per_s", cfg.vel_strong_per_s))
+    cfg.use_velocity_gate = bool(raw.get("use_velocity_gate", cfg.use_velocity_gate))
+    cfg.clamp_iv = _tuple(raw.get("clamp_iv"), cfg.clamp_iv)
+    cfg.clamp_dv = _tuple(raw.get("clamp_dv"), cfg.clamp_dv)
+    cfg.clamp_vel = _tuple(raw.get("clamp_vel"), cfg.clamp_vel)
+    cfg.require_positive_spike = bool(raw.get("require_positive_spike", cfg.require_positive_spike))
+    cfg.fallback_to_ticker = bool(raw.get("fallback_to_ticker", cfg.fallback_to_ticker))
+    cfg.ticker_delta_gate_enabled = bool(raw.get("ticker_delta_gate_enabled", cfg.ticker_delta_gate_enabled))
+    cfg.ticker_delta_min = float(raw.get("ticker_delta_min", cfg.ticker_delta_min))
+    cfg.ticker_delta_max = float(raw.get("ticker_delta_max", cfg.ticker_delta_max))
+    cfg.ticker_expiry_max_days = float(raw.get("ticker_expiry_max_days", cfg.ticker_expiry_max_days))
+    cfg.ticker_moneyness_abs = float(raw.get("ticker_moneyness_abs", cfg.ticker_moneyness_abs))
+    cfg.ticker_min_instruments = int(raw.get("ticker_min_instruments", cfg.ticker_min_instruments))
     return cfg
 
 
@@ -574,6 +615,8 @@ class CPUWorkerProcess(mp.Process):
         oi_detector = OISpikeDetector(oi_cfg, self.instrument_id)
         liq_cfg = _build_liq_cfg(self.rules)
         liq_detector = LiqClusterDetector(liq_cfg, self.instrument_id)
+        iv_spike_cfg = _build_iv_spike_cfg(self.rules)
+        iv_spike_detector = IVSpikeDetector(iv_spike_cfg, self.instrument_id)
         top_traders_cfg = _build_top_traders_cfg(self.rules)
         top_traders_detector = TopTradersDetector(top_traders_cfg, self.instrument_id)
         basis_dislocation_cfg = _build_basis_dislocation_cfg(self.rules)
@@ -590,6 +633,7 @@ class CPUWorkerProcess(mp.Process):
         last_snapshot: Optional[Snapshot] = None
         last_oi_poll_ts = 0.0
         last_liq_poll_ts = 0.0
+        last_iv_spike_poll_ts = 0.0
         last_tt_poll_ts = 0.0
         last_basis_poll_ts = 0.0
         last_skew_poll_ts = 0.0
@@ -634,6 +678,7 @@ class CPUWorkerProcess(mp.Process):
         need_db = (
             oi_cfg.enabled
             or liq_cfg.enabled
+            or iv_spike_cfg.enabled
             or top_traders_cfg.enabled
             or basis_dislocation_cfg.enabled
             or skew_cfg.enabled
@@ -687,6 +732,21 @@ class CPUWorkerProcess(mp.Process):
                     if ev_macro is not None:
                         self._emit_result("macro", ev_macro, poll_t0, poll_t0)
                     last_liq_poll_ts = now_poll
+                if (
+                    iv_spike_detector
+                    and iv_spike_detector.cfg.enabled
+                    and db_adapter is not None
+                    and (now_poll - last_iv_spike_poll_ts) >= float(iv_spike_detector.cfg.poll_s)
+                ):
+                    poll_t0 = time.perf_counter()
+                    try:
+                        ev_macro = iv_spike_detector.poll(now_poll, db_adapter, self.instrument_id)
+                    except Exception:
+                        ev_macro = None
+                        logger.exception("[cpu-worker] iv_spike poll failed")
+                    if ev_macro is not None:
+                        self._emit_result("macro", ev_macro, poll_t0, poll_t0)
+                    last_iv_spike_poll_ts = now_poll
                 if (
                     top_traders_detector
                     and top_traders_detector.cfg.enabled
@@ -846,6 +906,8 @@ class CPUWorkerProcess(mp.Process):
                             liq_detector.wmid_window._trim(time.time())
                         except Exception:
                             pass
+                        iv_spike_cfg = _build_iv_spike_cfg(req.payload or {})
+                        iv_spike_detector.cfg = iv_spike_cfg
                         top_traders_cfg = _build_top_traders_cfg(req.payload or {})
                         top_traders_detector.cfg = top_traders_cfg
                         basis_dislocation_cfg = _build_basis_dislocation_cfg(req.payload or {})
@@ -869,6 +931,7 @@ class CPUWorkerProcess(mp.Process):
                         need_db_after = (
                             oi_cfg.enabled
                             or liq_cfg.enabled
+                            or iv_spike_cfg.enabled
                             or top_traders_cfg.enabled
                             or basis_dislocation_cfg.enabled
                             or skew_cfg.enabled

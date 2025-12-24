@@ -192,6 +192,8 @@ def eval_rules(ev: Dict[str, Any], ctx: RuleContext) -> List[Dict[str, Any]]:
             return out
 
         # ---------- R19–R22: Opciones (stubs; los emitirá ingesta de opciones) ----------
+        if et == "iv_spike":
+            _append("R19", side or "na", ev, severity_=_sev_from_val(val, 0.60, 0.80));  return out
         if et == "iv_spike_up":
             _append("R19", "na", ev, "HIGH");  return out
         if et == "iv_spike_down":

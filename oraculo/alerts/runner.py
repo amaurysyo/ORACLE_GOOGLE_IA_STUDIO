@@ -787,6 +787,34 @@ async def dispatch_macro_event(
                 f"{price_span} "
                 f"i={ev.intensity:.2f}"
             )
+        elif ev.kind == "iv_spike":
+            iv_prev = fields.get("iv_prev")
+            iv_now = fields.get("iv_now")
+            dv = fields.get("dv")
+            vel = fields.get("vel_per_s")
+            source = fields.get("source", "na")
+            side_macro = ev.side or rule.get("side", "na")
+            try:
+                iv_prev_str = f"{float(iv_prev):.3f}"
+            except Exception:
+                iv_prev_str = "na"
+            try:
+                iv_now_str = f"{float(iv_now):.3f}"
+            except Exception:
+                iv_now_str = "na"
+            try:
+                dv_str = f"{float(dv):.3f}"
+            except Exception:
+                dv_str = "na"
+            try:
+                vel_str = f"{float(vel):.5f}/s"
+            except Exception:
+                vel_str = "na/s"
+            text = (
+                f"[{rule['rule']}] IV spike {side_macro}: "
+                f"IV {iv_prev_str}->{iv_now_str} dv={dv_str} vel={vel_str} "
+                f"i={ev.intensity:.2f} src={source}"
+            )
         elif ev.kind == "top_traders":
             acc_lr = fields.get("acc_long_ratio")
             acc_sr = fields.get("acc_short_ratio")

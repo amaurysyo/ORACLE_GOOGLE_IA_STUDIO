@@ -136,6 +136,34 @@ class GammaFlipCfg:
     min_oi: float = 0.0
 
 
+@dataclass
+class IVSpikeCfg:
+    enabled: bool = False
+    poll_s: float = 30.0
+    retrigger_s: float = 600.0
+    underlying: str = "BTC"
+    tenor_bucket: str = "0_7d"
+    moneyness_bucket: str = "NA"
+    lookback_s: float = 900.0
+    window_s: float = 300.0
+    dv_warn: float = 0.03
+    dv_strong: float = 0.07
+    vel_warn_per_s: float = 0.00010
+    vel_strong_per_s: float = 0.00025
+    use_velocity_gate: bool = False
+    clamp_iv: Tuple[float, float] = (0.0, 5.0)
+    clamp_dv: Tuple[float, float] = (-1.0, 1.0)
+    clamp_vel: Tuple[float, float] = (-0.01, 0.01)
+    require_positive_spike: bool = True
+    fallback_to_ticker: bool = True
+    ticker_delta_gate_enabled: bool = True
+    ticker_delta_min: float = 0.35
+    ticker_delta_max: float = 0.65
+    ticker_expiry_max_days: float = 45.0
+    ticker_moneyness_abs: float = 0.10
+    ticker_min_instruments: int = 20
+
+
 def _clamp01(x: float) -> float:
     try:
         return max(0.0, min(1.0, float(x)))
@@ -1202,6 +1230,304 @@ class SkewShockDetector:
                 "i_delta": i_delta,
                 "i_vel": i_vel,
             },
+        )
+
+
+class IVSpikeDetector:
+    def __init__(self, cfg: IVSpikeCfg, instrument_id: str):
+        self.cfg = cfg
+        self.instrument_id = instrument_id
+        self.last_fire_ts: Optional[float] = None
+
+    @staticmethod
+    def _await_if_needed(maybe_coro: Any) -> Any:
+        if inspect.isawaitable(maybe_coro):
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(maybe_coro)
+            finally:
+                loop.close()
+        return maybe_coro
+
+    def _fetch_one(self, db: Any, sql: str, *args: Any) -> Optional[Dict[str, Any]]:
+        if db is None:
+            return None
+        row = None
+        if hasattr(db, "fetchrow"):
+            try:
+                row = self._await_if_needed(db.fetchrow(sql, *args))
+            except Exception:
+                row = None
+        if row is None and hasattr(db, "fetch"):
+            try:
+                rows = self._await_if_needed(db.fetch(sql, *args))
+                row = rows[0] if rows else None
+            except Exception:
+                row = None
+        if row is None:
+            return None
+        try:
+            return dict(row)
+        except Exception:
+            return row  # type: ignore[return-value]
+
+    def _fetch_many(self, db: Any, sql: str, *args: Any) -> list[Dict[str, Any]]:
+        if db is None:
+            return []
+        rows = []
+        if hasattr(db, "fetch"):
+            try:
+                rows = self._await_if_needed(db.fetch(sql, *args)) or []
+            except Exception:
+                rows = []
+        elif hasattr(db, "fetchrow"):
+            try:
+                row = self._await_if_needed(db.fetchrow(sql, *args))
+                rows = [row] if row is not None else []
+            except Exception:
+                rows = []
+        out: list[Dict[str, Any]] = []
+        for r in rows:
+            try:
+                out.append(dict(r))
+            except Exception:
+                out.append(r)  # type: ignore[arg-type]
+        return out
+
+    @staticmethod
+    def _clamp(x: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, x))
+
+    @staticmethod
+    def _safe_float(val: Any) -> Optional[float]:
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    def _surface_row_now(self, db: Any, ts_now: float) -> Optional[Dict[str, Any]]:
+        sql = """
+            SELECT event_time, iv, rr_25d, bf_25d, n_used, meta_json
+            FROM deribit.options_iv_surface
+            WHERE underlying=$1 AND tenor_bucket=$2 AND moneyness_bucket=$3
+              AND event_time >= (to_timestamp($4) - ($5 || ' seconds')::interval)
+            ORDER BY event_time DESC
+            LIMIT 1;
+        """
+        return self._fetch_one(
+            db,
+            sql,
+            self.cfg.underlying,
+            self.cfg.tenor_bucket,
+            self.cfg.moneyness_bucket,
+            ts_now,
+            self.cfg.lookback_s,
+        )
+
+    def _surface_row_prev(self, db: Any, ts_now: float) -> Optional[Dict[str, Any]]:
+        sql = """
+            SELECT event_time, iv, rr_25d, bf_25d, n_used, meta_json
+            FROM deribit.options_iv_surface
+            WHERE underlying=$1 AND tenor_bucket=$2 AND moneyness_bucket=$3
+              AND event_time <= (to_timestamp($4) - ($5 || ' seconds')::interval)
+              AND event_time >= (to_timestamp($4) - ($6 || ' seconds')::interval)
+            ORDER BY event_time DESC
+            LIMIT 1;
+        """
+        return self._fetch_one(
+            db,
+            sql,
+            self.cfg.underlying,
+            self.cfg.tenor_bucket,
+            self.cfg.moneyness_bucket,
+            ts_now,
+            self.cfg.window_s,
+            self.cfg.lookback_s,
+        )
+
+    def _ticker_rows(self, db: Any, ts_now: float, ts_cut: float) -> list[Dict[str, Any]]:
+        params: list[Any] = []
+
+        def _add(val: Any) -> int:
+            params.append(val)
+            return len(params)
+
+        underlying_idx = _add(self.cfg.underlying)
+        ts_now_idx = _add(ts_now)
+        lookback_idx = _add(float(self.cfg.lookback_s))
+        ts_cut_idx = _add(ts_cut)
+        expiry_days_idx = _add(float(self.cfg.ticker_expiry_max_days))
+        moneyness_idx = _add(float(self.cfg.ticker_moneyness_abs))
+
+        sql = f"""
+            WITH latest AS (
+                SELECT DISTINCT ON (t.instrument_id)
+                    t.instrument_id, t.event_time, t.mark_iv, t.delta, t.underlying_price
+                FROM deribit.options_ticker t
+                JOIN deribit.options_instruments i ON i.instrument_id = t.instrument_id
+                WHERE i.underlying = ${underlying_idx}
+                  AND t.event_time >= (to_timestamp(${ts_now_idx}) - (${lookback_idx} || ' seconds')::interval)
+                  AND t.event_time <= to_timestamp(${ts_cut_idx})
+                  AND t.mark_iv IS NOT NULL
+                  AND t.underlying_price IS NOT NULL
+                  AND i.expiration >= to_timestamp(${ts_now_idx})
+                  AND i.expiration <= (to_timestamp(${ts_now_idx}) + (${expiry_days_idx} || ' days')::interval)
+                  AND i.strike BETWEEN (t.underlying_price*(1-${moneyness_idx})) AND (t.underlying_price*(1+${moneyness_idx}))
+        """
+
+        if self.cfg.ticker_delta_gate_enabled:
+            delta_min_idx = _add(float(self.cfg.ticker_delta_min))
+            delta_max_idx = _add(float(self.cfg.ticker_delta_max))
+            sql += f"                  AND abs(t.delta) BETWEEN ${delta_min_idx} AND ${delta_max_idx}\n"
+
+        sql += """
+                ORDER BY t.instrument_id, t.event_time DESC
+            )
+            SELECT * FROM latest;
+        """
+        return self._fetch_many(db, sql, *params)
+
+    def _aggregate_ticker(self, db: Any, ts_now: float, ts_cut: float) -> Optional[Tuple[float, float, int]]:
+        rows = self._ticker_rows(db, ts_now, ts_cut)
+        if not rows:
+            return None
+
+        ivs: list[float] = []
+        ts_list: list[float] = []
+        for row in rows:
+            iv_raw = self._safe_float(row.get("mark_iv"))
+            ts_raw = _ts_to_epoch(row.get("event_time"))
+            if iv_raw is None or ts_raw is None:
+                continue
+            ivs.append(self._clamp(iv_raw, float(self.cfg.clamp_iv[0]), float(self.cfg.clamp_iv[1])))
+            ts_list.append(ts_raw)
+
+        if len(ivs) < int(self.cfg.ticker_min_instruments):
+            return None
+        if not ts_list:
+            return None
+
+        iv_avg = sum(ivs) / len(ivs)
+        ts_max = max(ts_list)
+        return iv_avg, ts_max, len(ivs)
+
+    def poll(self, ts_now: float, db: Any, instrument_id: str) -> Optional[Event]:
+        if not self.cfg.enabled:
+            return None
+        _ = instrument_id
+
+        if self.last_fire_ts is not None and (ts_now - self.last_fire_ts) < float(self.cfg.retrigger_s):
+            return None
+
+        row_now = self._surface_row_now(db, ts_now)
+        row_prev = self._surface_row_prev(db, ts_now)
+        source = "surface"
+        iv_now: Optional[float] = None
+        iv_prev: Optional[float] = None
+        ts_now_row: Optional[float] = None
+        ts_prev_row: Optional[float] = None
+        n_used_now: Optional[int] = None
+        n_used_prev: Optional[int] = None
+
+        if row_now is not None and row_prev is not None:
+            iv_now_raw = self._safe_float(row_now.get("iv"))
+            iv_prev_raw = self._safe_float(row_prev.get("iv"))
+            if iv_now_raw is not None:
+                iv_now = self._clamp(iv_now_raw, float(self.cfg.clamp_iv[0]), float(self.cfg.clamp_iv[1]))
+            if iv_prev_raw is not None:
+                iv_prev = self._clamp(iv_prev_raw, float(self.cfg.clamp_iv[0]), float(self.cfg.clamp_iv[1]))
+            ts_now_row = _ts_to_epoch(row_now.get("event_time"))
+            ts_prev_row = _ts_to_epoch(row_prev.get("event_time"))
+            n_used_now = row_now.get("n_used")
+            n_used_prev = row_prev.get("n_used")
+        elif self.cfg.fallback_to_ticker:
+            agg_now = self._aggregate_ticker(db, ts_now, ts_now)
+            agg_prev = self._aggregate_ticker(db, ts_now, ts_now - float(self.cfg.window_s))
+            if agg_now is None or agg_prev is None:
+                return None
+            iv_now, ts_now_row, n_used_now = agg_now
+            iv_prev, ts_prev_row, n_used_prev = agg_prev
+            source = "ticker_fallback"
+        else:
+            return None
+
+        if iv_now is None or iv_prev is None:
+            return None
+
+        dv = iv_now - iv_prev
+        dv = self._clamp(dv, float(self.cfg.clamp_dv[0]), float(self.cfg.clamp_dv[1]))
+        if ts_prev_row is None:
+            return None
+
+        dt_s = max(1.0, ts_now - ts_prev_row)
+        vel = dv / dt_s
+        vel = self._clamp(vel, float(self.cfg.clamp_vel[0]), float(self.cfg.clamp_vel[1]))
+
+        if self.cfg.require_positive_spike and dv <= 0:
+            return None
+        if abs(dv) < float(self.cfg.dv_warn):
+            return None
+        if self.cfg.use_velocity_gate and abs(vel) < float(self.cfg.vel_warn_per_s):
+            return None
+
+        i_dv = _clamp01(
+            (abs(dv) - float(self.cfg.dv_warn)) / max(float(self.cfg.dv_strong - self.cfg.dv_warn), 1e-9)
+        )
+        i_vel = 0.0
+        if self.cfg.use_velocity_gate:
+            i_vel = _clamp01(
+                (abs(vel) - float(self.cfg.vel_warn_per_s))
+                / max(float(self.cfg.vel_strong_per_s - self.cfg.vel_warn_per_s), 1e-9)
+            )
+        intensity = _clamp01(max(i_dv, i_vel if self.cfg.use_velocity_gate else 0.0))
+
+        side = "up" if dv > 0 else "down"
+        self.last_fire_ts = ts_now
+
+        fields: Dict[str, Any] = {
+            "underlying": self.cfg.underlying,
+            "tenor_bucket": self.cfg.tenor_bucket,
+            "moneyness_bucket": self.cfg.moneyness_bucket,
+            "iv_now": iv_now,
+            "iv_prev": iv_prev,
+            "dv": dv,
+            "vel_per_s": vel,
+            "dt_s": dt_s,
+            "ts_now_surface": ts_now_row,
+            "ts_prev_surface": ts_prev_row,
+            "dv_warn": self.cfg.dv_warn,
+            "dv_strong": self.cfg.dv_strong,
+            "use_velocity_gate": self.cfg.use_velocity_gate,
+            "vel_warn_per_s": self.cfg.vel_warn_per_s,
+            "vel_strong_per_s": self.cfg.vel_strong_per_s,
+            "i_dv": i_dv,
+            "n_used_now": n_used_now,
+            "n_used_prev": n_used_prev,
+            "source": source,
+            "require_positive_spike": self.cfg.require_positive_spike,
+        }
+
+        if self.cfg.use_velocity_gate:
+            fields["i_vel"] = i_vel
+        if source == "ticker_fallback":
+            fields.update(
+                {
+                    "ticker_delta_gate_enabled": self.cfg.ticker_delta_gate_enabled,
+                    "ticker_delta_min": self.cfg.ticker_delta_min,
+                    "ticker_delta_max": self.cfg.ticker_delta_max,
+                    "ticker_expiry_max_days": self.cfg.ticker_expiry_max_days,
+                    "ticker_moneyness_abs": self.cfg.ticker_moneyness_abs,
+                    "ticker_min_instruments": self.cfg.ticker_min_instruments,
+                }
+            )
+
+        return Event(
+            kind="iv_spike",
+            side=side,
+            ts=ts_now,
+            price=0.0,
+            intensity=intensity,
+            fields=fields,
         )
 
 
