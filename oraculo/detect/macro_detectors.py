@@ -1467,44 +1467,69 @@ class GammaFlipDetector:
 
     def _spot_row(self, db: Any, ts_now: float) -> Optional[Dict[str, Any]]:
         sql = """
-            SELECT underlying_price, event_time
-            FROM deribit.options_ticker
-            WHERE event_time >= (to_timestamp($1) - ($2 || ' seconds')::interval)
-            ORDER BY event_time DESC
+            SELECT t.underlying_price, t.event_time
+            FROM deribit.options_ticker t
+            JOIN deribit.options_instruments i ON i.instrument_id = t.instrument_id
+            WHERE i.underlying = $1
+              AND t.event_time >= (to_timestamp($2) - ($3 || ' seconds')::interval)
+              AND t.underlying_price IS NOT NULL
+            ORDER BY t.event_time DESC
             LIMIT 1;
         """
-        return self._fetch_one(db, sql, ts_now, float(self.cfg.lookback_s))
+        return self._fetch_one(db, sql, self.cfg.underlying, ts_now, float(self.cfg.lookback_s))
 
     def _gex_rows(self, db: Any, ts_now: float, spot_ref: float) -> list[Dict[str, Any]]:
-        sql = """
-            SELECT
-              t.instrument_id, t.event_time, t.gamma, t.open_interest, t.delta, t.underlying_price,
-              i.option_type, i.strike, i.expiration
-            FROM deribit.options_ticker t
-            JOIN deribit.options_instruments i ON i.instrument_id=t.instrument_id
-            WHERE i.underlying=$1
-              AND t.event_time >= (to_timestamp($2) - ($3 || ' seconds')::interval)
-              AND i.expiration >= to_timestamp($2)
-              AND i.expiration <= (to_timestamp($2) + ($4 || ' days')::interval)
-              AND i.strike BETWEEN ($5*(1-$6)) AND ($5*(1+$6))
-              AND t.open_interest IS NOT NULL AND t.gamma IS NOT NULL
+        params: list[Any] = []
+
+        def _add_param(val: Any) -> int:
+            params.append(val)
+            return len(params)
+
+        ts_idx = _add_param(ts_now)
+        lookback_idx = _add_param(float(self.cfg.lookback_s))
+
+        sql = f"""
+            WITH latest AS (
+                SELECT DISTINCT ON (t.instrument_id)
+                    t.instrument_id, t.event_time, t.gamma, t.open_interest, t.delta, t.underlying_price
+                FROM deribit.options_ticker t
+                WHERE t.event_time >= (to_timestamp(${ts_idx}) - (${lookback_idx} || ' seconds')::interval)
+                  AND t.gamma IS NOT NULL
+                  AND t.open_interest IS NOT NULL
         """
-        args: list[Any] = [
-            self.cfg.underlying,
-            ts_now,
-            float(self.cfg.lookback_s),
-            float(self.cfg.expiry_max_days),
-            spot_ref,
-            float(self.cfg.moneyness_abs),
-        ]
+
         if self.cfg.min_oi > 0:
-            sql += "              AND t.open_interest >= $7\n"
-            args.append(float(self.cfg.min_oi))
+            min_oi_idx = _add_param(float(self.cfg.min_oi))
+            sql += f"                  AND t.open_interest >= ${min_oi_idx}\n"
+
+        sql += """
+                ORDER BY t.instrument_id, t.event_time DESC
+            )
+            SELECT
+              l.instrument_id, l.event_time, l.gamma, l.open_interest, l.delta, l.underlying_price,
+              i.option_type, i.strike, i.expiration
+            FROM latest l
+            JOIN deribit.options_instruments i ON i.instrument_id = l.instrument_id
+        """
+
+        underlying_idx = _add_param(self.cfg.underlying)
+        expiry_days_idx = _add_param(float(self.cfg.expiry_max_days))
+        spot_idx = _add_param(spot_ref)
+        moneyness_idx = _add_param(float(self.cfg.moneyness_abs))
+
+        sql += f"""
+            WHERE i.underlying = ${underlying_idx}
+              AND i.expiration >= to_timestamp(${ts_idx})
+              AND i.expiration <= (to_timestamp(${ts_idx}) + (${expiry_days_idx} || ' days')::interval)
+              AND i.strike BETWEEN (${spot_idx}*(1-${moneyness_idx})) AND (${spot_idx}*(1+${moneyness_idx}))
+        """
+
         if self.cfg.delta_gate_enabled:
-            delta_start_idx = len(args) + 1
-            sql += f"              AND abs(t.delta) BETWEEN ${delta_start_idx} AND ${delta_start_idx + 1}\n"
-            args.extend([float(self.cfg.delta_min), float(self.cfg.delta_max)])
-        return self._fetch_many(db, sql, *args)
+            delta_min_idx = _add_param(float(self.cfg.delta_min))
+            delta_max_idx = _add_param(float(self.cfg.delta_max))
+            sql += f"              AND abs(l.delta) BETWEEN ${delta_min_idx} AND ${delta_max_idx}\n"
+
+        return self._fetch_many(db, sql, *params)
 
     def poll(self, ts_now: float, db: Any, instrument_id: str) -> Optional[Event]:
         if not self.cfg.enabled:

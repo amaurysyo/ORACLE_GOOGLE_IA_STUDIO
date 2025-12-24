@@ -76,3 +76,16 @@ FROM data;
 - Mantén `enabled=false` hasta completar calibración y validar que el flip sólo dispara tras cambios de signo persistentes (ver `require_stable_samples`, `flip_hysteresis`, `retrigger_s`).
 - Documenta siempre la versión de filtros usados (lookback, moneyness, delta gate, `min_oi`) junto con los percentiles calculados.
 - El proxy no está en USD/contrato; usa sólo comparativos relativos e inspecciona `call_gex`/`put_gex` por separado si se requiere diagnóstico adicional.
+
+## Performance & Indexing
+- El `DISTINCT ON` del ticker por `instrument_id` se beneficia de un índice descendente en `(instrument_id, event_time)`:
+  ```sql
+  CREATE INDEX IF NOT EXISTS options_ticker_instrument_event_desc
+    ON deribit.options_ticker (instrument_id, event_time DESC);
+  ```
+- Si se consultan ventanas por tiempo con frecuencia, complementa con:
+  ```sql
+  CREATE INDEX IF NOT EXISTS options_ticker_event_desc
+    ON deribit.options_ticker (event_time DESC);
+  ```
+- Ambos índices reducen el volumen leído antes del join con `options_instruments` y aceleran la selección del último tick por instrumento.
