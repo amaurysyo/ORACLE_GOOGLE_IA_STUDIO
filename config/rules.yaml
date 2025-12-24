@@ -243,6 +243,40 @@ detectors:
     require_stable_samples: 2
     min_oi: 0.0
 
+  iv_spike:
+    enabled: false
+    poll_s: 30
+    retrigger_s: 600
+    underlying: "BTC"
+
+    # fuente principal
+    tenor_bucket: "0_7d"
+    moneyness_bucket: "NA"
+
+    lookback_s: 900
+    window_s: 300                # delta IV entre now y now-window_s
+
+    dv_warn: 0.03                # 3 vol points (si iv en decimales)
+    dv_strong: 0.07
+    vel_warn_per_s: 0.00010      # opcional
+    vel_strong_per_s: 0.00025
+    use_velocity_gate: false
+
+    clamp_iv: [0.0, 5.0]
+    clamp_dv: [-1.0, 1.0]
+    clamp_vel: [-0.01, 0.01]
+
+    require_positive_spike: true # true => solo IV sube; false => también shock a la baja
+
+    # fallback
+    fallback_to_ticker: true
+    ticker_delta_gate_enabled: true
+    ticker_delta_min: 0.35
+    ticker_delta_max: 0.65
+    ticker_expiry_max_days: 45
+    ticker_moneyness_abs: 0.10
+    ticker_min_instruments: 20
+
   term_structure_invert:
     enabled: false
     poll_s: 30
