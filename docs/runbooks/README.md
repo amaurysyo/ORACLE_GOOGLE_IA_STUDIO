@@ -1,3 +1,9 @@
+# Runbook global de cierre
+- [docs/runbooks/ORACULO_CLOSURE.md](./ORACULO_CLOSURE.md)
+
+# Runbook global de cierre
+- [docs/runbooks/ORACULO_CLOSURE.md](./ORACULO_CLOSURE.md)
+
 # Índice de runbooks por detector
 
 | detector | archivo runbook | reglas afectadas (Rxx) | estado | fuentes de datos principales |
