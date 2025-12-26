@@ -1,37 +1,82 @@
 # spread_squeeze runbook
 
 ## 1) Propósito y definición operativa (qué detecta exactamente)
-- Detecta compresión anómala del spread cuando se reduce por debajo de umbral con profundidad mínima en ambos lados.
+- Detecta **compresión extrema del spread** cuando el spread en USD cae por debajo de `max_spread_usd` y existe profundidad mínima en ambos lados (`min_depth_*`).
+- No debe disparar si el depth disponible es bajo o si el spread rebota antes de `hold_ms`.
 
 ## 2) Dependencias de datos (tablas/vistas/streams, lag esperado)
-- Depth con spread calculado y profundidad en niveles top (levels=50).
+- Depth consolidado con precios y qty.
+- Serie `spread_usd` en `oraculo.metrics_series` (window_s=1) y depth agregado top `levels`.
+- Lag esperado <200 ms; vigilar `ws_msg_lag_ms{stream="depth"}` y `alerts_queue_time_latest_seconds{stream="depth"}`.
 
 ## 3) Configuración (knobs YAML + valores recomendados iniciales)
-- `max_spread_usd` (0.5) como umbral de squeeze.
-- `levels` (50) para medir profundidad.
-- `min_depth_bid_btc`/`min_depth_ask_btc` (200) mínimos por lado.
-- Timing: `hold_ms` (1500), `retrigger_s` (30).
+
+```yaml
+detectors:
+  spread_squeeze:
+    enabled: true
+    max_spread_usd: 0.5
+    levels: 50
+    min_depth_bid_btc: 200.0
+    min_depth_ask_btc: 200.0
+    hold_ms: 1500
+    retrigger_s: 30
+```
+- `max_spread_usd`: umbral principal.
+- `levels`: head del libro considerado.
+- `hold_ms`: tiempo que debe mantenerse el squeeze.
 
 ## 4) Calibración (percentiles + cómo elegir warn/strong/retrigger)
-- Percentiles de spread histórico para validar `max_spread_usd`.
-- Ajustar `min_depth_*` según liquidez típica.
+- Métrica primaria: `spread_usd` y depth acumulado top `levels`.
+
+```sql
+WITH spr AS (
+  SELECT value AS spread
+  FROM oraculo.metrics_series
+  WHERE metric = 'spread_usd'
+    AND instrument_id = :instrument
+    AND event_time >= now() - interval '14 days'
+)
+SELECT
+  percentile_cont(0.50) WITHIN GROUP (ORDER BY spread) AS p50,
+  percentile_cont(0.90) WITHIN GROUP (ORDER BY spread) AS p90,
+  percentile_cont(0.95) WITHIN GROUP (ORDER BY spread) AS p95,
+  percentile_cont(0.99) WITHIN GROUP (ORDER BY spread) AS p99
+FROM spr;
+```
+- Regla: fijar `max_spread_usd` cerca de p10–p20 para capturar compresiones raras; warn en p95 de profundidad y strong en p99 de profundidad acumulada.
+- Validar profundidad usando snapshots agregados en CPU (`metrics_series` si persiste `depth_top_levels`).
 
 ## 5) Validación (queries de “health”, ejemplos de señales recientes)
-- Health: nº de squeezes y relación con volatilidad.
-- Ejemplos recientes con spread y depth en payload.
+
+```sql
+SELECT event_time, intensity,
+       fields->>'spread_usd' AS spread,
+       fields->>'depth_bid' AS depth_bid,
+       fields->>'depth_ask' AS depth_ask
+FROM oraculo.slice_events
+WHERE event_type = 'spread_squeeze'
+  AND event_time >= now() - interval '24 hours'
+ORDER BY event_time DESC
+LIMIT 50;
+```
+- Health por hora: conteo de señales y promedio de spread en `metrics_series` para el mismo período.
 
 ## 6) Observabilidad (métricas Prometheus / logs / auditoría)
-- Métricas de spread actual y duración del squeeze.
-- Logs con niveles usados y profundidades medidas.
+- Pipeline depth: `alerts_queue_depth`, `alerts_stage_duration_ms{stage="depth"}`.
+- Logs incluyen `spread_usd`, depth por lado, `levels`, `hold_ms`, `latency_ms`.
+- Revisar `ws_last_msg_age_seconds` si hay huecos en depth.
 
 ## 7) Performance (índices recomendados, filtros lookback, límites)
-- Limitar análisis a `levels` configurados.
-- Indexar depth por `ts` y side.
+- Consultas a `metrics_series` con filtros de tiempo/metric para usar compresión Timescale.
+- `levels` altos aumentan CPU; 50 suele ser suficiente.
+- `hold_ms` largo reduce spam pero requiere buffering; asegurar colas (`alerts_queue_depth`) no crecen.
 
 ## 8) Troubleshooting (tabla vacía, lag, blockers, fallbacks)
-- Si no detecta: revisar cálculo de spread y profundidad mínima.
-- Si ruido: bajar `max_spread_usd` o subir `min_depth_*`.
+- Sin señales: revisar `max_spread_usd` (puede estar demasiado bajo) y precisión de `spread_usd` (tick_size correcto).
+- Señales erráticas: subir `min_depth_*` y `hold_ms`; verificar que `spread_usd` no esté contaminado por latencias (lag >200 ms).
+- Clock skew: revisar `ws_msg_lag_ms` y sincronización NTP.
 
 ## 9) Rollback / Safe mode (enabled=false, subir umbrales, etc.)
-- Desactivar con `enabled=false` o subir `max_spread_usd` temporalmente.
-- Extender `hold_ms` para exigir persistencia.
+- Subir `max_spread_usd` a p50 y `hold_ms` a 0 para modo observación.
+- Desactivar con `enabled=false` en reglas si sigue generando ruido.
