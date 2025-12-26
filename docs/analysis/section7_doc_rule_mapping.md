@@ -74,3 +74,6 @@ Reglas copiadas de `📘 Proyecto — Oráculo Btcusdt  V1 — ACTUALIZADO.docx`
 - Convención de eventos: `event_type` en snake_case (`oi_spike`, `top_traders`, `liq_cluster`, `basis_dislocation`, `skew_shock`, `gamma_flip`, `term_structure_invert`) con `side` explícito (`buy`/`sell`/`na`/`bias`).
 - Campos de auditoría recomendados: `metric_source` (legacy/doc/auto), `window_s`, `thresholds` usados, `metric_used_*` cuando se combine DOC/legacy, y `profile` del `RuleContext` para mantener compatibilidad de telemetría.
 - Las reglas R28/R29 están implementadas y gobernadas por `detectors.oi_spike.enabled` (default false) para no alterar producción hasta habilitación explícita; R30/R31 `top_traders`, R34 `basis_dislocation`, R35 `skew_shock`, R36 `gamma_flip` y R37 `term_structure_invert` siguen el mismo patrón de feature flag (`detectors.top_traders.enabled=false`, `detectors.basis_dislocation.enabled=false`, `detectors.skew_shock.enabled=false`, `detectors.gamma_flip.enabled=false`, `detectors.term_structure_invert.enabled=false`). Sección 7 queda cerrada (Opción A) sin renumerar reglas previas.
+
+## Operación / calibración / cierre
+- Para operación y release consultar `docs/runbooks/ORACULO_CLOSURE.md`.

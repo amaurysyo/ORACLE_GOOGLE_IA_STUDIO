@@ -122,6 +122,9 @@ Fuente: Sección 6 “Métricas Microestructurales” del DOC `📘 Proyecto —
   - Depletion DOC = Δvolumen top-n por lado en ventana 1–5s (delta absoluto, cubre replenishment con signo).【F:oraculo/detect/metrics_engine.py†L145-L153】
   - Wmid = (best_bid + best_ask)/2 tick a tick.【F:oraculo/detect/metrics_engine.py†L115-L123】
   - Basis DOC = (Index−Mark)/Mark en bps + derivadas 1ª y 2ª sobre ventana 60–300s configurable.【F:oraculo/detect/metrics_engine.py†L88-L117】
-  - OI Δ% = (OI_t−OI_{t−Δ})/OI_{t−Δ} calculado en ingest REST y persistido con `window_s` configurable (default 120s).【F:oraculo/ingest/binance_rest.py†L129-L155】
+- OI Δ% = (OI_t−OI_{t−Δ})/OI_{t−Δ} calculado en ingest REST y persistido con `window_s` configurable (default 120s).【F:oraculo/ingest/binance_rest.py†L129-L155】
 - Ventanas configurables añadidas (defaults DOC): imbalance_doc=3s, dominance_doc=2s, depletion_doc=3s, basis_doc=120s, oi_doc=120s en reglas/config para hot-reload sin afectar legacy.【F:config/rules.yaml†L85-L92】【F:config/config.yaml†L8-L17】
 - Regla de migración: las reglas/detectores actuales siguen consumiendo las métricas legacy; la migración a métricas DOC queda pendiente de un sprint posterior.
+
+## Cierre operativo
+- Para operación y release consultar `docs/runbooks/ORACULO_CLOSURE.md`.
