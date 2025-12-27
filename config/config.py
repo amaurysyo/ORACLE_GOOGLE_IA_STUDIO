@@ -25,7 +25,7 @@ class StorageCfg(BaseModel):
 
 class TelegramBotCfg(BaseModel):
     token: str
-    chat_id: int
+    chat_id: int | str
 
 
 class RoutingCfg(BaseModel):
