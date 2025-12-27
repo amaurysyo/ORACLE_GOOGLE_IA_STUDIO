@@ -30,8 +30,28 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # ------- helpers -------
 
-def _load_env() -> None:
-    load_dotenv(ROOT / ".env")
+def _find_project_root() -> Path:
+    here = Path(__file__).resolve().parent
+    found_env: Optional[Path] = None
+    for candidate in [here] + list(here.parents):
+        env_file = candidate / ".env"
+        if env_file.exists():
+            found_env = candidate
+        cfg_file = candidate / "config" / "config.yaml"
+        if cfg_file.exists():
+            return candidate
+    return found_env or ROOT
+
+
+def _load_env() -> Optional[Path]:
+    root = _find_project_root()
+    env_file = root / ".env"
+    if env_file.exists():
+        load_dotenv(dotenv_path=env_file, override=True)
+        logger.debug(f"Loaded .env from {env_file} (override=True)")
+        return env_file
+    load_dotenv(override=True)
+    return None
 
 
 def _run_async(coro) -> None:
@@ -48,6 +68,71 @@ def _run_async(coro) -> None:
     except Exception:
         pass
     return asyncio.get_event_loop().run_until_complete(coro)
+
+
+def _env_var(key: str) -> Optional[str]:
+    v = os.getenv(key)
+    if v is None:
+        return None
+    v = v.strip()
+    return v or None
+
+
+def _normalize_token(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+    if value.startswith("<") and value.endswith(">"):
+        return None
+    return value
+
+
+def _normalize_chat_id(value: Optional[str]) -> Optional[Any]:
+    if value is None:
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+    return int(value) if value.isdigit() else value
+
+
+def _resolve_telegram_routing(cfg_routing: Optional[Any]) -> Dict[str, Dict[str, Optional[Any]]]:
+    env_routing = {
+        "bot_events": {"token": _env_var("TELEGRAM_BOT_EVENTS_TOKEN"), "chat_id": _env_var("TELEGRAM_CHAT_EVENTS")},
+        "bot_rules": {"token": _env_var("TELEGRAM_BOT_RULES_TOKEN"), "chat_id": _env_var("TELEGRAM_CHAT_RULES")},
+        "bot_errors": {"token": _env_var("TELEGRAM_BOT_ERRORS_TOKEN"), "chat_id": _env_var("TELEGRAM_CHAT_ERRORS")},
+    }
+
+    routing: Dict[str, Dict[str, Optional[Any]]] = {}
+
+    def _from_cfg(kind: str) -> Dict[str, Any]:
+        if cfg_routing is None:
+            return {}
+        if isinstance(cfg_routing, dict):
+            return cfg_routing.get(kind, {}) or {}
+        if hasattr(cfg_routing, "dict"):
+            try:
+                as_dict = cfg_routing.dict()
+                return as_dict.get(kind, {}) or {}
+            except Exception:
+                pass
+        return getattr(cfg_routing, kind, {}) or {}
+
+    for kind, env_vals in env_routing.items():
+        source = _from_cfg(kind)
+        token = _normalize_token(source.get("token")) or _normalize_token(env_vals.get("token"))
+        chat_id = _normalize_chat_id(source.get("chat_id")) or _normalize_chat_id(env_vals.get("chat_id"))
+
+        token_repr = "present" if token else "missing"
+        if isinstance(token, str):
+            token_repr = f"present ({token[:6]}...)" if len(token) >= 6 else "present"
+        chat_repr = "present" if chat_id else "missing"
+        logger.debug(f"Telegram ENV resolved for kind={kind}: token={token_repr} chat_id={chat_repr}")
+
+        routing[kind] = {"token": token, "chat_id": chat_id}
+    return routing
 
 
 # ===========================================
@@ -667,12 +752,11 @@ def alerts_run() -> None:
         await db.connect()
 
         # Routing: desde cfg o desde env como fallback
-        routing = (cfg.routing or {}).get("telegram") if cfg.routing else None
-        routing = routing or {
-            "bot_events": {"token": os.getenv("TELEGRAM_BOT_EVENTS_TOKEN"), "chat_id": os.getenv("TELEGRAM_CHAT_EVENTS")},
-            "bot_rules":  {"token": os.getenv("TELEGRAM_BOT_RULES_TOKEN"),  "chat_id": os.getenv("TELEGRAM_CHAT_RULES")},
-            "bot_errors": {"token": os.getenv("TELEGRAM_BOT_ERRORS_TOKEN"), "chat_id": os.getenv("TELEGRAM_CHAT_ERRORS")},
-        }
+        routing_cfg = (cfg.routing or {}).get("telegram") if cfg.routing else None
+        routing = _resolve_telegram_routing(routing_cfg)
+        missing_kinds = [k for k, v in routing.items() if not v.get("token") or not v.get("chat_id")]
+        if missing_kinds:
+            logger.warning(f"Telegram credentials missing for kinds: {', '.join(sorted(missing_kinds))}.")
 
         # Hot reload: habilitado por defecto (o mira config si tienes sección)
         hot = True
