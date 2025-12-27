@@ -32,12 +32,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _find_project_root() -> Path:
     here = Path(__file__).resolve().parent
+    found_env: Optional[Path] = None
     for candidate in [here] + list(here.parents):
         env_file = candidate / ".env"
+        if env_file.exists():
+            found_env = candidate
         cfg_file = candidate / "config" / "config.yaml"
-        if env_file.exists() or cfg_file.exists():
+        if cfg_file.exists():
             return candidate
-    return ROOT
+    return found_env or ROOT
 
 
 def _load_env() -> Optional[Path]:
@@ -95,7 +98,7 @@ def _normalize_chat_id(value: Optional[str]) -> Optional[Any]:
     return int(value) if value.isdigit() else value
 
 
-def _resolve_telegram_routing(cfg_routing: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Optional[Any]]]:
+def _resolve_telegram_routing(cfg_routing: Optional[Any]) -> Dict[str, Dict[str, Optional[Any]]]:
     env_routing = {
         "bot_events": {"token": _env_var("TELEGRAM_BOT_EVENTS_TOKEN"), "chat_id": _env_var("TELEGRAM_CHAT_EVENTS")},
         "bot_rules": {"token": _env_var("TELEGRAM_BOT_RULES_TOKEN"), "chat_id": _env_var("TELEGRAM_CHAT_RULES")},
@@ -103,8 +106,22 @@ def _resolve_telegram_routing(cfg_routing: Optional[Dict[str, Any]]) -> Dict[str
     }
 
     routing: Dict[str, Dict[str, Optional[Any]]] = {}
+
+    def _from_cfg(kind: str) -> Dict[str, Any]:
+        if cfg_routing is None:
+            return {}
+        if isinstance(cfg_routing, dict):
+            return cfg_routing.get(kind, {}) or {}
+        if hasattr(cfg_routing, "dict"):
+            try:
+                as_dict = cfg_routing.dict()
+                return as_dict.get(kind, {}) or {}
+            except Exception:
+                pass
+        return getattr(cfg_routing, kind, {}) or {}
+
     for kind, env_vals in env_routing.items():
-        source = (cfg_routing or {}).get(kind, {}) or {}
+        source = _from_cfg(kind)
         token = _normalize_token(source.get("token")) or _normalize_token(env_vals.get("token"))
         chat_id = _normalize_chat_id(source.get("chat_id")) or _normalize_chat_id(env_vals.get("chat_id"))
 
