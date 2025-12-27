@@ -43,6 +43,38 @@ def _as_mapping(obj: Any) -> Dict[str, Any]:
         return {}
 
 
+def _normalize_chat_id(raw: Any) -> int | str | None:
+    """Normaliza chat_id permitiendo @canales y corrigiendo el prefijo -100."""
+    if raw is None:
+        return None
+
+    if isinstance(raw, (int, float)):
+        try:
+            return int(raw)
+        except Exception:
+            return None
+
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    if s.startswith("@"):
+        return s
+
+    digits = s.lstrip("-")
+    if digits.isdigit():
+        if not s.startswith("-") and len(digits) >= 11:
+            corrected = f"-100{digits}"
+            logger.warning(f"[telegram] chat_id sin prefijo -100 detectado; normalizando {s} -> {corrected}")
+            s = corrected
+        try:
+            return int(s)
+        except Exception:
+            return None
+
+    return None
+
+
 class TelegramRouter:
     """Envía mensajes a Telegram con rate-limit (token bucket) y logging en DB.
 
@@ -61,11 +93,7 @@ class TelegramRouter:
         def norm_bot(bot: Dict[str, Any], env_token: str, env_chat: str) -> Dict[str, Any]:
             bot = _as_mapping(bot)
             token = bot.get("token") or os.getenv(env_token)
-            chat_id = bot.get("chat_id") or os.getenv(env_chat) or 0
-            try:
-                chat_id = int(chat_id)
-            except Exception:
-                chat_id = 0
+            chat_id = _normalize_chat_id(bot.get("chat_id") or os.getenv(env_chat))
             return {"token": token, "chat_id": chat_id}
 
         self._targets: Dict[str, Dict[str, Any]] = {
@@ -106,7 +134,8 @@ class TelegramRouter:
 
         target_cfg = self._targets.get(kind) or {}
         token = target_cfg.get("token")
-        chat_id = int(target_cfg.get("chat_id") or 0)
+        chat_id = target_cfg.get("chat_id")
+        chat_id_display = str(chat_id) if chat_id not in (None, "") else "unset"
         channel = f"telegram/{kind}"
 
         obs_metrics.dispatch_attempts_total.labels(channel=channel).inc()
@@ -115,10 +144,10 @@ class TelegramRouter:
         status = "sent=0"
         err: Optional[str] = None
 
-        if not token or chat_id == 0:
+        if not token or chat_id in (None, "", 0):
             err = "missing credentials"
             logger.warning(f"[telegram] missing credentials for kind={kind}")
-            logger.info(f"[telegram] {kind}@{chat_id} (skipped): {text}")
+            logger.info(f"[telegram] {kind}@{chat_id_display} (skipped): {text}")
             obs_metrics.dispatch_dropped_total.labels(
                 channel=channel, reason="disabled"
             ).inc()
@@ -126,7 +155,7 @@ class TelegramRouter:
             try:
                 bot = Bot(token=token)
                 await bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
-                logger.info(f"[telegram] {kind}@{chat_id}: {text}")
+                logger.info(f"[telegram] {kind}@{chat_id_display}: {text}")
                 status = "sent=1"
                 obs_metrics.dispatch_success_total.labels(channel=channel).inc()
                 obs_metrics.dispatch_last_success_ts.labels(channel=channel).set(time.time())
@@ -160,7 +189,7 @@ class TelegramRouter:
                     # event_time: ahora mismo
                     event_time = dt.datetime.now(dt.timezone.utc)
                     # target NO nulo (antes estaba NULL y rompía el NOT NULL)
-                    target = f"{kind}@{chat_id}"
+                    target = f"{kind}@{chat_id_display}"
                     t0 = time.perf_counter()
                     await self._db.execute(
                         """
