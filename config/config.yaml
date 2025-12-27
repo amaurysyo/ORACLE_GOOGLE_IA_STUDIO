@@ -72,8 +72,8 @@ streams:
     hb_timeout_s: 30
     use_trades_by_instrument: true          # <--- GRANULARIDAD ACTIVADA
     auth:
-      client_id: "KQpLTge6"
-      client_secret: "LJ3OPUM90drnGff3wj_CrSydG5ZpFitTjyL5SuwkVyI"
+      client_id: "${DERIBIT_CLIENT_ID}"
+      client_secret: "${DERIBIT_CLIENT_SECRET}"
     filters:
       expiries_front: 3        # n expiraciones más cercanas
       strikes_around_atm: 5    # ±n strikes alrededor del ATM

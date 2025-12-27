@@ -7,6 +7,7 @@ import asyncio
 import datetime as dt
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -29,6 +30,21 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 # ------- helpers -------
+_PLACEHOLDER_RE = re.compile(r"^\$\{[A-Z0-9_]+\}$")
+
+
+def _none_if_placeholder(v):
+    if v is None:
+        return None
+    if not isinstance(v, str):
+        return v
+    s = v.strip()
+    if not s:
+        return None
+    if _PLACEHOLDER_RE.match(s):
+        return None
+    return s
+
 
 def _find_project_root() -> Path:
     here = Path(__file__).resolve().parent
@@ -296,8 +312,8 @@ def env_deribit(timeout: int) -> None:
 
         # Credenciales opcionales para raw
         auth_cfg = (dcfg.get("auth") or {})
-        client_id = auth_cfg.get("client_id") or os.getenv("DERIBIT_CLIENT_ID")
-        client_secret = auth_cfg.get("client_secret") or os.getenv("DERIBIT_CLIENT_SECRET")
+        client_id = _none_if_placeholder(auth_cfg.get("client_id")) or os.getenv("DERIBIT_CLIENT_ID")
+        client_secret = _none_if_placeholder(auth_cfg.get("client_secret")) or os.getenv("DERIBIT_CLIENT_SECRET")
 
         def sanitize(p: Dict[str, Any]) -> Dict[str, Any]:
             # Deribit no acepta bool Python en query-string
@@ -671,6 +687,7 @@ def ingest_run() -> None:
         d = (getattr(cfg, "streams", {}) or {}).get("deribit", {}) or {}
         if d.get("enabled", False):
             from oraculo.ingest.deribit_ws import DeribitRunner
+            auth_cfg = d.get("auth") or {}
             runner = DeribitRunner(
                 db=db,
                 batcher=batcher,
@@ -683,8 +700,8 @@ def ingest_run() -> None:
                 strikes_around_atm=int(d.get("filters", {}).get("strikes_around_atm", 5)),
                 hb_timeout_s=int(d.get("hb_timeout_s", 30)),
                 use_trades_by_instrument=bool(d.get("use_trades_by_instrument", False)),
-                auth_client_id=(d.get("auth", {}) or {}).get("client_id") or os.getenv("DERIBIT_CLIENT_ID"),
-                auth_client_secret=(d.get("auth", {}) or {}).get("client_secret") or os.getenv("DERIBIT_CLIENT_SECRET"),
+                auth_client_id=_none_if_placeholder(auth_cfg.get("client_id")) or os.getenv("DERIBIT_CLIENT_ID"),
+                auth_client_secret=_none_if_placeholder(auth_cfg.get("client_secret")) or os.getenv("DERIBIT_CLIENT_SECRET"),
             )
             tasks.append(asyncio.create_task(runner.run(), name="ingest-deribit"))
             logger.info("DERIBIT WS habilitado.")
