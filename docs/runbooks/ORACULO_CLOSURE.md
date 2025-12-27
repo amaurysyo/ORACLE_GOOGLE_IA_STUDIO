@@ -129,6 +129,7 @@ WHERE bucket >= now() - interval '2 hours';
 | spoofing | 0–2/h | Muros que aparecen/desaparecen rápido | Subir `wall_size_btc`, `distance_ticks`; bajar `max_cancel_ratio` | `enabled=false` |
 | depletion | 0–3/h | Caída abrupta depth | Subir `pct_drop_*`, `hold_ms`; cambiar `metric_source=legacy` | `enabled=false` |
 | basis (extreme/mean_revert) | 0–5/h | Basis extremo o revert | Subir `basis_extreme_*`, `vel_gate_abs`; set `metric_source=legacy` | `enabled=false` |
+| options | 0–2/h | IV/OI en rangos esperados; surface sin gaps | Subir `iv_spike.*` y `oi_skew.*`; elegir `surface` conservadora | Desactivar reglas R19–R22 en servicio o bajar umbrales a no-disparo |
 | tape_pressure | 1–5/h | OFI extremo en 5s | Subir `min_trades`, `min_qty_btc`, `retrigger_s` | `enabled=false` |
 | spread_squeeze | 1–5/h | Compresión spread | Subir `max_spread_usd`, `hold_ms`, `retrigger_s` | `enabled=false` |
 | oi_spike | 0–3/h | ΔOI% con momentum precio | Subir `oi_warn/strong_pct`, `mom_*`; ampliar `retrigger_s` | `enabled=false` |
@@ -139,6 +140,8 @@ WHERE bucket >= now() - interval '2 hours';
 | gamma_flip | 0–1/h | Cambio signo GEX estable | Subir `min_abs_net_gex`, `flip_hysteresis`, `retrigger_s`; endurecer `delta_gate`/`moneyness_abs` | `enabled=false` |
 | iv_spike | 0–2/h | ΔIV + velocidad | Subir `dv_*`, `vel_*`; activar `use_velocity_gate` | `enabled=false` |
 | term_structure_invert | 0–1/h | Inversión curva IV | Subir `spread_*`, `vel_*`; `use_velocity_gate=true` | `enabled=false` |
+| metrics | N/A (no emite alertas) | Series `metrics_series` sin lag y sin NaN | Subir umbrales `imbalance_*`, `basis_*`, `spread_squeeze`; usar `metric_source=legacy` si DOC inestable | Deshabilitar reglas dependientes o comentar uso de métricas hasta estabilizar |
+| metrics_doc | N/A (no emite alertas) | Buckets DOC recientes (`*_doc_window_s`) y sin nulls | Ajustar ventanas DOC (`*_doc_window_s`) o forzar `metric_source=legacy` en reglas consumidoras | Deshabilitar reglas DOC o fallback a `metric_source=legacy` |
 
 ## Rollback / Safe-mode único
 1) Pausar nuevas alertas: `detectors.<name>.enabled=false` en `config/rules.yaml` y recargar servicio.
