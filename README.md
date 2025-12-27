@@ -5,14 +5,16 @@ Created on Fri Oct 31 19:27:26 2025
 @author: AMAURY
 """
 
-# README.md  # why: guía rápida
-# 1) conda create -n oraculo python=3.11 -y && conda activate oraculo
-# 2) pip install -r requirements.txt
-# 3) cp .env.example .env  # y edita PG_DSN + tokens
-# 4) python scripts/cli.py health
-# 5) python scripts/cli.py db:migrate core|hotfix|bt
-# 6) python scripts/cli.py db:refresh-caggs --from "6 hours"
-# 7) python scripts/cli.py telegram:test "Hola"
+# README.md  # guía rápida
+
+1) `conda create -n oraculo python=3.11 -y && conda activate oraculo`  
+   o usa `python -m venv .venv && source .venv/bin/activate`
+2) `pip install -r requirements.txt`
+3) `cp .env.example .env` y edita valores (PG_DSN, tokens, etc.).
+4) `python scripts/cli.py env doctor`
+5) `python scripts/cli.py ingest run`
+6) `python scripts/cli.py alerts run`
+7) Opcional: `python scripts/cli.py loadtest alerts --target ws://localhost:8765/ws`
 ## Cómo correr el loadtest desde Spyder
 
 1. Abre `scripts/spyder_loadtest_runner.py` en Spyder.
