@@ -17,6 +17,36 @@ from oraculo.db import DB
 from oraculo.obs import metrics as obs_metrics
 
 
+def _is_placeholder_or_invalid(value: Any) -> bool:
+    """Detecta valores vacíos, inválidos o placeholders de entorno."""
+    if value is None:
+        return True
+
+    s = str(value).strip()
+    if not s:
+        return True
+
+    lowered = s.lower()
+    if lowered in {"unset", "none", "null"}:
+        return True
+
+    return _looks_like_placeholder(s)
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    """Detecta placeholders comunes (${VAR}, $VAR, %VAR%)."""
+    if value.startswith("${") and value.endswith("}"):
+        return True
+
+    if value.startswith("$") and len(value) > 1:
+        return True
+
+    if value.startswith("%") and value.endswith("%") and len(value) > 2:
+        return True
+
+    return False
+
+
 def _as_mapping(obj: Any) -> Dict[str, Any]:
     """Best-effort to turn dict / pydantic / dataclass-like into a plain dict."""
     if obj is None:
@@ -90,16 +120,41 @@ class TelegramRouter:
         root = _as_mapping(cfg)
         tg = _as_mapping(root.get("telegram") or root)
 
-        def norm_bot(bot: Dict[str, Any], env_token: str, env_chat: str) -> Dict[str, Any]:
+        def norm_bot(bot: Dict[str, Any], env_token: str, env_chat: str, *, kind: str) -> Dict[str, Any]:
             bot = _as_mapping(bot)
-            token = bot.get("token") or os.getenv(env_token)
-            chat_id = _normalize_chat_id(bot.get("chat_id") or os.getenv(env_chat))
+            raw_token = bot.get("token")
+            raw_chat_id = bot.get("chat_id")
+
+            token = None
+            chat_id_raw: Any = None
+
+            if not _is_placeholder_or_invalid(raw_token):
+                token = raw_token
+            else:
+                env_val = os.getenv(env_token)
+                if not _is_placeholder_or_invalid(env_val):
+                    token = env_val
+                    logger.debug(
+                        f"[telegram] placeholder/invalid token in config for kind={kind}, using ENV {env_token}"
+                    )
+
+            if not _is_placeholder_or_invalid(raw_chat_id):
+                chat_id_raw = raw_chat_id
+            else:
+                env_val = os.getenv(env_chat)
+                if not _is_placeholder_or_invalid(env_val):
+                    chat_id_raw = env_val
+                    logger.debug(
+                        f"[telegram] placeholder/invalid chat_id in config for kind={kind}, using ENV {env_chat}"
+                    )
+
+            chat_id = _normalize_chat_id(chat_id_raw)
             return {"token": token, "chat_id": chat_id}
 
         self._targets: Dict[str, Dict[str, Any]] = {
-            "events": norm_bot(tg.get("bot_events"), "TELEGRAM_BOT_EVENTS_TOKEN", "TELEGRAM_CHAT_EVENTS"),
-            "rules":  norm_bot(tg.get("bot_rules"),  "TELEGRAM_BOT_RULES_TOKEN",  "TELEGRAM_CHAT_RULES"),
-            "errors": norm_bot(tg.get("bot_errors"), "TELEGRAM_BOT_ERRORS_TOKEN", "TELEGRAM_CHAT_ERRORS"),
+            "events": norm_bot(tg.get("bot_events"), "TELEGRAM_BOT_EVENTS_TOKEN", "TELEGRAM_CHAT_EVENTS", kind="events"),
+            "rules":  norm_bot(tg.get("bot_rules"),  "TELEGRAM_BOT_RULES_TOKEN",  "TELEGRAM_CHAT_RULES", kind="rules"),
+            "errors": norm_bot(tg.get("bot_errors"), "TELEGRAM_BOT_ERRORS_TOKEN", "TELEGRAM_CHAT_ERRORS", kind="errors"),
         }
 
         self._db = db
