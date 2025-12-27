@@ -7,6 +7,8 @@ Created on Fri Oct 31 19:27:26 2025
 
 # README.md  # guía rápida
 
+Ver: docs/analysis/section1_5_alignment_report.md
+
 1) `conda create -n oraculo python=3.11 -y && conda activate oraculo`  
    o usa `python -m venv .venv && source .venv/bin/activate`
 2) `pip install -r requirements.txt`
