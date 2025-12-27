@@ -38,7 +38,13 @@ if "pydantic" not in sys.modules:
             obj.__dict__.update(data or {})
             return obj
 
-    sys.modules["pydantic"] = types.SimpleNamespace(BaseModel=_DummyBase, ConfigDict=dict)
+    def _identity_validator(*_args, **_kwargs):
+        def _decorator(fn):
+            return fn
+
+        return _decorator
+
+    sys.modules["pydantic"] = types.SimpleNamespace(BaseModel=_DummyBase, ConfigDict=dict, field_validator=_identity_validator)
 if "asyncpg" not in sys.modules:
     class _DummyPool:
         async def close(self):
@@ -170,4 +176,3 @@ def test_config_change_triggers_resubscribe():
                 await runner._task
 
     asyncio.run(_run())
-
