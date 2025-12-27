@@ -764,6 +764,7 @@ class MetricTriggerDetector:
 # --------- Basis mean-revert detector ---------
 @dataclass
 class BasisMRcfg:
+    window_s: float = 120.0
     gate_abs_bps: float = 25.0
     vel_gate_abs: float = 1.5
     retrigger_s: int = 60
