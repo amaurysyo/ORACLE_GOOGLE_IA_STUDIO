@@ -11,3 +11,22 @@ CREATE SCHEMA oraculo;
 CREATE SCHEMA oraculo_audit;
 
 CREATE SCHEMA oraculo_bt;
+
+CREATE DOMAIN public.instrument_id_t AS text;
+
+CREATE TYPE public.side_t AS ENUM (
+    'buy',
+    'sell'
+);
+
+CREATE TYPE public.action_t AS ENUM (
+    'insert',
+    'update',
+    'delete'
+);
+
+CREATE TYPE public.severity_t AS ENUM (
+    'ALTA',
+    'MEDIA',
+    'BAJA'
+);
