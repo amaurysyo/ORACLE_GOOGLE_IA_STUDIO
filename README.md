@@ -53,3 +53,7 @@ Ver: docs/analysis/section1_5_alignment_report.md
   - `rate(oraculo_alerts_engine_lock_seconds_sum{service="alerts"}[5m])`
 
 En los logs, busca entradas con prefijo `[alerts][watchdog] DUMP_TRIGGERED` para confirmar la emisión del stack.
+
+## Database bootstrap
+
+Consulta el runbook en `docs/runbooks/DB_BOOTSTRAP.md` para prerequisitos, comandos `psql` y verificaciones mínimas.
