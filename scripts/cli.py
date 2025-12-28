@@ -9,6 +9,7 @@ import json
 import os
 import re
 import time
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +19,10 @@ import websockets
 from dotenv import load_dotenv
 from loguru import logger
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from oraculo.config import load_config
 from oraculo.config_hot import ConfigManager
 from oraculo.db import DB
@@ -25,8 +30,6 @@ from oraculo.ingest.batch_writer import AsyncBatcher
 from oraculo.obs.logging import setup_logging_json
 from oraculo.obs.metrics import run_exporter, start_event_loop_lag_monitor
 from scripts.loadtest_ws import DEFAULT_METRICS, LoadTestConfig, run_loadtest
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 # ------- helpers -------
@@ -727,14 +730,6 @@ def ingest_run() -> None:
 
 
 # ===========================================
-# MAIN
-# ===========================================
-
-if __name__ == "__main__":
-    cli()
-
-
-# ===========================================
 # ALERTS GROUP  (detectors + rules + router)
 # ===========================================
 
@@ -798,3 +793,11 @@ def alerts_run() -> None:
         await run_pipeline(db, {"telegram": routing}, rules_profile="EU", cfg_mgr=cfgmgr)
 
     _run_async(_run())
+
+
+# ===========================================
+# MAIN
+# ===========================================
+
+if __name__ == "__main__":
+    cli()
