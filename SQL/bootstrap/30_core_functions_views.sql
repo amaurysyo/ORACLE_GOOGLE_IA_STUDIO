@@ -1,3 +1,5 @@
+-- Generated from SQL/SQL_ORACULO_BACKUP.sql by tools/split_pg_dump_bootstrap.py
+
 CREATE FUNCTION oraculo.f_slicing_blocks(p_instrument_id public.instrument_id_t, p_from timestamp with time zone, p_to timestamp with time zone, p_min_trades integer DEFAULT 1, p_min_qty_btc double precision DEFAULT 0) RETURNS TABLE(instrument_id public.instrument_id_t, block_id bigint, side public.side_t, price double precision, t_start timestamp with time zone, t_end timestamp with time zone, n_trades bigint, qty_btc double precision, duration_s double precision, qty_min double precision, qty_max double precision, qty_stddev double precision, qty_all_equal boolean, qty_almost_equal boolean, pattern text)
     LANGUAGE sql
     AS '
@@ -755,6 +757,7 @@ basis_series AS (
     p_instrument_id, p_start, p_end
   )
 ),
+-- 1) depth con prev_qty por (instrument_id, side, price)
 depth_delta AS (
   SELECT
     instrument_id,
@@ -773,6 +776,7 @@ depth_delta AS (
   WHERE instrument_id = p_instrument_id
     AND event_time BETWEEN p_start - interval ''3 seconds'' AND p_end
 ),
+-- 2) eventos de inserción/borrado lógicos (deltas)
 depth_events AS (
   SELECT
     event_time,
@@ -802,6 +806,7 @@ SELECT
        THEN LEAST(ins_sell / del_sell, 1.0)
        ELSE 0 END AS refill_ask_3s
 FROM slices s
+-- basis/basis_vel: último mark_funding <= ts_sec
 LEFT JOIN LATERAL (
   SELECT
     event_time,
@@ -812,6 +817,7 @@ LEFT JOIN LATERAL (
   ORDER BY m.event_time DESC
   LIMIT 1
 ) b ON true
+-- suma ins/dels de los últimos 3s por lado
 LEFT JOIN LATERAL (
   SELECT
     COALESCE(SUM(CASE WHEN side = ''buy''  THEN ins  END), 0.0) AS ins_buy,
