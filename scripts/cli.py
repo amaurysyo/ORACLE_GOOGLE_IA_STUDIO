@@ -98,6 +98,7 @@ def _env_var(key: str) -> Optional[str]:
 
 
 def _normalize_token(value: Optional[str]) -> Optional[str]:
+    value = _none_if_placeholder(value)
     if value is None:
         return None
     value = str(value).strip()
@@ -109,6 +110,7 @@ def _normalize_token(value: Optional[str]) -> Optional[str]:
 
 
 def _normalize_chat_id(value: Optional[str]) -> Optional[Any]:
+    value = _none_if_placeholder(value)
     if value is None:
         return None
     value = str(value).strip()
