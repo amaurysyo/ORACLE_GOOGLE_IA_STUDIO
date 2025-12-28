@@ -1,3 +1,5 @@
+-- Generated from SQL/SQL_ORACULO_BACKUP.sql by tools/split_pg_dump_bootstrap.py
+
 SET default_table_access_method = heap;
 
 CREATE TABLE binance_futures.mark_funding (
@@ -605,3 +607,9 @@ ALTER TABLE ONLY oraculo_bt.bt_metrics
 
 ALTER TABLE ONLY oraculo_bt.bt_trades
     ADD CONSTRAINT bt_trades_run_id_fkey FOREIGN KEY (run_id) REFERENCES oraculo_bt.bt_runs(run_id) ON DELETE CASCADE;
+
+
+-- Completed on 2025-12-28 17:58:16
+
+--
+-- PostgreSQL database dump complete

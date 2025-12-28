@@ -1,3 +1,5 @@
+-- Generated from SQL/SQL_ORACULO_BACKUP.sql by tools/split_pg_dump_bootstrap.py
+
 CREATE VIEW oraculo.iv_surface_1m AS
  SELECT _materialized_hypertable_88.underlying,
     _materialized_hypertable_88.bucket,
