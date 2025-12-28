@@ -14,6 +14,9 @@ DOC_HEADER = (
     "-- Generated from SQL/SQL_ORACULO_BACKUP.sql by tools/split_pg_dump_bootstrap.py"
 )
 TABLE_PREAMBLE_MARKER = "SET default_table_access_method = heap;"
+METADATA_PATTERN = re.compile(r"-- Name: (.*?); Type: ([^;]+); Schema: ([^;]+); Owner:")
+REQUIRED_TYPES = ("instrument_id_t", "side_t", "action_t", "severity_t")
+EXTENSION_LINE = "CREATE EXTENSION IF NOT EXISTS timescaledb;"
 
 OUTPUT_KEYS = [
     "00_extensions.sql",
@@ -53,9 +56,20 @@ def read_blocks(lines: Iterable[str]) -> List[List[str]]:
             if current:
                 blocks.append(current)
             current = [line]
-        else:
-            if current:
+            continue
+
+        if METADATA_PATTERN.match(line):
+            if not current:
+                current = [line]
+            elif current[0].startswith("-- TOC entry "):
                 current.append(line)
+            else:
+                blocks.append(current)
+                current = [line]
+            continue
+
+        if current:
+            current.append(line)
     if current:
         blocks.append(current)
     return blocks
@@ -63,19 +77,50 @@ def read_blocks(lines: Iterable[str]) -> List[List[str]]:
 
 def parse_metadata(block: Iterable[str]) -> Optional[Tuple[str, str, str]]:
     for line in block:
-        match = re.search(
-            r"-- Name: (.*?); Type: ([^;]+); Schema: ([^;]+); Owner:", line
-        )
+        match = METADATA_PATTERN.search(line)
         if match:
             return match.group(1), match.group(2).strip(), match.group(3).strip()
     return None
 
 
-def classify_block(type_name: str, block_text: str) -> Optional[str]:
-    if "_timescaledb_" in block_text:
-        return "40_timescale.sql"
-
+def classify_block(type_name: str) -> Optional[str]:
     return TYPE_ROUTING.get(type_name.upper())
+
+
+def is_timescale_internal(schema: str, block_text: str) -> bool:
+    if schema.startswith(
+        (
+            "_timescaledb_",
+            "timescaledb_information",
+            "timescaledb_experimental",
+            "_timescaledb_functions",
+        )
+    ):
+        return True
+
+    return "_timescaledb_" in block_text
+
+
+def validate_required_types(outputs: Dict[str, List[str]]) -> None:
+    body_text = "\n".join(
+        segment for segments in outputs.values() for segment in segments
+    )
+
+    for type_name in REQUIRED_TYPES:
+        reference_pattern = re.compile(rf"\bpublic\.{re.escape(type_name)}\b")
+        definition_pattern = re.compile(
+            rf"CREATE\s+(?:TYPE|DOMAIN)\s+public\.{re.escape(type_name)}\b",
+            re.IGNORECASE,
+        )
+
+        has_reference = bool(reference_pattern.search(body_text))
+        has_definition = bool(definition_pattern.search(body_text))
+
+        if has_reference and not has_definition:
+            raise ValueError(
+                f"Bootstrap output references public.{type_name} but no CREATE TYPE/DOMAIN/ENUM is present. "
+                "Ensure custom types are included in 10_core_schema.sql."
+            )
 
 
 def strip_metadata_and_extract_preamble(
@@ -140,8 +185,13 @@ def main() -> None:
         if not metadata:
             continue
 
-        name, type_name, _schema = metadata
-        target = classify_block(type_name, "".join(block))
+        name, type_name, schema = metadata
+        block_text = "".join(block)
+
+        if is_timescale_internal(schema, block_text):
+            continue
+
+        target = classify_block(type_name)
 
         if not target:
             skipped.append(metadata)
@@ -152,6 +202,13 @@ def main() -> None:
 
         if cleaned_lines:
             outputs[target].append("".join(cleaned_lines))
+
+    # Ensure extensions file always contains at least the Timescale statement.
+    extensions = outputs.setdefault("00_extensions.sql", [])
+    if not any(EXTENSION_LINE in segment for segment in extensions):
+        extensions.insert(0, f"{EXTENSION_LINE}\n")
+
+    validate_required_types(outputs)
 
     write_outputs(outputs, table_preamble)
 
