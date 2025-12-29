@@ -145,7 +145,7 @@ def test_basis_mr_source_selection():
 
 
 def test_dominance_doc_path():
-    det_dom_doc = DominanceDetector(DominanceCfg(metric_source="auto", dom_pct_doc=0.60))
+    det_dom_doc = DominanceDetector(DominanceCfg(metric_source="auto", dom_pct_doc=0.60, hold_ms=0, retrigger_s=0))
     snap_doc = Snapshot(
         spread_usd=1.0,
         dominance_bid_doc=0.65,
@@ -168,7 +168,7 @@ def test_dominance_doc_path():
     assert res_doc.dominance_event.fields["metric_source"] == "doc"
     assert res_doc.dominance_event.side == "buy"
 
-    det_dom_legacy = DominanceDetector(DominanceCfg(metric_source="auto", dom_pct=0.8))
+    det_dom_legacy = DominanceDetector(DominanceCfg(metric_source="auto", dom_pct=0.8, hold_ms=0, retrigger_s=0))
     book = _DummyBook([(100.0, 1.0), (99.5, 1.0), (99.0, 1.0), (98.5, 1.0)], [(101.0, 1.0)])
     det_dom_legacy.attach_book(book)
     snap_legacy = Snapshot(spread_usd=1.0, best_bid=100.0, best_ask=101.0)

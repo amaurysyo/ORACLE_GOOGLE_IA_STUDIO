@@ -104,6 +104,18 @@ def _sev_norm(x: str) -> str:
     return _SEV_MAP.get(str(x).strip().upper(), "MEDIA")
 
 
+def compute_ts_first_bucket(event_time: dt.datetime, suppress_window_s: Optional[int]) -> dt.datetime:
+    """
+    Replica del cálculo de ts_first en oraculo.upsert_rule_alert.
+    """
+    window_s = suppress_window_s if suppress_window_s is not None and suppress_window_s > 0 else 90
+    if event_time.tzinfo is None:
+        event_time = event_time.replace(tzinfo=dt.timezone.utc)
+    event_time = event_time.astimezone(dt.timezone.utc)
+    bucket_epoch = math.floor(event_time.timestamp() / window_s) * window_s
+    return dt.datetime.fromtimestamp(bucket_epoch, tz=dt.timezone.utc)
+
+
 def _parse_deribit_option(instrument_id: str) -> tuple[Optional[str], Optional[str]]:
     """
     Extrae (underlying, tipo) de un instrument_id canónico de Deribit OPTIONS.
@@ -617,10 +629,11 @@ class DBWriter:
         t0 = time.perf_counter()
         try:
             sev_db = _sev_norm(rule["severity"])
+            latency_ms = int(max(0.0, (time.time() - event_ts) * 1000.0))
             alert_id = await self.db.fetchval(
                 """
                 SELECT oraculo.upsert_rule_alert(
-                  $1, $2, $3, $4::severity_t, $5, $6::jsonb, $7, $8
+                  $1, $2, $3, $4::severity_t, $5, $6::jsonb, $7, $8, $9
                 ) AS id
             """,
                 self.instrument_id,
@@ -631,6 +644,7 @@ class DBWriter:
                 json.dumps(rule["context"] or {}),
                 rule.get("suppress_window_s"),
                 self.profile,
+                latency_ms,
             )
             if alert_id is None:
                 obs_metrics.rule_alerts_no_id_total.labels(

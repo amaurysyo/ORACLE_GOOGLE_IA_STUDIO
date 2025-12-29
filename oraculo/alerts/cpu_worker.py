@@ -1058,6 +1058,7 @@ class CPUWorkerProcess(mp.Process):
 
         dom_event: Optional[Event] = None
         metric_source = (det_dom.cfg.metric_source or "legacy").lower()
+        doc_candidate = False
         if metric_source in ("doc", "auto"):
             doc_bid = getattr(snap, "dominance_bid_doc", None)
             doc_ask = getattr(snap, "dominance_ask_doc", None)
@@ -1075,11 +1076,11 @@ class CPUWorkerProcess(mp.Process):
                     metric_used = "dominance_ask_doc"
 
                 if side_doc and dom_val is not None:
+                    doc_candidate = True
                     price = snap.best_bid if side_doc == "buy" else snap.best_ask
-                    dom_event = Event(
-                        "dominance",
-                        side_doc,
+                    dom_event = det_dom.maybe_emit_doc(
                         now_ts,
+                        side_doc,
                         price or 0.0,
                         dom_val * 100.0,
                         {
@@ -1089,7 +1090,7 @@ class CPUWorkerProcess(mp.Process):
                         },
                     )
 
-        if dom_event is None and metric_source != "doc":
+        if dom_event is None and metric_source != "doc" and not doc_candidate:
             dom_event = det_dom.maybe_emit(now_ts, spread_usd=spread_usd)
             if dom_event:
                 dom_event.fields["metric_used"] = "dom_levels_legacy"

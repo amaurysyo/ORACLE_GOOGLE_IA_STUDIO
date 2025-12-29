@@ -437,11 +437,35 @@ class DominanceDetector:
     def __init__(self, cfg: DominanceCfg, book=None):
         self.cfg = cfg
         self._book = book  # si no se pasa, el caller debe setearlo luego
-        self._last_ts_emit = 0.0
+        self._last_emit_ts: Optional[float] = None
         self._last_side: Optional[str] = None
+        self._arm_ts: Optional[float] = None
+        self._arm_side: Optional[str] = None
 
     def attach_book(self, book) -> None:
         self._book = book
+
+    def _can_emit(self, ts: float, side: str) -> bool:
+        hold_s = max(float(self.cfg.hold_ms or 0) / 1000.0, 0.0)
+        retrigger_s = max(float(self.cfg.retrigger_s or 0), 0.0)
+        if side not in ("buy", "sell"):
+            return False
+        if self._arm_side != side:
+            self._arm_side = side
+            self._arm_ts = ts
+        elif self._arm_ts is None:
+            self._arm_ts = ts
+        if hold_s > 0 and self._arm_ts is not None and (ts - self._arm_ts) < hold_s:
+            return False
+        if retrigger_s > 0 and self._last_emit_ts is not None and (ts - self._last_emit_ts) < retrigger_s:
+            return False
+        return True
+
+    def _mark_emit(self, ts: float, side: str) -> None:
+        self._last_emit_ts = ts
+        self._last_side = side
+        self._arm_ts = ts
+        self._arm_side = side
 
     def _dominance_pct(self, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]]) -> Tuple[str, float, float]:
         nz_bids = sum(1 for _, q in bids[: self.cfg.levels] if q > 0)
@@ -462,12 +486,27 @@ class DominanceDetector:
         side, dom, _ = self._dominance_pct(bids, asks)
         if side == "none" or spread_usd > self.cfg.max_spread_usd:
             return None
-        if (ts - self._last_ts_emit) * 1000.0 < self.cfg.hold_ms and side == self._last_side:
+        if not self._can_emit(ts, side):
             return None
-        self._last_ts_emit = ts
-        self._last_side = side
+        self._mark_emit(ts, side)
         price = (bids[0][0] if bids else 0.0) if side == "buy" else (asks[0][0] if asks else 0.0)
-        return Event("dominance", side, ts, price, dom * 100.0, {"levels": self.cfg.levels})
+        return Event(
+            "dominance",
+            side,
+            ts,
+            price,
+            dom * 100.0,
+            {"levels": self.cfg.levels, "hold_ms": self.cfg.hold_ms, "retrigger_s": self.cfg.retrigger_s},
+        )
+
+    def maybe_emit_doc(self, ts: float, side: str, price: float, dom_val: float, fields: Dict[str, Any]) -> Optional[Event]:
+        if not self.cfg.enabled:
+            return None
+        if not self._can_emit(ts, side):
+            return None
+        self._mark_emit(ts, side)
+        out_fields = {**(fields or {}), "levels": self.cfg.levels, "hold_ms": self.cfg.hold_ms, "retrigger_s": self.cfg.retrigger_s}
+        return Event("dominance", side, ts, price, dom_val, out_fields)
 
 # --------- Spoofing (aparición/retirada de muro sin ejecución) ---------
 @dataclass

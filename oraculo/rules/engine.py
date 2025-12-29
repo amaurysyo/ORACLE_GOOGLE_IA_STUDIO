@@ -31,6 +31,37 @@ class RuleContext:
     profile: str = "EU"
     suppress_window_s: int = 90
 
+_VOLATILE_FIELD_KEYS = {
+    "ts",
+    "timestamp",
+    "event_time",
+    "event_ts",
+    "ts_first",
+    "ts_last",
+    "seq",
+    "id",
+    "uuid",
+    "nonce",
+    "ts_ms",
+}
+
+
+def _sanitize_fields_for_hash(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _sanitize_fields_for_hash(v) for k, v in value.items() if k not in _VOLATILE_FIELD_KEYS}
+    if isinstance(value, list):
+        return [_sanitize_fields_for_hash(v) for v in value]
+    return value
+
+
+def _intensity_component(context_type: Any, ev: Dict[str, Any], severity: str) -> str:
+    if str(context_type or "").lower() == "dominance":
+        return f"sev={severity}"
+    try:
+        return f"i={round(float(ev.get('intensity')), 4)}"
+    except Exception:
+        return "i=na"
+
 def _mk(rule: str, side: str, ev: Dict[str, Any], ctx: RuleContext, severity: str = "MEDIUM") -> Dict[str, Any]:
     price = ev.get("price")
     fields = ev.get("fields") or {}
@@ -43,14 +74,11 @@ def _mk(rule: str, side: str, ev: Dict[str, Any], ctx: RuleContext, severity: st
     except Exception:
         price_component = "p=err"
 
-    try:
-        intensity_component = f"i={round(float(ev.get('intensity')), 4)}"
-    except Exception:
-        intensity_component = "i=na"
+    intensity_component = _intensity_component(context_type, ev, severity)
 
     try:
         fields_sig = hashlib.sha1(
-            json.dumps(fields, sort_keys=True, default=str).encode("utf-8")
+            json.dumps(_sanitize_fields_for_hash(fields), sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()[:8]
     except Exception:
         fields_sig = "fields=err"
