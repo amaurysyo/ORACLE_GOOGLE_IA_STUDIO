@@ -36,7 +36,7 @@ def test_metrics_engine_reconstructs_book_from_deltas():
 
 def test_dominance_detector_reads_reconstructed_book():
     engine = MetricsEngine(top_n=10)
-    det = DominanceDetector(DominanceCfg(dom_pct=0.75, max_spread_usd=5.0), book=engine.book)
+    det = DominanceDetector(DominanceCfg(dom_pct=0.75, max_spread_usd=5.0, hold_ms=0, retrigger_s=0), book=engine.book)
 
     ts = 10.0
     for i in range(4):

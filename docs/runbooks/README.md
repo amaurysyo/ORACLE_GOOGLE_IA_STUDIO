@@ -1,6 +1,9 @@
 # Runbook global de cierre
 - [docs/runbooks/ORACULO_CLOSURE.md](./ORACULO_CLOSURE.md)
 
+# Notas operativas globales
+- Las alertas de reglas se deduplican por `suppress_window_s`; Telegram sólo envía notificación al abrir una nueva ventana o si la severidad escala dentro de la misma ventana.
+
 # Índice de runbooks por detector
 
 | detector | archivo runbook | reglas afectadas (Rxx) | estado | fuentes de datos principales |
