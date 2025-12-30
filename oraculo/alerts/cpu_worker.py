@@ -675,6 +675,21 @@ class CPUWorkerProcess(mp.Process):
                 db_loop = None
                 db_adapter = None
 
+        def _init_db_adapter() -> None:
+            nonlocal db_loop, db_pool, db_adapter
+            db_loop = asyncio.new_event_loop()
+            prev_loop: Optional[asyncio.AbstractEventLoop] = None
+            try:
+                try:
+                    prev_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    prev_loop = None
+                asyncio.set_event_loop(db_loop)
+                db_pool = db_loop.run_until_complete(asyncpg.create_pool(dsn=self.db_dsn, min_size=1, max_size=2))
+                db_adapter = _AsyncpgAdapter(db_pool, db_loop)
+            finally:
+                asyncio.set_event_loop(prev_loop)
+
         need_db = (
             oi_cfg.enabled
             or liq_cfg.enabled
@@ -687,9 +702,7 @@ class CPUWorkerProcess(mp.Process):
         )
         if need_db and self.db_dsn and asyncpg is not None:
             try:
-                db_loop = asyncio.new_event_loop()
-                db_pool = db_loop.run_until_complete(asyncpg.create_pool(dsn=self.db_dsn, min_size=1, max_size=2))
-                db_adapter = _AsyncpgAdapter(db_pool, db_loop)
+                _init_db_adapter()
                 logger.info("[cpu-worker] DB adapter enabled for macro detectors.")
             except Exception as e:
                 logger.warning(f"[cpu-worker] Failed to init DB pool for macro detectors: {e!s}")
@@ -940,11 +953,7 @@ class CPUWorkerProcess(mp.Process):
                         )
                         if need_db_after and db_adapter is None and self.db_dsn and asyncpg is not None:
                             try:
-                                db_loop = asyncio.new_event_loop()
-                                db_pool = db_loop.run_until_complete(
-                                    asyncpg.create_pool(dsn=self.db_dsn, min_size=1, max_size=2)
-                                )
-                                db_adapter = _AsyncpgAdapter(db_pool, db_loop)
+                                _init_db_adapter()
                             except Exception:
                                 logger.warning("[cpu-worker] failed to init db adapter after rules update")
                                 _close_db_resources()
