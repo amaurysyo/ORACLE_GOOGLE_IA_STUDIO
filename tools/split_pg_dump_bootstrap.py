@@ -6,12 +6,19 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
+"""
+After updating the dump, run:
+    python tools/split_pg_dump_bootstrap.py
+    python tools/export_timescale_layer.py
+to regenerate full bootstrap set.
+"""
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-INPUT_PATH = PROJECT_ROOT / "SQL" / "SQL_ORACULO_BACKUP.sql"
+INPUT_PATH = PROJECT_ROOT / "SQL" / "oraculo_schema_only.sql"
 BOOTSTRAP_DIR = PROJECT_ROOT / "SQL" / "bootstrap"
 
 DOC_HEADER = (
-    "-- Generated from SQL/SQL_ORACULO_BACKUP.sql by tools/split_pg_dump_bootstrap.py"
+    "-- Generated from SQL/oraculo_schema_only.sql by tools/split_pg_dump_bootstrap.py"
 )
 TABLE_PREAMBLE_MARKER = "SET default_table_access_method = heap;"
 METADATA_PATTERN = re.compile(r"-- Name: (.*?); Type: ([^;]+); Schema: ([^;]+); Owner:")
@@ -23,7 +30,6 @@ OUTPUT_KEYS = [
     "10_core_schema.sql",
     "20_core_tables.sql",
     "30_core_functions_views.sql",
-    "40_timescale.sql",
 ]
 
 TYPE_ROUTING = {

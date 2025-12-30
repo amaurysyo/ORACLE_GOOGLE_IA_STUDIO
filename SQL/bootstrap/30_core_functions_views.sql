@@ -1,4 +1,4 @@
--- Generated from SQL/SQL_ORACULO_BACKUP.sql by tools/split_pg_dump_bootstrap.py
+-- Generated from SQL/oraculo_schema_only.sql by tools/split_pg_dump_bootstrap.py
 
 CREATE FUNCTION oraculo.f_slicing_blocks(p_instrument_id public.instrument_id_t, p_from timestamp with time zone, p_to timestamp with time zone, p_min_trades integer DEFAULT 1, p_min_qty_btc double precision DEFAULT 0) RETURNS TABLE(instrument_id public.instrument_id_t, block_id bigint, side public.side_t, price double precision, t_start timestamp with time zone, t_end timestamp with time zone, n_trades bigint, qty_btc double precision, duration_s double precision, qty_min double precision, qty_max double precision, qty_stddev double precision, qty_all_equal boolean, qty_almost_equal boolean, pattern text)
     LANGUAGE sql

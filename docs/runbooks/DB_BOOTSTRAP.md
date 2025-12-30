@@ -25,8 +25,12 @@ psql "$PG_DSN" -f SQL/bootstrap/40_timescale.sql
 Si necesitas volver a generar el dump de esquema sin metadatos de permisos ni propietarios:
 
 ```bash
-pg_dump --schema-only --no-owner --no-privileges --format=p --encoding=UTF8 --file SQL/SQL_ORACULO_BACKUP.sql "$PG_DSN"
+pg_dump --schema-only --no-owner --no-privileges --format=p --encoding=UTF8 --file SQL/oraculo_schema_only.sql "$PG_DSN"
+python tools/split_pg_dump_bootstrap.py
+python tools/export_timescale_layer.py
 ```
+
+El archivo `SQL/bootstrap/40_timescale.sql` es generado por `tools/export_timescale_layer.py` y debe conservarse sin ser sobrescrito por el splitter.
 
 ## Verificación mínima
 
