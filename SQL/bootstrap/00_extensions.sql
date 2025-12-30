@@ -1,3 +1,3 @@
--- Generated from SQL/SQL_ORACULO_BACKUP.sql by tools/split_pg_dump_bootstrap.py
+-- Generated from SQL/oraculo_schema_only.sql by tools/split_pg_dump_bootstrap.py
 
 CREATE EXTENSION IF NOT EXISTS timescaledb;
