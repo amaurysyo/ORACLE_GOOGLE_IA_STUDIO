@@ -356,12 +356,12 @@ class DeribitSurfaceBuilder:
 
         spot = await self._fetch_spot(db, bucket_ts)
         if spot is None or spot <= 0:
-            logger.debug("[surface_builder] spot unavailable for bucket %s", bucket_ts)
+            logger.debug("[surface_builder] spot unavailable for bucket {}", bucket_ts)
             return 0
 
         expiries_by_bucket = await self._select_expiries(db, bucket_ts)
         if not expiries_by_bucket:
-            logger.debug("[surface_builder] no expiries for bucket %s", bucket_ts)
+            logger.debug("[surface_builder] no expiries for bucket {}", bucket_ts)
             return 0
 
         rows_to_insert: List[Tuple] = []
@@ -370,7 +370,7 @@ class DeribitSurfaceBuilder:
         for tenor_bucket, expiries in expiries_by_bucket.items():
             if len(expiries) > 1:
                 logger.debug(
-                    "[surface_builder] Aggregating expiries within bucket: n=%s tenor_bucket=%s event_time=%s",
+                    "[surface_builder] Aggregating expiries within bucket: n={} tenor_bucket={} event_time={}",
                     len(expiries),
                     tenor_bucket,
                     bucket_ts,
@@ -425,7 +425,7 @@ class DeribitSurfaceBuilder:
 
             if agg.n_expiries_used > 1:
                 logger.debug(
-                    "[surface_builder] Aggregating expiries within bucket: n=%s tenor_bucket=%s moneyness_bucket=%s event_time=%s",
+                    "[surface_builder] Aggregating expiries within bucket: n={} tenor_bucket={} moneyness_bucket={} event_time={}",
                     agg.n_expiries_used,
                     tenor_bucket,
                     m_bucket,

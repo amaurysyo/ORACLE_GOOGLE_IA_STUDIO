@@ -511,7 +511,7 @@ async def _monitor_event_loop_lag(
             try:
                 on_lag(lag)
             except Exception as exc:  # pragma: no cover - handler defensivo
-                logger.warning("event loop lag handler failed for %s: %s", service, exc)
+                logger.warning("event loop lag handler failed for {}: {}", service, exc)
         expected = loop.time() + period
 
 
@@ -534,7 +534,7 @@ def start_event_loop_lag_monitor(
     )
     _loop_lag_tasks[service].add_done_callback(
         lambda t: logger.warning(
-            "event loop lag monitor for %s stopped: %s", service, t.exception()
+            "event loop lag monitor for {} stopped: {}", service, t.exception()
         )
         if t.cancelled() is False and t.exception() is not None
         else None

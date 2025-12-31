@@ -8,6 +8,7 @@ para calcular deltas de lag/drops.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import random
 import time
@@ -146,7 +147,9 @@ def _pick_symbol(symbols: int, idx: int) -> str:
 
 async def run_loadtest(config: LoadTestConfig) -> LoadTestResult:
     metrics = config.metrics or DEFAULT_METRICS
-    artifacts_dir = config.artifacts_dir or (ARTIFACTS_ROOT / time.strftime("%Y%m%d_%H%M%S"))
+    now = dt.datetime.now()
+    timestamp = now.isoformat(sep="_", timespec="seconds").replace("-", "").replace(":", "")
+    artifacts_dir = config.artifacts_dir or (ARTIFACTS_ROOT / timestamp)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     metrics_before: Dict[str, float] = {}
@@ -169,7 +172,7 @@ async def run_loadtest(config: LoadTestConfig) -> LoadTestResult:
     try:
         async with websockets.connect(config.target_ws, ping_interval=None) as ws:
             logger.info(
-                "Iniciando loadtest: stream=%s rps=%s batch=%s duration=%ss symbols=%s",
+                "Iniciando loadtest: stream={} rps={} batch={} duration={}s symbols={}",
                 stream_choices,
                 config.rps,
                 config.batch_size,
