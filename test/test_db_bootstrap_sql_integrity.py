@@ -9,7 +9,8 @@ BOOTSTRAP_DIR = Path("SQL/bootstrap")
 CORE_BOOTSTRAP_FILES = [
     BOOTSTRAP_DIR / "10_core_schema.sql",
     BOOTSTRAP_DIR / "20_core_tables.sql",
-    BOOTSTRAP_DIR / "30_core_functions_views.sql",
+    BOOTSTRAP_DIR / "30_core_functions.sql",
+    BOOTSTRAP_DIR / "31_core_views.sql",
 ]
 TIMESCALE_BOOTSTRAP = BOOTSTRAP_DIR / "40_timescale.sql"
 
