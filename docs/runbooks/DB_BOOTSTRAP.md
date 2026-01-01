@@ -14,7 +14,8 @@ Ejecuta los scripts en orden usando el DSN configurado:
 psql "$PG_DSN" -f SQL/bootstrap/00_extensions.sql
 psql "$PG_DSN" -f SQL/bootstrap/10_core_schema.sql
 psql "$PG_DSN" -f SQL/bootstrap/20_core_tables.sql
-psql "$PG_DSN" -f SQL/bootstrap/30_core_functions_views.sql
+psql "$PG_DSN" -f SQL/bootstrap/30_core_functions.sql
+psql "$PG_DSN" -f SQL/bootstrap/31_core_views.sql
 psql "$PG_DSN" -f SQL/bootstrap/40_timescale.sql
 ```
 

@@ -29,7 +29,8 @@ OUTPUT_KEYS = [
     "00_extensions.sql",
     "10_core_schema.sql",
     "20_core_tables.sql",
-    "30_core_functions_views.sql",
+    "30_core_functions.sql",
+    "31_core_views.sql",
 ]
 
 TYPE_ROUTING = {
@@ -45,11 +46,11 @@ TYPE_ROUTING = {
     "FK CONSTRAINT": "20_core_tables.sql",
     "SEQUENCE OWNED BY": "20_core_tables.sql",
     "DEFAULT": "20_core_tables.sql",
-    "FUNCTION": "30_core_functions_views.sql",
-    "PROCEDURE": "30_core_functions_views.sql",
-    "VIEW": "30_core_functions_views.sql",
-    "MATERIALIZED VIEW": "30_core_functions_views.sql",
-    "TRIGGER": "30_core_functions_views.sql",
+    "FUNCTION": "30_core_functions.sql",
+    "PROCEDURE": "30_core_functions.sql",
+    "TRIGGER": "30_core_functions.sql",
+    "VIEW": "31_core_views.sql",
+    "MATERIALIZED VIEW": "31_core_views.sql",
 }
 
 
