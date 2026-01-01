@@ -961,7 +961,7 @@ class CPUWorkerProcess(mp.Process):
                     else:
                         logger.warning(f"[cpu-worker] Unknown request type: {req.kind}")
                 except Exception:
-                    logger.exception("[cpu-worker] failed processing request %s", req.kind)
+                    logger.exception("[cpu-worker] failed processing request {}", req.kind)
                     try:
                         self._emit_result(req.kind, None, t0, req.enqueued_at)
                     except Exception:

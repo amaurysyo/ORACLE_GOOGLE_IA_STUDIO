@@ -66,7 +66,7 @@ def _colorize_message(msg: str) -> str:
 
 def _console_format(record: Dict[str, Any]) -> str:
     # Timestamp verde claro, nivel con color propio, todo lo demás blanco salvo tags coloreados.
-    ts = record["time"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    ts = record["time"].replace(tzinfo=None).isoformat(sep=" ", timespec="milliseconds")
     lvl = record["level"].name
     name = record["name"]
     func = record["function"]

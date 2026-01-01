@@ -218,14 +218,14 @@ class AuditOrderbookRunner:
             self._book = LocalOrderBook(new.max_levels_per_side)
             self._task = asyncio.create_task(self._stream_loop(new, self._book))
             logger.info(
-                "Audit orderbook started for %s speed=%s levels=%s",
+                "Audit orderbook started for {} speed={} levels={}",
                 new.symbol,
                 new.stream_speed,
                 new.max_levels_per_side,
             )
         else:
             logger.info(
-                "Audit orderbook soft-update snapshot_interval_ms=%s",
+                "Audit orderbook soft-update snapshot_interval_ms={}",
                 new.snapshot_interval_ms,
             )
 

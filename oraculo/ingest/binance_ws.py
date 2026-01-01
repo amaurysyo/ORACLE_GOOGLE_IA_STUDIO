@@ -128,7 +128,7 @@ class FuturesWSRunner:
                     gap = pu - self._last_depth_u
                     if gap < 0:
                         logger.debug(
-                            "[fut-depth] stale/out-of-order depthUpdate pu=%s < last=%s -> skip",
+                            "[fut-depth] stale/out-of-order depthUpdate pu={} < last={} -> skip",
                             pu,
                             self._last_depth_u,
                         )
@@ -139,7 +139,7 @@ class FuturesWSRunner:
                     # rebasamos baseline y seguimos.
                     if gap >= self._huge_gap_rebase:
                         logger.warning(
-                            "[fut-depth] HUGE gap detected pu=%s last=%s (gap=%s) -> rebase baseline without resub",
+                            "[fut-depth] HUGE gap detected pu={} last={} (gap={}) -> rebase baseline without resub",
                             pu,
                             self._last_depth_u,
                             gap,
@@ -153,7 +153,7 @@ class FuturesWSRunner:
                     # con límite de reintentos para no entrar en bucle infinito.
                     self._depth_gap_streak += 1
                     logger.warning(
-                        "[fut-depth] gap detected pu=%s last=%s (gap=%s) streak=%s -> resync",
+                        "[fut-depth] gap detected pu={} last={} (gap={}) streak={} -> resync",
                         pu,
                         self._last_depth_u,
                         gap,
@@ -165,7 +165,7 @@ class FuturesWSRunner:
                         await self._resync_depth(session)
                     else:
                         logger.error(
-                            "[fut-depth] too many resync attempts (%s), "
+                            "[fut-depth] too many resync attempts ({}), "
                             "disabling strict gap detect and rebasing on current pu",
                             self._depth_gap_streak,
                         )
@@ -242,7 +242,7 @@ class FuturesWSRunner:
                 data = await r.json()
                 last_u = int(data.get("lastUpdateId") or 0)
                 logger.info(
-                    "[fut-depth] fetched snapshot lastUpdateId=%s (solo informativo, no usado para seq)",
+                    "[fut-depth] fetched snapshot lastUpdateId={} (solo informativo, no usado para seq)",
                     last_u,
                 )
         except Exception as e:

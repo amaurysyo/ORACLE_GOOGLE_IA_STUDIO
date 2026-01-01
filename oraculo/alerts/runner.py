@@ -651,7 +651,7 @@ class DBWriter:
                     rule=rule.get("rule", "unknown"), reason="null_from_db"
                 ).inc()
                 logger.warning(
-                    "[db-writer] upsert_rule_alert returned NULL (rule=%s side=%s dedup_key=%s severity=%s profile=%s)",
+                    "[db-writer] upsert_rule_alert returned NULL (rule={} side={} dedup_key={} severity={} profile={})",
                     rule.get("rule"),
                     rule.get("side"),
                     rule.get("dedup_key"),
@@ -668,7 +668,7 @@ class DBWriter:
                     rule=rule.get("rule", "unknown"), reason="ts_first_missing"
                 ).inc()
                 logger.warning(
-                    "[db-writer] ts_first not readable for alert_id=%s (rule=%s dedup_key=%s profile=%s)",
+                    "[db-writer] ts_first not readable for alert_id={} (rule={} dedup_key={} profile={})",
                     alert_id,
                     rule.get("rule"),
                     rule.get("dedup_key"),
@@ -1188,7 +1188,7 @@ async def run_pipeline(
         prev_thread_cpu = prev_proc_cpu
 
     logger.warning(
-        "[alerts][watchdog] enabled=%s lag>=%.3fs lag_immediate>=%.3fs consecutive=%s queue>=%s cooldown=%.1fs",
+        "[alerts][watchdog] enabled={} lag>={:.3f}s lag_immediate>={:.3f}s consecutive={} queue>={} cooldown={:.1f}s",
         watchdog_enabled,
         lag_dump_threshold,
         lag_immediate_threshold,
@@ -1199,7 +1199,7 @@ async def run_pipeline(
 
     def _emit_watchdog_dump(reason: str, lag: float, queue_depth: int, proc_cores: float, main_share: float, threads_total: int) -> None:
         logger.warning(
-            "[alerts][watchdog] DUMP_TRIGGERED reason=%s lag=%.3f queue_depth=%s cooldown=%.1fs proc_cores=%.3f main_thread_share=%.3f threads_total=%s",
+            "[alerts][watchdog] DUMP_TRIGGERED reason={} lag={:.3f} queue_depth={} cooldown={:.1f}s proc_cores={:.3f} main_thread_share={:.3f} threads_total={}",
             reason,
             lag,
             queue_depth,
@@ -1224,7 +1224,7 @@ async def run_pipeline(
         obs_metrics.last_dump_timestamp_seconds.labels(service=service_name).set(time.time())
         obs_metrics.last_dump_lag_seconds.labels(service=service_name, reason=reason).set(lag)
         logger.warning(
-            "[alerts][watchdog] dump reason=%s lag=%.3f queue_depth=%s proc_cores=%.3f main_thread_share=%.3f threads_total=%s\n%s",
+            "[alerts][watchdog] dump reason={} lag={:.3f} queue_depth={} proc_cores={:.3f} main_thread_share={:.3f} threads_total={}\n{}",
             reason,
             lag,
             queue_depth,
@@ -1303,7 +1303,7 @@ async def run_pipeline(
             exc = t.exception()
             if exc is not None:
                 obs_metrics.record_task_exception(service_name, exported_service, label, exc)
-                logger.exception("[alerts] task %s crashed", label, exc_info=exc)
+                logger.opt(exception=exc).error("[alerts] task {} crashed", label)
 
         task.add_done_callback(_on_done)
         return task
@@ -1527,7 +1527,7 @@ async def run_pipeline(
                 rule=rule.get("rule", "unknown"), reason="enqueue_none"
             ).inc()
             logger.warning(
-                "[alerts] enqueue_rule returned None (rule=%s side=%s severity=%s dedup_key=%s type=%s profile=%s)",
+                "[alerts] enqueue_rule returned None (rule={} side={} severity={} dedup_key={} type={} profile={})",
                 rule.get("rule"),
                 rule.get("side"),
                 rule.get("severity"),
