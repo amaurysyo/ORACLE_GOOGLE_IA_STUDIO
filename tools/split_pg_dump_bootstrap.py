@@ -172,7 +172,15 @@ def write_outputs(outputs: Dict[str, List[str]], table_preamble: List[str]) -> N
         segments.extend(outputs.get(key, []))
 
         body = "\n\n".join(segment.rstrip() for segment in segments if segment.strip())
-        content = f"{DOC_HEADER}\n\n{body}\n"
+        if key == "30_core_functions.sql":
+            content = (
+                f"{DOC_HEADER}\n\n"
+                "SET check_function_bodies = false;\n\n"
+                f"{body}\n\n"
+                "SET check_function_bodies = true;\n"
+            )
+        else:
+            content = f"{DOC_HEADER}\n\n{body}\n"
         path.write_text(content, encoding="utf-8")
 
 
