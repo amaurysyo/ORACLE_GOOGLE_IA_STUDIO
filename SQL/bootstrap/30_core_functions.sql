@@ -1,6 +1,9 @@
 -- Generated from SQL/oraculo_schema_only.sql by tools/split_pg_dump_bootstrap.py
 
 
+SET check_function_bodies = false;
+
+
 CREATE FUNCTION oraculo.f_slicing_blocks(p_instrument_id public.instrument_id_t, p_from timestamp with time zone, p_to timestamp with time zone, p_min_trades integer DEFAULT 1, p_min_qty_btc double precision DEFAULT 0) RETURNS TABLE(instrument_id public.instrument_id_t, block_id bigint, side public.side_t, price double precision, t_start timestamp with time zone, t_end timestamp with time zone, n_trades bigint, qty_btc double precision, duration_s double precision, qty_min double precision, qty_max double precision, qty_stddev double precision, qty_all_equal boolean, qty_almost_equal boolean, pattern text)
     LANGUAGE sql
     AS '
@@ -1327,3 +1330,5 @@ ORDER BY tb;
 CREATE TRIGGER trg_opt_instr_touch BEFORE UPDATE ON deribit.options_instruments FOR EACH ROW EXECUTE FUNCTION oraculo.touch_updated_at();
 
 CREATE TRIGGER trg_instr_touch BEFORE UPDATE ON oraculo.instrument_catalog FOR EACH ROW EXECUTE FUNCTION oraculo.touch_updated_at();
+
+SET check_function_bodies = true;
