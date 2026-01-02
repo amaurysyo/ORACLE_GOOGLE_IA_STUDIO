@@ -669,10 +669,15 @@ def render_refresh_policies(
 
 
 def ensure_no_internal_names(content: str) -> None:
-    banned_tokens = ("_timescaledb_internal", "_materialized_hypertable_")
-    for token in banned_tokens:
-        if token in content:
-            raise ValueError(f"Generated SQL contains forbidden token: {token}")
+    patterns = [
+        r"create_hypertable\([^;]*_timescaledb_internal",
+        r"create_hypertable\([^;]*_materialized_hypertable_",
+        r"ALTER\s+TABLE\s+\"?_timescaledb_",
+    ]
+
+    for pattern in patterns:
+        if re.search(pattern, content, re.IGNORECASE | re.DOTALL):
+            raise ValueError(f"Generated SQL contains forbidden target pattern: {pattern}")
 
 
 async def generate() -> str:
