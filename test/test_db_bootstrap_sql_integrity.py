@@ -89,3 +89,30 @@ def test_timescale_bootstrap_excludes_internal_relations() -> None:
     assert not re.search(materialized_pattern, sql, re.IGNORECASE | re.DOTALL), (
         "Timescale bootstrap must not target materialized hypertables"
     )
+
+    internal_schema_pattern = r"create_hypertable\([^;]*\"?_timescaledb_"
+    assert not re.search(internal_schema_pattern, sql, re.IGNORECASE | re.DOTALL), (
+        "Timescale bootstrap must not target _timescaledb_* schemas"
+    )
+
+
+def test_timescale_compression_settings_require_enablement() -> None:
+    assert TIMESCALE_BOOTSTRAP.exists(), f"Timescale bootstrap file is missing: {TIMESCALE_BOOTSTRAP}"
+    sql = TIMESCALE_BOOTSTRAP.read_text(encoding="utf-8")
+
+    alter_statements = re.finditer(r"ALTER\s+TABLE\b.*?;", sql, re.IGNORECASE | re.DOTALL)
+    violations = []
+    for statement_match in alter_statements:
+        statement = statement_match.group(0)
+        normalized = statement.lower()
+        has_segment_or_order = (
+            "timescaledb.compress_segmentby" in normalized
+            or "timescaledb.compress_orderby" in normalized
+        )
+        if has_segment_or_order and "timescaledb.compress = true" not in normalized:
+            violations.append(statement.strip())
+
+    assert not violations, (
+        "Compression settings must be paired with timescaledb.compress = true "
+        "in the same ALTER TABLE statement:\n" + "\n\n".join(violations)
+    )
