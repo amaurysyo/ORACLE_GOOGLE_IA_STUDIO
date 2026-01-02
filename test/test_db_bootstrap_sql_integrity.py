@@ -75,3 +75,17 @@ def test_timescale_bootstrap_contains_hypertable_creation_and_usage() -> None:
         "Timescale bootstrap must reference Timescale features to be meaningful:\n"
         + ", ".join(timescaledb_tokens)
     )
+
+
+def test_timescale_bootstrap_excludes_internal_relations() -> None:
+    assert TIMESCALE_BOOTSTRAP.exists(), f"Timescale bootstrap file is missing: {TIMESCALE_BOOTSTRAP}"
+    sql = TIMESCALE_BOOTSTRAP.read_text(encoding="utf-8")
+
+    assert 'create_hypertable(\'"_timescaledb_' not in sql, (
+        "Timescale bootstrap must not attempt to hypertablize internal Timescale relations"
+    )
+
+    materialized_pattern = r"create_hypertable\([^;]*_materialized_hypertable_"
+    assert not re.search(materialized_pattern, sql, re.IGNORECASE | re.DOTALL), (
+        "Timescale bootstrap must not target materialized hypertables"
+    )
