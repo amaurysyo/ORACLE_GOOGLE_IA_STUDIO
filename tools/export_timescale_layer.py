@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import numbers
 from dataclasses import dataclass, field
@@ -280,6 +281,9 @@ async def fetch_compression_settings(
             """
         )
         for row in rows:
+            key = (row["hypertable_schema"], row["hypertable_name"])
+            if not is_allowed_hypertable_target(*key):
+                continue
             compression_states[(row["hypertable_schema"], row["hypertable_name"])] = row["compression_state"]
 
     compression_settings_available = bool(
@@ -308,6 +312,8 @@ async def fetch_compression_settings(
         grouped: Dict[tuple[str, str], CompressionSettings] = {}
         for row in rows:
             key = (row["hypertable_schema"], row["hypertable_name"])
+            if not is_allowed_hypertable_target(*key):
+                continue
             settings = grouped.setdefault(
                 key, CompressionSettings(enabled=False, segment_by=[], order_by=[])
             )
@@ -361,9 +367,13 @@ async def fetch_compression_policies(jobs: Iterable[asyncpg.Record]) -> List[Com
         if job.get("proc_name") != "policy_compression":
             continue
 
-        config = job.get("config") or {}
+        config = normalize_job_config(job.get("config"))
         hypertable_schema = job.get("hypertable_schema")
         hypertable_name = job.get("hypertable_name")
+        if not hypertable_schema or not hypertable_name:
+            continue
+        if not is_allowed_hypertable_target(hypertable_schema, hypertable_name):
+            continue
         compress_after = config.get("compress_after")
         if hypertable_schema and hypertable_name and compress_after is not None:
             policies.append(
@@ -387,7 +397,7 @@ async def fetch_retention_policies(
         if job.get("proc_name") != "policy_retention":
             continue
 
-        config = job.get("config") or {}
+        config = normalize_job_config(job.get("config"))
         drop_after = config.get("drop_after")
         schema = job.get("hypertable_schema") or job.get("table_schema")
         name = job.get("hypertable_name") or job.get("table_name")
@@ -443,7 +453,7 @@ async def fetch_refresh_policies(
         if job.get("proc_name") != "policy_refresh_continuous_aggregate":
             continue
 
-        config = job.get("config") or {}
+        config = normalize_job_config(job.get("config"))
         schema = job.get("hypertable_schema") or job.get("table_schema")
         name = job.get("hypertable_name") or job.get("table_name")
 
@@ -489,6 +499,19 @@ def build_policy_guard(proc_name: str, schema: str, name: str, job_columns: Sequ
     )
 
 
+def normalize_job_config(config: object) -> dict:
+    if isinstance(config, dict):
+        return config
+    if isinstance(config, str):
+        try:
+            parsed = json.loads(config)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
 def render_hypertables(hypertables: Iterable[Hypertable]) -> List[str]:
     statements: List[str] = []
 
@@ -529,28 +552,43 @@ def render_hypertables(hypertables: Iterable[Hypertable]) -> List[str]:
     return statements
 
 
-def render_compression_settings(settings_map: Dict[tuple[str, str], CompressionSettings]) -> List[str]:
+def render_compression_settings(
+    settings_map: Dict[tuple[str, str], CompressionSettings],
+    compression_policy_targets: Iterable[tuple[str, str]],
+) -> List[str]:
     statements: List[str] = []
-    for (schema, name), settings in sorted(settings_map.items()):
-        if not settings.enabled:
-            continue
+    targets: set[tuple[str, str]] = set()
 
+    for key, settings in settings_map.items():
+        if settings.enabled or settings.segment_by or settings.order_by:
+            if is_allowed_hypertable_target(*key):
+                targets.add(key)
+
+    for policy_target in compression_policy_targets:
+        if is_allowed_hypertable_target(*policy_target):
+            targets.add(policy_target)
+
+    for schema, name in sorted(targets):
+        settings = settings_map.get((schema, name), CompressionSettings(enabled=False, segment_by=[], order_by=[]))
         qualified = qualify_name(schema, name)
-        statements.append(f"ALTER TABLE {qualified} SET (timescaledb.compress);")
 
-        if settings.segment_by:
-            segment_val = ", ".join(quote_ident(col) for col in settings.segment_by if col)
-            if segment_val:
-                statements.append(
-                    f"ALTER TABLE {qualified} SET (timescaledb.compress_segmentby='{segment_val}');"
-                )
+        option_parts = ["timescaledb.compress = true"]
 
-        if settings.order_by:
-            order_val = ", ".join(settings.order_by)
-            if order_val:
-                statements.append(
-                    f"ALTER TABLE {qualified} SET (timescaledb.compress_orderby='{order_val}');"
-                )
+        segment_val = ", ".join(quote_ident(col) for col in settings.segment_by if col)
+        if segment_val:
+            option_parts.append(f"timescaledb.compress_segmentby = {literal(segment_val)}")
+
+        order_val = ", ".join(settings.order_by)
+        if order_val:
+            option_parts.append(f"timescaledb.compress_orderby = {literal(order_val)}")
+
+        options_sql = ",\n        ".join(option_parts)
+        statements.append(
+            f"ALTER TABLE {qualified}\n"
+            "    SET (\n"
+            f"        {options_sql}\n"
+            "    );"
+        )
 
     return statements
 
@@ -672,12 +710,14 @@ async def generate() -> str:
     segments.append("-- Generated by tools/export_timescale_layer.py")
     segments.append("CREATE EXTENSION IF NOT EXISTS timescaledb;")
 
+    compression_policy_targets = {(policy.schema, policy.name) for policy in compression_policies}
+
     segments.extend(render_hypertables(hypertables))
-    segments.extend(render_compression_settings(compression_settings))
+    segments.extend(render_compression_settings(compression_settings, compression_policy_targets))
     segments.extend(render_compression_policies(compression_policies, job_columns))
-    segments.extend(render_retention_policies(retention_policies, job_columns))
     segments.extend(render_caggs(caggs))
     segments.extend(render_refresh_policies(refresh_policies, job_columns))
+    segments.extend(render_retention_policies(retention_policies, job_columns))
 
     content = "\n\n".join(segment for segment in segments if segment.strip()) + "\n"
     ensure_no_internal_names(content)
