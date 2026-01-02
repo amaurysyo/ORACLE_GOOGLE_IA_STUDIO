@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
+import json
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from loguru import logger
@@ -137,7 +138,7 @@ class DeribitSurfaceBuilder:
         sql = """
             SELECT underlying_price
             FROM deribit.options_ticker
-            WHERE event_time >= $2 - interval '1 seconds' * $3
+            WHERE event_time >= ($2::timestamptz) - make_interval(secs => $3)
               AND instrument_id LIKE $1
             ORDER BY event_time DESC
             LIMIT 1
@@ -195,8 +196,8 @@ class DeribitSurfaceBuilder:
             JOIN deribit.options_instruments i ON i.instrument_id = t.instrument_id
             WHERE i.underlying = $1
               AND i.expiry = $2
-              AND t.event_time >= $3 - interval '1 seconds' * $4
-              AND t.event_time <= $3 + interval '5 seconds'
+              AND t.event_time >= ($3::timestamptz) - make_interval(secs => $4)
+              AND t.event_time <= ($3::timestamptz) + make_interval(secs => 5)
             ORDER BY t.event_time DESC
         """
         rows = await db.fetch(sql, self.cfg.underlying, expiry, bucket_ts, int(self.cfg.lookback_s))
@@ -454,8 +455,10 @@ class DeribitSurfaceBuilder:
             if missing_counts:
                 meta["n_components_missing"] = missing_counts
 
+            meta_json = json.dumps(meta, ensure_ascii=False)
+
             rows_to_insert.append(
-                (self.cfg.underlying, bucket_ts, tenor_bucket, m_bucket, iv_val, rr_val, bf_val, meta)
+                (self.cfg.underlying, bucket_ts, tenor_bucket, m_bucket, iv_val, rr_val, bf_val, meta_json)
             )
 
         if not rows_to_insert:
