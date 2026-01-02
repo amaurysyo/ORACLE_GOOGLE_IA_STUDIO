@@ -12,6 +12,22 @@ import asyncpg
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_PATH = PROJECT_ROOT / "SQL" / "bootstrap" / "40_timescale.sql"
+ALLOWED_HYPERTABLE_SCHEMAS = {
+    "public",
+    "oraculo",
+    "oraculo_bt",
+    "oraculo_audit",
+    "binance_futures",
+    "binance_spot",
+    "deribit",
+}
+DISALLOWED_HYPERTABLE_SCHEMAS = {
+    "timescaledb_information",
+    "timescaledb_experimental",
+    "_timescaledb_functions",
+}
+INTERNAL_SCHEMA_PREFIX = "_timescaledb_"
+MATERIALIZED_HYPERTABLE_PREFIX = "_materialized_hypertable_"
 
 
 @dataclass
@@ -143,6 +159,18 @@ def format_interval_literal(value: object) -> str:
     return text
 
 
+def is_allowed_hypertable_target(schema: str, name: str) -> bool:
+    if schema.startswith(INTERNAL_SCHEMA_PREFIX):
+        return False
+    if schema in DISALLOWED_HYPERTABLE_SCHEMAS:
+        return False
+    if name.startswith(MATERIALIZED_HYPERTABLE_PREFIX):
+        return False
+    if schema not in ALLOWED_HYPERTABLE_SCHEMAS:
+        return False
+    return True
+
+
 async def fetch_hypertables(
     conn: asyncpg.Connection, dimension_columns: Sequence[str], hypertable_columns: Sequence[str]
 ) -> List[Hypertable]:
@@ -175,7 +203,10 @@ async def fetch_hypertables(
             """
         )
         for row in rows:
-            hypertables_raw[(row["hypertable_schema"], row["hypertable_name"])] = row["chunk_time_interval"]
+            key = (row["hypertable_schema"], row["hypertable_name"])
+            if not is_allowed_hypertable_target(*key):
+                continue
+            hypertables_raw[key] = row["chunk_time_interval"]
 
     hypertables: List[Hypertable] = []
     for row in dimensions:
@@ -188,6 +219,8 @@ async def fetch_hypertables(
             is_time_dimension = row["dimension_number"] == 0
 
         key = (row["hypertable_schema"], row["hypertable_name"])
+        if not is_allowed_hypertable_target(*key):
+            continue
 
         if is_time_dimension:
             interval_value = row.get("interval_length")
@@ -216,8 +249,12 @@ async def fetch_hypertables(
         if is_time_dimension:
             continue
 
+        key = (row["hypertable_schema"], row["hypertable_name"])
+        if not is_allowed_hypertable_target(*key):
+            continue
+
         partitions = row.get("num_partitions") or row.get("number_partitions")
-        partitions_map.setdefault((row["hypertable_schema"], row["hypertable_name"]), []).append(
+        partitions_map.setdefault(key, []).append(
             PartitionDimension(column_name=row["column_name"], partitions=partitions)
         )
 
