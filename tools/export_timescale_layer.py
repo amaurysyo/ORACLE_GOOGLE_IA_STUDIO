@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import numbers
 from dataclasses import dataclass, field
@@ -366,7 +367,7 @@ async def fetch_compression_policies(jobs: Iterable[asyncpg.Record]) -> List[Com
         if job.get("proc_name") != "policy_compression":
             continue
 
-        config = job.get("config") or {}
+        config = normalize_job_config(job.get("config"))
         hypertable_schema = job.get("hypertable_schema")
         hypertable_name = job.get("hypertable_name")
         if not hypertable_schema or not hypertable_name:
@@ -396,7 +397,7 @@ async def fetch_retention_policies(
         if job.get("proc_name") != "policy_retention":
             continue
 
-        config = job.get("config") or {}
+        config = normalize_job_config(job.get("config"))
         drop_after = config.get("drop_after")
         schema = job.get("hypertable_schema") or job.get("table_schema")
         name = job.get("hypertable_name") or job.get("table_name")
@@ -452,7 +453,7 @@ async def fetch_refresh_policies(
         if job.get("proc_name") != "policy_refresh_continuous_aggregate":
             continue
 
-        config = job.get("config") or {}
+        config = normalize_job_config(job.get("config"))
         schema = job.get("hypertable_schema") or job.get("table_schema")
         name = job.get("hypertable_name") or job.get("table_name")
 
@@ -496,6 +497,19 @@ def build_policy_guard(proc_name: str, schema: str, name: str, job_columns: Sequ
         f"WHERE proc_name = {literal(proc_name)}{predicate_sql}"
         ")"
     )
+
+
+def normalize_job_config(config: object) -> dict:
+    if isinstance(config, dict):
+        return config
+    if isinstance(config, str):
+        try:
+            parsed = json.loads(config)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
 
 
 def render_hypertables(hypertables: Iterable[Hypertable]) -> List[str]:
