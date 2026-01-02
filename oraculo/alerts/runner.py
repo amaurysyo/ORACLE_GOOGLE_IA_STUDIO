@@ -1076,6 +1076,19 @@ async def run_pipeline(
             symbol = getattr(cfg_obj.app, "symbol", symbol)
         except Exception:
             pass
+
+    def _attach_task_monitor(task: asyncio.Task, label: str) -> asyncio.Task:
+        def _on_done(t: asyncio.Task) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                obs_metrics.record_task_exception(service_name, exported_service, label, exc)
+                logger.opt(exception=exc).error("[alerts] task {} crashed", label)
+
+        task.add_done_callback(_on_done)
+        return task
+
     surface_builder_cfg = SurfaceBuilderCfg()
     if cfg_mgr is not None and getattr(cfg_mgr, "cfg", None) is not None:
         try:
@@ -1295,18 +1308,6 @@ async def run_pipeline(
     )
     if lag_monitor_task is not None:
         background_tasks.append(lag_monitor_task)
-
-    def _attach_task_monitor(task: asyncio.Task, label: str) -> asyncio.Task:
-        def _on_done(t: asyncio.Task) -> None:
-            if t.cancelled():
-                return
-            exc = t.exception()
-            if exc is not None:
-                obs_metrics.record_task_exception(service_name, exported_service, label, exc)
-                logger.opt(exception=exc).error("[alerts] task {} crashed", label)
-
-        task.add_done_callback(_on_done)
-        return task
 
     db_dsn = getattr(db, "_dsn", None)
     worker_rules = cfg_mgr.rules if cfg_mgr is not None else {}
