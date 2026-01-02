@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
+import json
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from loguru import logger
@@ -454,8 +455,10 @@ class DeribitSurfaceBuilder:
             if missing_counts:
                 meta["n_components_missing"] = missing_counts
 
+            meta_json = json.dumps(meta, ensure_ascii=False)
+
             rows_to_insert.append(
-                (self.cfg.underlying, bucket_ts, tenor_bucket, m_bucket, iv_val, rr_val, bf_val, meta)
+                (self.cfg.underlying, bucket_ts, tenor_bucket, m_bucket, iv_val, rr_val, bf_val, meta_json)
             )
 
         if not rows_to_insert:
