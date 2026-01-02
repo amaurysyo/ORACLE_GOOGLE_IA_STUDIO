@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import numbers
+import re
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -734,9 +735,19 @@ def write_output(content: str) -> None:
     OUTPUT_PATH.write_text(content, encoding="utf-8")
 
 
-def main() -> None:
-    content = asyncio.run(generate())
+async def async_main() -> None:
+    content = await generate()
     write_output(content)
+
+
+def main() -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(async_main())
+        return
+
+    loop.create_task(async_main())
 
 
 if __name__ == "__main__":
