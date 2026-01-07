@@ -567,8 +567,9 @@ def ingest_run() -> None:
         )
         batcher.register_stmt(
             "bfut_mark",
-            "INSERT INTO binance_futures.mark_funding(instrument_id,event_time,mark_price,index_price,funding_rate,next_funding_time,basis_bps,meta)"
-            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb) ON CONFLICT DO NOTHING",
+            "INSERT INTO binance_futures.mark_funding("
+            "instrument_id,event_time,mark_price,index_price,est_settle_price,funding_rate,next_funding_time,basis_bps,meta)"
+            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) ON CONFLICT DO NOTHING",
         )
         batcher.register_stmt(
             "bfut_liq",

@@ -347,12 +347,13 @@ class FuturesWSRunner:
         event_time = _ms_to_ts(p.get("E") or p.get("eventTime", 0))
         mark = _to_float(p.get("p") or p.get("markPrice"))
         index = _to_float(p.get("i") or p.get("indexPrice"))
+        est_settle = _to_float(p.get("P") or p.get("estimatedSettlePrice"))
         fr = _to_float(p.get("r") or p.get("fundingRate"))
         nfund_ms = p.get("T") or p.get("nextFundingTime")
         next_funding = _ms_to_ts(nfund_ms) if isinstance(nfund_ms, int) else None
         basis_bps = ((mark - index) / index * 10000.0) if (mark is not None and index not in (None, 0.0)) else None
         meta = json.dumps({})
-        row = (BINANCE_FUT_INST, event_time, mark, index, fr, next_funding, basis_bps, meta)
+        row = (BINANCE_FUT_INST, event_time, mark, index, est_settle, fr, next_funding, basis_bps, meta)
         self._batcher.add("bfut_mark", row)
 
     async def _handle_liq(self, p: dict[str, Any]) -> None:

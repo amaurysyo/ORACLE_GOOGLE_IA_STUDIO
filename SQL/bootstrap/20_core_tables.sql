@@ -7,6 +7,7 @@ CREATE TABLE binance_futures.mark_funding (
     event_time timestamp with time zone NOT NULL,
     mark_price double precision NOT NULL,
     index_price double precision,
+    est_settle_price numeric(18,8),
     funding_rate double precision,
     next_funding_time timestamp with time zone,
     basis_bps double precision,
