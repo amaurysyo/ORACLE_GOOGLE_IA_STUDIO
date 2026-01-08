@@ -877,6 +877,10 @@ class TapePressureCfg:
     window_s: float = 3.0
     buy_thr: float = 0.8
     sell_thr: float = 0.2
+    min_trades: int = 0
+    min_qty_btc: float = 0.0
+    max_spread_usd: float = 0.0
+    hold_ms: int = 0
     retrigger_s: int = 20
 
 class TapePressureDetector:
@@ -887,31 +891,95 @@ class TapePressureDetector:
     def __init__(self, cfg: TapePressureCfg):
         self.cfg = cfg
         self._win: List[Tuple[float, str, float, float]] = []
-        self._last_emit_ts: float = 0.0
+        self._last_emit_ts: Dict[str, float] = {"buy": 0.0, "sell": 0.0}
+        self._hold_start: Dict[str, Optional[float]] = {"buy": None, "sell": None}
 
-    def on_trade(self, ts: float, side: str, price: float, qty: float) -> Optional[Event]:
+    def _reset_holds(self) -> None:
+        self._hold_start["buy"] = None
+        self._hold_start["sell"] = None
+
+    def on_trade(
+        self,
+        ts: float,
+        side: str,
+        price: float,
+        qty: float,
+        *,
+        spread_usd: Optional[float] = None,
+    ) -> Optional[Event]:
         self._win.append((ts, side, price, qty))
         cutoff = ts - self.cfg.window_s
         while self._win and self._win[0][0] < cutoff:
             self._win.pop(0)
 
-        buy = sum(q for _, s, _, q in self._win if s == "buy")
-        sell = sum(q for _, s, _, q in self._win if s == "sell")
-        tot = buy + sell
-        if tot <= 0:
-            return None
-        ratio = buy / tot
+        buy_qty = sum(q for _, s, _, q in self._win if s == "buy")
+        sell_qty = sum(q for _, s, _, q in self._win if s == "sell")
+        tot_qty = buy_qty + sell_qty
+        n_trades = len(self._win)
 
-        if (ts - self._last_emit_ts) < self.cfg.retrigger_s:
+        if tot_qty <= 0:
+            self._reset_holds()
             return None
 
+        if self.cfg.min_trades > 0 and n_trades < self.cfg.min_trades:
+            self._reset_holds()
+            return None
+
+        if self.cfg.min_qty_btc > 0 and tot_qty < self.cfg.min_qty_btc:
+            self._reset_holds()
+            return None
+
+        if self.cfg.max_spread_usd > 0 and spread_usd is not None and spread_usd > self.cfg.max_spread_usd:
+            self._reset_holds()
+            return None
+
+        ratio = buy_qty / tot_qty
+        ofi = (buy_qty - sell_qty) / tot_qty
+
+        cond_side: Optional[str] = None
         if ratio >= self.cfg.buy_thr:
-            self._last_emit_ts = ts
-            return Event("tape_pressure", "buy", ts, price, ratio, {"window_s": self.cfg.window_s})
-        if ratio <= self.cfg.sell_thr:
-            self._last_emit_ts = ts
-            return Event("tape_pressure", "sell", ts, price, ratio, {"window_s": self.cfg.window_s})
-        return None
+            cond_side = "buy"
+        elif ratio <= self.cfg.sell_thr:
+            cond_side = "sell"
+
+        if cond_side is None:
+            self._reset_holds()
+            return None
+
+        other_side = "sell" if cond_side == "buy" else "buy"
+        self._hold_start[other_side] = None
+
+        if self.cfg.hold_ms > 0:
+            hold_start = self._hold_start[cond_side]
+            if hold_start is None:
+                self._hold_start[cond_side] = ts
+                return None
+            if (ts - hold_start) * 1000.0 < self.cfg.hold_ms:
+                return None
+
+        if (ts - self._last_emit_ts[cond_side]) < self.cfg.retrigger_s:
+            return None
+
+        self._last_emit_ts[cond_side] = ts
+        self._hold_start[cond_side] = ts
+        return Event(
+            "tape_pressure",
+            cond_side,
+            ts,
+            price,
+            ratio,
+            {
+                "window_s": self.cfg.window_s,
+                "ratio": ratio,
+                "ofi": ofi,
+                "buy_qty": buy_qty,
+                "sell_qty": sell_qty,
+                "tot_qty": tot_qty,
+                "n_trades": n_trades,
+                "spread_usd": spread_usd,
+                "hold_ms": self.cfg.hold_ms,
+            },
+        )
 
 # --------- Opciones (Deribit): IV spikes R19/R20 ---------
 @dataclass
