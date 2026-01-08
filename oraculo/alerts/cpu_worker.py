@@ -534,9 +534,21 @@ def _apply_rules_to_detectors(
 
     tp = det.get("tape_pressure") or {}
     tape_det.cfg.window_s = float(tp.get("window_s", tape_det.cfg.window_s))
-    tape_det.cfg.buy_thr = float(tp.get("buy_thr", tape_det.cfg.buy_thr))
-    tape_det.cfg.sell_thr = float(tp.get("sell_thr", tape_det.cfg.sell_thr))
+    tape_det.cfg.min_trades = int(tp.get("min_trades", tape_det.cfg.min_trades))
+    tape_det.cfg.min_qty_btc = float(tp.get("min_qty_btc", tp.get("min_qty", tape_det.cfg.min_qty_btc)))
+    tape_det.cfg.max_spread_usd = float(tp.get("max_spread_usd", tp.get("max_spread", tape_det.cfg.max_spread_usd)))
+    tape_det.cfg.hold_ms = int(tp.get("hold_ms", tape_det.cfg.hold_ms))
     tape_det.cfg.retrigger_s = int(tp.get("retrigger_s", tape_det.cfg.retrigger_s))
+    buy_thr = tp.get("buy_thr", tape_det.cfg.buy_thr)
+    sell_thr = tp.get("sell_thr", tape_det.cfg.sell_thr)
+    ofi_up = tp.get("ofi_up")
+    ofi_down = tp.get("ofi_down")
+    if ofi_up is not None:
+        buy_thr = (float(ofi_up) + 1.0) / 2.0
+    if ofi_down is not None:
+        sell_thr = (float(ofi_down) + 1.0) / 2.0
+    tape_det.cfg.buy_thr = max(0.0, min(1.0, float(buy_thr)))
+    tape_det.cfg.sell_thr = max(0.0, min(1.0, float(sell_thr)))
 
     logger.info(
         f"[cpu-worker] Rules applied: slicing={s} absorption={a} bw={b} pass={p} "
@@ -1029,7 +1041,7 @@ class CPUWorkerProcess(mp.Process):
         ev_abs = det_abs.on_trade(ts, side, px, qty)
 
         snap = engine.get_snapshot(ts)
-        ev_tp = tape_det.on_trade(ts, side, px, qty)
+        ev_tp = tape_det.on_trade(ts, side, px, qty, spread_usd=snap.spread_usd)
 
         bw_event: Optional[Event] = None
         bw_gating: Optional[str] = None
