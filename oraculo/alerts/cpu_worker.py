@@ -448,6 +448,9 @@ def _apply_rules_to_detectors(
     det_pass.cfg.gap_ms = int(p.get("gap_ms", det_pass.cfg.gap_ms))
     det_pass.cfg.k_min = int(p.get("k_min", det_pass.cfg.k_min))
     det_pass.cfg.qty_min = float(p.get("qty_min", det_pass.cfg.qty_min))
+    det_pass.cfg.require_equal = bool(p.get("require_equal", det_pass.cfg.require_equal))
+    det_pass.cfg.equal_tol_pct = float(p.get("equal_tol_pct", det_pass.cfg.equal_tol_pct))
+    det_pass.cfg.equal_tol_abs = p.get("equal_tol_abs", det_pass.cfg.equal_tol_abs)
 
     # dominancia
     d = det.get("dominance") or {}
@@ -1000,11 +1003,9 @@ class CPUWorkerProcess(mp.Process):
         payload: Dict[str, Any],
     ) -> DepthProcessResult:
         engine.on_depth(payload["ts"], payload["side"], payload["action"], payload["price"], payload["qty"])
-        passive_event: Optional[Event] = None
-        if payload["action"] == "insert" and payload["qty"] > 0:
-            passive_event = det_pass.on_depth(
-                payload["ts"], payload["side"], payload["price"], payload["qty"]
-            )
+        passive_event = det_pass.on_depth(
+            payload["ts"], payload["side"], payload["action"], payload["price"], payload["qty"]
+        )
 
         bb, ba = engine.book.best()
         book_qty = engine.book.bids.get(payload["price"]) if payload["side"] == "buy" else engine.book.asks.get(payload["price"])

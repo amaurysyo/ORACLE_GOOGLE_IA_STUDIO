@@ -110,6 +110,9 @@ class SlicingPassConfig:
     gap_ms: int = 120
     k_min: int = 6
     qty_min: float = 5.0
+    require_equal: bool = False
+    equal_tol_pct: float = 0.0
+    equal_tol_abs: Optional[float] = 0.0
 
 class SlicingPassiveDetector:
     """
@@ -124,8 +127,17 @@ class SlicingPassiveDetector:
         self._last_price: Optional[float] = None
         self._k: int = 0
         self._acc_qty: float = 0.0
+        self._ref_qty: Optional[float] = None
 
-    def on_depth(self, ts: float, side: str, price: float, qty: float) -> Optional[Event]:
+    @staticmethod
+    def _equal(a: float, b: float, tol_pct: float, tol_abs: Optional[float]) -> bool:
+        if tol_abs is not None and abs(a - b) <= tol_abs:
+            return True
+        if a == 0 or b == 0:
+            return abs(a - b) <= (tol_abs or 0.0)
+        return abs(a - b) / max(abs(a), abs(b)) <= max(tol_pct, 0.0)
+
+    def on_depth(self, ts: float, side: str, action: str, price: float, qty: float) -> Optional[Event]:
         gap_s = self.cfg.gap_ms / 1000.0
         same_bucket = (
             self._last_ts is not None
@@ -133,13 +145,35 @@ class SlicingPassiveDetector:
             and self._last_side == side
             and (self._last_price == price)
         )
+
+        if action == "delete":
+            if same_bucket:
+                self._k = 0
+                self._acc_qty = 0.0
+                self._ref_qty = None
+            return None
+
+        if action != "insert":
+            return None
+
         if not same_bucket:
             self._k = 0
             self._acc_qty = 0.0
+            self._ref_qty = None
 
         self._last_ts = ts
         self._last_side = side
         self._last_price = price
+
+        if self.cfg.require_equal:
+            if self._ref_qty is None:
+                self._ref_qty = qty
+            is_eq = self._equal(qty, self._ref_qty, self.cfg.equal_tol_pct, self.cfg.equal_tol_abs)
+            if not is_eq:
+                self._k = 0
+                self._acc_qty = 0.0
+                self._ref_qty = qty
+
         self._k += 1
         self._acc_qty += qty
 
