@@ -1307,7 +1307,7 @@ class IVSpikeDetector:
 
     def _surface_row_now(self, db: Any, ts_now: float) -> Optional[Dict[str, Any]]:
         sql = """
-            SELECT event_time, iv, rr_25d, bf_25d, n_used, meta_json
+            SELECT event_time, iv, rr_25d, bf_25d, (meta->>'n_used_total')::int as n_used, meta as meta_json
             FROM deribit.options_iv_surface
             WHERE underlying=$1 AND tenor_bucket=$2 AND moneyness_bucket=$3
               AND event_time >= (to_timestamp($4) - ($5 || ' seconds')::interval)
@@ -1326,7 +1326,7 @@ class IVSpikeDetector:
 
     def _surface_row_prev(self, db: Any, ts_now: float) -> Optional[Dict[str, Any]]:
         sql = """
-            SELECT event_time, iv, rr_25d, bf_25d, n_used, meta_json
+            SELECT event_time, iv, rr_25d, bf_25d, (meta->>'n_used_total')::int as n_used, meta as meta_json
             FROM deribit.options_iv_surface
             WHERE underlying=$1 AND tenor_bucket=$2 AND moneyness_bucket=$3
               AND event_time <= (to_timestamp($4) - ($5 || ' seconds')::interval)
@@ -1370,8 +1370,8 @@ class IVSpikeDetector:
                   AND t.event_time <= to_timestamp(${ts_cut_idx})
                   AND t.mark_iv IS NOT NULL
                   AND t.underlying_price IS NOT NULL
-                  AND i.expiration >= to_timestamp(${ts_now_idx})
-                  AND i.expiration <= (to_timestamp(${ts_now_idx}) + (${expiry_days_idx} || ' days')::interval)
+                  AND i.expiry >= to_timestamp(${ts_now_idx})
+                  AND i.expiry <= (to_timestamp(${ts_now_idx}) + (${expiry_days_idx} || ' days')::interval)
                   AND i.strike BETWEEN (t.underlying_price*(1-${moneyness_idx})) AND (t.underlying_price*(1+${moneyness_idx}))
         """
 
