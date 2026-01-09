@@ -80,10 +80,10 @@ def test_slicing_passive_still_triggers_on_delta_inserts():
     det = SlicingPassiveDetector(SlicingPassConfig(gap_ms=200, k_min=3, qty_min=4.0))
 
     ts = 50.0
-    assert det.on_depth(ts, "buy", 100.0, 1.5) is None
-    assert det.on_depth(ts + 0.05, "buy", 100.0, 1.5) is None
+    assert det.on_depth(ts, "buy", "insert", 100.0, 1.5) is None
+    assert det.on_depth(ts + 0.05, "buy", "insert", 100.0, 1.5) is None
 
-    ev = det.on_depth(ts + 0.10, "buy", 100.0, 1.2)
+    ev = det.on_depth(ts + 0.10, "buy", "insert", 100.0, 1.2)
     assert ev is not None
     assert ev.kind == "slicing_pass"
     assert ev.intensity == pytest.approx(4.2)
