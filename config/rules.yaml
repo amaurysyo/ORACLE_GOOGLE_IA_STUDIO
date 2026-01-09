@@ -244,7 +244,7 @@ detectors:
     min_oi: 0.0
 
   iv_spike:
-    enabled: false
+    enabled: true
     poll_s: 30
     retrigger_s: 900
     underlying: "BTC"
@@ -256,9 +256,9 @@ detectors:
     lookback_s: 900
     window_s: 300                # delta IV entre now y now-window_s
 
-    dv_warn: 0.05                # 3 vol points (si iv en decimales)
+    dv_warn: 0.06                # 3 vol points (si iv en decimales)
     dv_strong: 0.10
-    vel_warn_per_s: 0.00015      # opcional
+    vel_warn_per_s: 0.00030      # opcional
     vel_strong_per_s: 0.00025
     use_velocity_gate: true
 
@@ -269,7 +269,7 @@ detectors:
     require_positive_spike: true # true => solo IV sube; false => también shock a la baja
 
     # fallback
-    fallback_to_ticker: false
+    fallback_to_ticker: false # Vital: avoid noise
     ticker_delta_gate_enabled: true
     ticker_delta_min: 0.35
     ticker_delta_max: 0.65

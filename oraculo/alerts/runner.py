@@ -1447,19 +1447,20 @@ async def run_pipeline(
 
             if mark_iv is None or float(mark_iv) <= 0.0:
                 telemetry.bump(ts_opt, "R19/R20", "na", disc_iv_missing=1)
-            else:
-                ev_iv = iv_det.on_iv(ts_opt, float(mark_iv))
-                if ev_iv is not None:
-                    ev_iv.fields.setdefault("instrument_id", inst_id)
-                    for rule in eval_rules(_evdict(ev_iv), ctx):
-                        aid, t0_dt = await enqueue_rule(rule, ev_iv.ts)
-                        if aid is not None:
-                            telemetry.bump(ev_iv.ts, rule["rule"], rule.get("side", "na"), emitted=1)
-                            text = (
-                                f"#{rule['rule']} IV spike {ev_iv.intensity:.2f}% "
-                                f"({inst_id})"
-                            )
-                            await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
+            # else:
+            #     # LEGACY / DEPRECATED - Code disabled in runner.py
+            #     ev_iv = iv_det.on_iv(ts_opt, float(mark_iv))
+            #     if ev_iv is not None:
+            #         ev_iv.fields.setdefault("instrument_id", inst_id)
+            #         for rule in eval_rules(_evdict(ev_iv), ctx):
+            #             aid, t0_dt = await enqueue_rule(rule, ev_iv.ts)
+            #             if aid is not None:
+            #                 telemetry.bump(ev_iv.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+            #                 text = (
+            #                     f"#{rule['rule']} IV spike {ev_iv.intensity:.2f}% "
+            #                     f"({inst_id})"
+            #                 )
+            #                 await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
 
             if oi_val is None:
                 telemetry.bump(ts_opt, "R21/R22", "na", disc_oi_missing=1)
@@ -1491,15 +1492,16 @@ async def run_pipeline(
             if min_total_oi > 0.0 and total_oi < min_total_oi:
                 telemetry.bump(ts_opt, "R21/R22", "na", disc_oi_low=1)
 
-            ev_oi = oi_skew_det.on_oi(ts_opt, oi_c, oi_p)
-            if ev_oi is not None:
-                ev_oi.fields.setdefault("underlying", underlying)
-                for rule in eval_rules(_evdict(ev_oi), ctx):
-                    aid, t0_dt = await enqueue_rule(rule, ev_oi.ts)
-                    if aid is not None:
-                        telemetry.bump(ev_oi.ts, rule["rule"], rule.get("side", "na"), emitted=1)
-                        text = f"#{rule['rule']} OI skew {ev_oi.intensity:.2f} ({underlying})"
-                        await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
+            # LEGACY / DEPRECATED - Code disabled in runner.py
+            # ev_oi = oi_skew_det.on_oi(ts_opt, oi_c, oi_p)
+            # if ev_oi is not None:
+            #     ev_oi.fields.setdefault("underlying", underlying)
+            #     for rule in eval_rules(_evdict(ev_oi), ctx):
+            #         aid, t0_dt = await enqueue_rule(rule, ev_oi.ts)
+            #         if aid is not None:
+            #             telemetry.bump(ev_oi.ts, rule["rule"], rule.get("side", "na"), emitted=1)
+            #             text = f"#{rule['rule']} OI skew {ev_oi.intensity:.2f} ({underlying})"
+            #             await router.send("rules", text, alert_id=aid, ts_first=t0_dt)
 
     async def _yield_if_needed(stage: str, idx: int, every: int = 50, max_gap_s: Optional[float] = None) -> None:
         now = time.perf_counter()
