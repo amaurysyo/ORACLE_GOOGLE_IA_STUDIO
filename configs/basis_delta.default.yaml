@@ -1,0 +1,34 @@
+notifications:
+  enabled: false
+  queue_max: 200
+  drop_policy: drop_oldest
+  dedup_window_s: 60
+  dedup_max_keys: 2000
+  cooldown_s_by_type: {}
+  cooldown_max_keys: 5000
+  cooldown_prune_every_n: 200
+  stop_timeout_s: 2.0
+
+  sinks:
+    discord:
+      enabled: false
+      timeout_s: 5.0
+      max_retries: 2
+      backoff_s: 1.0
+      rate_limit_per_min: 30
+      username: "Basis-Delta NRT"
+      avatar_url: null
+      webhook_env_trading: BDNRT_DISCORD_WEBHOOK_TRADING_URL
+      webhook_env_ops: BDNRT_DISCORD_WEBHOOK_OPS_URL
+
+  # Deprecated: use notifications.sinks.discord
+  discord:
+    enabled: false
+    timeout_s: 5.0
+    max_retries: 2
+    backoff_s: 1.0
+    rate_limit_per_min: 30
+    username: "Basis-Delta NRT"
+    avatar_url: null
+    webhook_env_trading: BDNRT_DISCORD_WEBHOOK_TRADING_URL
+    webhook_env_ops: BDNRT_DISCORD_WEBHOOK_OPS_URL
